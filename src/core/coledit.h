@@ -58,6 +58,20 @@ struct ColHit {
 // The nearest shape the ray hits (only the kinds that are shown).
 ColHit pickCol(const ColModel& m, const float origin[3], const float dir[3], bool boxes = true, bool spheres = true, bool mesh = true);
 
+// ---- surface materials (the number every box, sphere and face carries) ----
+// GTA III knows materials 0 to 32 (33 and 34 exist in the numbering but GTA III does not use them). The names are the
+// community's (re3, used only as a reference); the numbering is confirmed by the game itself: the grip group of each
+// number below is the game's own CSurfaceTable function at 0x004aba60, and it agrees with every name (grass, sand and
+// cardboard are loose, water alone is wet, pedestrians and rubber are rubber, ...). The groups are the rows of
+// data/surface.dat.
+constexpr int kColMaterialCount = 35;
+enum class GripGroup { Rubber = 0, Hard = 1, Road = 2, Loose = 3, Wet = 4 };
+// "Grass", "Water", ...; "" outside 0..34.
+const char* colMaterialName(int material);
+// The game's grip group of a material (0x004aba60; numbers it does not list count as Road, as in the game).
+GripGroup colMaterialGrip(int material);
+const char* gripGroupName(GripGroup g);  // "rubber", "hard", "road", "loose", "wet" (data/surface.dat's rows)
+
 // ---- saving: which COL file gets an edited record ----
 // The game loads every COLFILE line of gta3.dat in order and loads each record over an earlier one of the same model
 // name (CFileLoader_LoadCollisionFile 0x00478b20); when the player changes island it reloads the COLFILE lines of that

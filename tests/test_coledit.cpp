@@ -327,6 +327,23 @@ int main() {
         CHECK(colFileLevel(dat, "data/x.col") == -1);  // only in a comment
         CHECK(colFileLevel(dat, "data/maps/nothere.col") == -1);
     }
+    // ---- surface materials: names and the game's grip groups (0x004aba60) ----
+    {
+        int counts[5] = {0, 0, 0, 0, 0};
+        for (int k = 0; k <= 32; ++k) {
+            CHECK(colMaterialName(k)[0] != 0 && colMaterialName(k)[0] != '(');
+            ++counts[int(colMaterialGrip(k))];
+        }
+        CHECK(counts[int(GripGroup::Rubber)] == 3 && counts[int(GripGroup::Hard)] == 17 && counts[int(GripGroup::Road)] == 6 && counts[int(GripGroup::Loose)] == 6 &&
+              counts[int(GripGroup::Wet)] == 1);
+        CHECK(std::string(colMaterialName(2)) == "Grass" && colMaterialGrip(2) == GripGroup::Loose);
+        CHECK(std::string(colMaterialName(19)) == "Water" && colMaterialGrip(19) == GripGroup::Wet);
+        CHECK(std::string(colMaterialName(18)) == "Sand" && colMaterialGrip(18) == GripGroup::Loose);
+        CHECK(colMaterialGrip(1) == GripGroup::Road && colMaterialGrip(17) == GripGroup::Rubber && colMaterialGrip(11) == GripGroup::Hard);
+        CHECK(colMaterialGrip(33) == GripGroup::Road && colMaterialGrip(200) == GripGroup::Road);  // the game's default
+        CHECK(std::string(colMaterialName(33)).find("not used") != std::string::npos && colMaterialName(35)[0] == 0 && colMaterialName(-1)[0] == 0);
+        CHECK(std::string(gripGroupName(GripGroup::Wet)) == "wet");
+    }
     if (failures == 0) std::printf("all collision editor tests passed\n");
     return failures ? 1 : 0;
 }

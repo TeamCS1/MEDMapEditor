@@ -353,6 +353,42 @@ ColHit pickCol(const ColModel& m, const float o[3], const float dir[3], bool box
     return best;
 }
 
+// ---- surface materials ----
+
+const char* colMaterialName(int material) {
+    static const char* names[kColMaterialCount] = {
+        "Default",            "Tarmac",          "Grass",           "Gravel",          "Dry mud",        "Pavement",
+        "Car",                "Glass",           "See-through cloth", "Garage door",   "Car panel",      "Thick metal plate",
+        "Scaffold pole",      "Lamp post",       "Fire hydrant",    "Girder",          "Chain-link fence", "Pedestrian",
+        "Sand",               "Water",           "Wooden crates",   "Wooden bench",    "Solid wood",     "Rubber",
+        "Plastic",            "Hedge",           "Steep cliff",     "Container",       "News stand",     "Wheel base",
+        "Cardboard box",      "See-through stone", "Metal gate",    "(not used in GTA III)", "(not used in GTA III)"};
+    return material >= 0 && material < kColMaterialCount ? names[material] : "";
+}
+
+GripGroup colMaterialGrip(int material) {
+    // the game's CSurfaceTable function at 0x004aba60, case by case
+    switch (material) {
+        case 2: case 3: case 18: case 25: case 26: case 30: return GripGroup::Loose;
+        case 4: case 6: case 7: case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15: case 16:
+        case 24: case 27: case 28: case 31: case 32: return GripGroup::Hard;
+        case 17: case 23: case 29: return GripGroup::Rubber;
+        case 19: return GripGroup::Wet;
+        default: return GripGroup::Road;  // 0, 1, 5, 20, 21, 22 and anything else
+    }
+}
+
+const char* gripGroupName(GripGroup g) {
+    switch (g) {
+        case GripGroup::Rubber: return "rubber";
+        case GripGroup::Hard: return "hard";
+        case GripGroup::Road: return "road";
+        case GripGroup::Loose: return "loose";
+        case GripGroup::Wet: return "wet";
+    }
+    return "";
+}
+
 // ---- saving ----
 
 ColSaveTarget colSaveTarget(const std::string& region, int level) {

@@ -24,3 +24,6 @@
 005275d0	CTxdStore_FindTxdSlot_maybe
 004f6b40	CBaseModelInfo_SetTexDictionary_maybe
 00476520	CFileLoader_ReloadLevelCollision_maybe
+004ab8f0	CSurfaceTable_Initialise_maybe
+004aba60	CSurfaceTable_GetAdhesionGroup_maybe
+004abaa0	CSurfaceTable_GetWetMultiplier_maybe
