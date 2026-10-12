@@ -29,4 +29,4 @@ Run `build/cmake/med_viewer.exe` and choose your GTA III folder. **No game files
 
 ## What is not in this repository
 
-GTA III's files and anything decompiled from the game's executable belong to Rockstar Games and are not published here. The Ghidra databases are left out because they are large and can be rebuilt (see CLAUDE.md, Tooling). The original MEd 0.32 release is included as permitted by its licence (`MEdv032/readme.txt`); the Visual C++ runtime DLLs it shipped with are not.
+GTA III's files and anything decompiled from the game's executable belong to Rockstar Games and are not published here. The Ghidra databases are left out because they are large and can be rebuilt (see CLAUDE.md, Tooling). The original MEd 0.32 release is included as permitted by its licence (`MEdv032/readme.txt`), with the Visual C++ 7.1 runtime DLLs (`msvcp71.dll`, `msvcr71.dll`) it shipped with, which MEd.exe needs to start.

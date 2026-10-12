@@ -18,9 +18,8 @@ re/out/*.err
 re/**/*.log
 re/**/*.err
 
-# The original MEd release: MEd.exe and its readme are kept (its licence allows redistribution);
-# the Visual C++ 7.1 runtime DLLs are Microsoft's and are not
-MEdv032/*.dll
+# The original MEd release is kept whole (MEd.exe needs its Visual C++ 7.1 runtime DLLs, msvcp71.dll and msvcr71.dll,
+# to run); the .rar is the same release again
 MEdv032.rar
 
 # Editor settings and per-machine files
