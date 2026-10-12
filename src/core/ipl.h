@@ -1,5 +1,6 @@
 // IPL (item placement) files: text and binary ("bnry") formats.
 #pragma once
+#include <functional>
 #include <string>
 #include <vector>
 #include "gtatypes.h"
@@ -48,6 +49,19 @@ bool removeIplInstance(std::vector<IplInstance>& fileInstances, size_t index);
 // placements in `all` that are the partner(s) of `all[index]`: the opposite kind (LOD or building), same
 // tail, within `maxDistance` units. Empty when there is none.
 std::vector<size_t> findLodPartners(const std::vector<IplInstance>& all, size_t index, double maxDistance = 5.0);
+
+// The partner(s) that really belong to `all[index]` when several of the same name share a spot, which happens after
+// Duplicate or Paste (the copy lands exactly on the original): findLodPartners would give every building there every
+// stand-in there. Here the buildings and stand-ins around index are paired one to one: nearest first, then an original
+// with an original and an added one with an added one (isOriginal, may be empty: all count as original), then file
+// order. A lone building keeps every stand-in it has (findLodPartners); a building left without one gets none.
+std::vector<size_t> pairedLodPartners(const std::vector<IplInstance>& all, size_t index, const std::function<bool(size_t)>& isOriginal = {},
+                                      double maxDistance = 5.0);
+
+// The name a LOD stand-in model of `building` would have by that rule ("LOD" + the name without its first three
+// characters: hospitaland -> LODpitaland). Empty for a name of three characters or less and for a LOD name itself.
+// Whether such a model exists is up to the caller (look it up case-insensitively in the IDE definitions).
+std::string lodModelNameFor(const std::string& building);
 
 // One "inst" line (no line ending), in the format MEd writes (IPL save, 0x00423080): fields
 // separated by ", ", numbers as QString::number(x, 'g', 12) i.e. %.12g.

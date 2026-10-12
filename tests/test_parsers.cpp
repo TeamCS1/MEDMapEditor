@@ -104,6 +104,28 @@ int main() {
         CHECK(findLodPartners(v, 5).empty());
         CHECK(findLodPartners(v, 99).empty());
         CHECK(findLodPartners(v, 0, 1.0).size() == 1);      // the distance limit is respected
+        // pairing one to one when copies share the spot (Duplicate puts the copy exactly on the original)
+        std::vector<IplInstance> d = {mk("hospitaland", 0, 0, 0), mk("LODpitaland", 0, 0, 0), mk("hospitaland", 0, 0, 0), mk("LODpitaland", 0, 0, 0)};
+        CHECK(findLodPartners(d, 2).size() == 2);                                     // the plain search sees both stand-ins
+        auto origFirstTwo = [](size_t i) { return i < 2; };
+        CHECK(pairedLodPartners(d, 0, origFirstTwo) == std::vector<size_t>{1});  // original with original
+        CHECK(pairedLodPartners(d, 2, origFirstTwo) == std::vector<size_t>{3});  // copy with copy
+        CHECK(pairedLodPartners(d, 1, origFirstTwo) == std::vector<size_t>{0});  // and from the stand-in's side
+        CHECK(pairedLodPartners(d, 3, origFirstTwo) == std::vector<size_t>{2});
+        CHECK(pairedLodPartners(d, 2) == std::vector<size_t>{3});                // without flags: file order
+        // the copy moved 3 units away (still within 5 of both): nearest wins
+        d[2].x = 3;
+        d[3].x = 3;
+        CHECK(pairedLodPartners(d, 0) == std::vector<size_t>{1} && pairedLodPartners(d, 2) == std::vector<size_t>{3});
+        // two buildings, one stand-in: the nearer building gets it, the other none
+        std::vector<IplInstance> e = {mk("hospitaland", 0, 0, 0), mk("LODpitaland", 0, 0, 0), mk("hospitaland", 2, 0, 0)};
+        CHECK(pairedLodPartners(e, 0) == std::vector<size_t>{1} && pairedLodPartners(e, 2).empty());
+        // a lone building keeps every stand-in (as findLodPartners)
+        CHECK(pairedLodPartners(v, 0) == findLodPartners(v, 0) && pairedLodPartners(v, 4).empty() && pairedLodPartners(v, 99).empty());
+        CHECK(lodModelNameFor("hospitaland") == "LODpitaland");
+        CHECK(lodModelNameFor("comSEbuilding1") == "LODSEbuilding1");
+        CHECK(lodModelNameFor("LODpitaland").empty() && lodModelNameFor("lodx1").empty());  // a LOD has no LOD
+        CHECK(lodModelNameFor("abc").empty() && lodModelNameFor("").empty());
     }
 
     // Removing an instance repairs the LOD links of the others (MEd, 0x00424490)

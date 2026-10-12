@@ -45,6 +45,8 @@ inline std::vector<MenuItem> objectMenu(bool multiple) {
         m.push_back({"Selected Items", kCmdNone, false, false});
         m.push_back({"Duplicate Objects", kCmdDuplicate, true, false});
         m.push_back({"Copy", kCmdCopy, true, false});
+        m.push_back({"Replace Objects...", kCmdReplace, true, false});
+        m.push_back({"Extract Objects...", kCmdExtract, true, false});
         m.push_back({"", kCmdNone, false, false});
         m.push_back({"Delete Objects (move below the map)", kCmdDeleteRelocate, true, true});
         m.push_back({"Delete Objects permanently (remove from file)", kCmdDeleteHard, true, false});
@@ -52,9 +54,9 @@ inline std::vector<MenuItem> objectMenu(bool multiple) {
     }
     m.push_back({"Centre on Object", kCmdCentre, true, false});
     m.push_back({"Properties", kCmdProperties, false, false});
-    m.push_back({"Extract Object", kCmdExtract, false, false});
+    m.push_back({"Extract Object...", kCmdExtract, true, false});
     m.push_back({"Duplicate Object", kCmdDuplicate, true, false});
-    m.push_back({"Replace Object", kCmdReplace, false, false});
+    m.push_back({"Replace Object...", kCmdReplace, true, false});
     m.push_back({"Copy", kCmdCopy, true, false});
     m.push_back({"", kCmdNone, false, false});
     m.push_back({"Delete Object (move below the map)", kCmdDeleteRelocate, true, true});

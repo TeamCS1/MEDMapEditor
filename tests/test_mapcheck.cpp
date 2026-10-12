@@ -172,6 +172,11 @@ int main() {
     // an LOD whose building was removed is counted
     r = withIpl("inst\r\n3, LOD2, 15, 20, 30, 1, 1, 1, 0, 0, 0, 1\r\nend\r\n");
     CHECK(r.summary.lodWithoutBuilding == 1);
+    // ... but not when it was deleted by moving it below the map (Replace does this when the new building has no LOD)
+    r = withIpl("inst\r\n3, LOD2, 15, 20, -200, 1, 1, 1, 0, 0, 0, 1\r\nend\r\n");
+    CHECK(r.summary.lodWithoutBuilding == 0);
+    r = withIpl("inst\r\n3, LOD2, 15, 20, -150, 1, 1, 1, 0, 0, 0, 1\r\nend\r\n");  // merely deep is still counted
+    CHECK(r.summary.lodWithoutBuilding == 1);
     r = withIpl("inst\r\n2, box2, 15, 20, 30, 1, 1, 1, 0, 0, 0, 1\r\n3, LOD2, 15, 20, 30, 1, 1, 1, 0, 0, 0, 1\r\nend\r\n");
     CHECK(r.summary.lodWithoutBuilding == 0 && r.summary.buildingWithoutLod == 0);
     r = withIpl("inst\r\n2, box2, 15, 20, 30, 1, 1, 1, 0, 0, 0, 1\r\nend\r\n");

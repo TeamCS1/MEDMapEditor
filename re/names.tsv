@@ -113,3 +113,7 @@
 004437f0	CIPLViewer_xrplus
 00443f10	CIPLViewer_xr1plus
 00450570	MainWindow_ctor
+0045c7f0	CMapView_extractObject
+00460aa0	CMapView_replaceObject
+0045ce00	CMapView_replaceObjectId
+0045cc30	CMapView_cancelReplace

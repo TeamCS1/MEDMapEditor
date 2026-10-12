@@ -151,6 +151,51 @@ namespace {
 bool isLodName(const std::string& name) { return name.size() > 3 && toLower(name.substr(0, 3)) == "lod"; }
 }  // namespace
 
+std::vector<size_t> pairedLodPartners(const std::vector<IplInstance>& all, size_t index, const std::function<bool(size_t)>& isOriginal, double maxDistance) {
+    const std::vector<size_t> mine = findLodPartners(all, index, maxDistance);
+    if (mine.empty()) return mine;
+    // the group around index: its own kind (index and every same-kind partner of its partners) and the other kind
+    std::vector<size_t> same = {index}, other = mine;
+    for (size_t c : mine)
+        for (size_t s : findLodPartners(all, c, maxDistance))
+            if (std::find(same.begin(), same.end(), s) == same.end()) same.push_back(s);
+    for (size_t s : same)
+        for (size_t c : findLodPartners(all, s, maxDistance))
+            if (std::find(other.begin(), other.end(), c) == other.end()) other.push_back(c);
+    if (same.size() == 1) return mine;  // nobody else claims these stand-ins
+    auto orig = [&](size_t i) { return isOriginal ? isOriginal(i) : true; };
+    struct Pair {
+        double d;
+        int mismatch;
+        size_t s, c;
+    };
+    std::vector<Pair> pairs;
+    for (size_t s : same)
+        for (size_t c : findLodPartners(all, s, maxDistance)) {
+            const double dx = all[s].x - all[c].x, dy = all[s].y - all[c].y, dz = all[s].z - all[c].z;
+            pairs.push_back({std::sqrt(dx * dx + dy * dy + dz * dz), orig(s) != orig(c) ? 1 : 0, s, c});
+        }
+    std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) {
+        if (a.d != b.d) return a.d < b.d;
+        if (a.mismatch != b.mismatch) return a.mismatch < b.mismatch;
+        if (a.s != b.s) return a.s < b.s;
+        return a.c < b.c;
+    });
+    std::vector<size_t> usedS, usedC, out;
+    for (const Pair& p : pairs) {
+        if (std::find(usedS.begin(), usedS.end(), p.s) != usedS.end() || std::find(usedC.begin(), usedC.end(), p.c) != usedC.end()) continue;
+        usedS.push_back(p.s);
+        usedC.push_back(p.c);
+        if (p.s == index) out.push_back(p.c);
+    }
+    return out;
+}
+
+std::string lodModelNameFor(const std::string& building) {
+    if (building.size() <= 3 || isLodName(building)) return "";
+    return "LOD" + building.substr(3);
+}
+
 std::vector<size_t> findLodPartners(const std::vector<IplInstance>& all, size_t index, double maxDistance) {
     std::vector<std::pair<double, size_t>> found;
     if (index >= all.size() || all[index].model.size() <= 3) return {};

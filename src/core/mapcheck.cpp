@@ -437,6 +437,9 @@ CheckResult checkMap(const CheckInput& in) {
         for (size_t i = 0; i < placed.size(); ++i) {
             const std::string& n = placed[i].p.name;
             if (n.size() <= 3) continue;
+            // a placement at the editor's "deleted" depth (Delete puts it at -200, below the map) was removed on purpose
+            // and needs no partner: Replace moves the old LOD stand-in there when the new building has no LOD model
+            if (placed[i].p.z <= kDeletedDepth) continue;
             if (isLodName(n)) {
                 if (!hasPartner(int(i))) lodAlone.push_back(int(i));
             } else if (lodModelTails.count(tailOf(n)) && !hasPartner(int(i))) {

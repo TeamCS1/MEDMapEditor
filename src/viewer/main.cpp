@@ -58,6 +58,9 @@
 #include "ipl.h"
 #include "mapcheck.h"
 #include "pools.h"
+#include "extract.h"
+#include "original.h"
+#include "roadkit.h"
 #include "bookmarks.h"
 #include "region.h"
 #include "rotation.h"
@@ -84,10 +87,14 @@ std::string fixSlashes(std::string s) {
     return s;
 }
 
+std::string ideLineOf(const IdeObject& o);  // Extract Object block
+
 struct ModelDef {
     std::string model, txd;
     std::string name;  // the model name as written in the IDE (model is lower case)
     std::string ide;   // the IDE file that defines it (file name only)
+    std::string ideLine;  // its line in that IDE file, rebuilt from the parsed values (for Extract's info file)
+    bool timed = false;   // a tobj entry
     double drawDistance = 300;
     Pool pool = Pool::Building;  // which game pool a placement of this model takes (pools.h)
     bool farModel = false;  // a LOD stand-in: named LOD..., or an IDE draw distance of 500 or more
@@ -141,6 +148,7 @@ struct App {
     std::string root;
     ImgArchive img;
     std::map<int, ModelDef> defs;
+    std::vector<std::string> colFiles;  // the COL files of gta3.dat, full paths, in order (Extract Object copies from them)
     std::vector<Bookmark> bookmarks;  // the Bookmarks window's list (MEd's format)
     std::string bookmarkFile;         // where it is saved: bookmarks.ini next to the editor
     PoolLimits limits;                     // pool sizes the game can really have: vanilla, or from a limit adjuster file in the game folder
@@ -191,6 +199,8 @@ struct App {
     bool keys[256] = {};
     bool dragging = false;
     POINT lastMouse = {0, 0};
+    POINT downMouse = {0, 0};
+    bool roadsOnly = false;  // --roads-only: draw road pieces only (screenshots)  // where the left button went down (a click without a drag opens a road node)
     DWORD lastTick = 0;
     double tickRemainder = 0;  // milliseconds not yet turned into 1 ms keyboard ticks
     HWND hwnd = nullptr;
@@ -201,6 +211,11 @@ struct App {
 // bookmarks.ini lines look like
 //   <bookmark id=0>name</bookmark><location id=0>x:y:z:h:yaw:pitch:flag</location>
 // ---- loading -----------------------------------------------------------------------------
+
+std::vector<bool> originalFlags();
+const std::vector<RoadEnd>& roadEndsOf(int id);
+bool isRoadPiece(int idx);
+bool roadEndJoined(int idx, const RoadEnd& w);
 
 bool loadGameData() {
     std::string err;
@@ -254,6 +269,8 @@ bool loadGameData() {
             d.model = toLower(o.model);
             d.name = o.model;
             d.ide = p.substr(p.find_last_of('/') + 1);
+            d.ideLine = ideLineOf(o);
+            d.timed = o.timed;
             d.txd = toLower(o.txd);
             d.drawDistance = o.drawDistances.empty() ? 300 : *std::max_element(o.drawDistances.begin(), o.drawDistances.end());
             d.farModel = isFarModel(d.model, d.drawDistance);
@@ -270,6 +287,7 @@ bool loadGameData() {
         app.iplPaths.push_back(p);
     }
     for (const std::string& cp : colPaths) {
+        app.colFiles.push_back(app.root + "/" + cp);
         std::string bytes = slurp(app.root + "/" + cp, ok);
         if (!ok) continue;
         std::vector<ColModel> models;
@@ -280,6 +298,8 @@ bool loadGameData() {
     std::printf("loaded %zu collision models\n", app.cols.size());
     std::printf("loaded %zu object definitions, %zu placements, %zu archive entries\n", app.defs.size(),
                 app.instances.size(), app.img.entries().size());
+    const std::vector<bool> orig = originalFlags();
+    std::printf("placements: %zu original, %zu added\n", size_t(std::count(orig.begin(), orig.end(), true)), size_t(std::count(orig.begin(), orig.end(), false)));
     return true;
 }
 
@@ -518,6 +538,7 @@ void collectVisible() {
         if (d == app.defs.end()) continue;
         const ModelDef& def = d->second;
         if (!app.regionOn.empty() && !app.regionOn[app.instFile[i]]) continue;  // its region is switched off in the Scene panel
+        if (app.roadsOnly && def.model.rfind("rd_", 0) != 0) continue;           // --roads-only (screenshots of road layouts)
         const bool swapped = swap && group.count(int(i)) > 0;
         if (swapped && !def.farModel) continue;  // LOD view: the normal model gives way to its stand-in
         double dx = inst.x - v.eyeX, dy = inst.y - v.eyeY, dz = inst.z - v.eyeZ;
@@ -758,6 +779,9 @@ void buildLodPartnerRanges();
 void plRefreshAfterEdit();  // the Placements tab: rows, counts and sort order follow the edits
 void itRefreshAfterEdit();  // the Item tab: placed counts follow the edits
 void showBookmarksWindow(HWND owner);
+void replaceSelectedUi(HWND owner);
+void extractObjectsUi(HWND owner, const std::vector<int>& modelIds);
+std::vector<int> modelIdsOf(const std::vector<int>& placements);
 void setShowEmptyRegions(bool on);
 void refreshRegions();
 
@@ -789,12 +813,24 @@ bool redoAction() {
     return true;
 }
 
+// The LOD partner(s) of one placement, paired one to one when copies share the spot (core pairedLodPartners): after a
+// Duplicate the copy sits exactly on the original, and each building must take only its own stand-in along.
+std::vector<size_t> lodPartnersOf(int idx) {
+    std::vector<bool> flags;
+    bool have = false;
+    auto isOriginal = [&](size_t i) {
+        if (!have) { flags = originalFlags(); have = true; }  // only needed when copies share a spot
+        return i < flags.size() ? bool(flags[i]) : true;
+    };
+    return pairedLodPartners(app.instances, size_t(idx), isOriginal);
+}
+
 // The selection plus the LOD partner of each selected placement: a building and its LOD stand-in must
 // always be moved or removed together, otherwise the game crashes (findLodPartners, ipl.h).
 std::vector<int> withLodPartners(const std::vector<int>& selection) {
     std::set<int> all(selection.begin(), selection.end());
     for (int idx : selection)
-        for (size_t partner : findLodPartners(app.instances, size_t(idx))) all.insert(int(partner));
+        for (size_t partner : lodPartnersOf(idx)) all.insert(int(partner));
     return std::vector<int>(all.begin(), all.end());
 }
 
@@ -950,17 +986,14 @@ void centreOnObject(int idx) {
     app.cam.pitch = 45;
 }
 
-// Delete, as in CMapView::deleteSelected (0x0045d0a0): do nothing without a selection; always take an
-// undo snapshot first (not only once per selection); remove every selected placement from its IPL file,
-// repairing the LOD links of that file (removeIplInstance); clear the selection. The file is rewritten
-// on the next save.
-bool deleteSelected() {
-    if (app.selected.empty()) return false;
-    app.history.snapshot(captureState());
-    std::vector<int> idxs = withLodPartners(app.selected);  // MEd leaves the LOD behind, which crashes the game
+// Remove placements from their files for good (MEd's IPL_removeInstance, 0x00424490, per file), repairing the LOD links
+// of each file. No undo snapshot and no selection handling: the callers do that. The selection indices above a removed
+// placement must be shifted down by the caller (shiftAfterRemoval).
+void removePlacements(std::vector<int> idxs) {
     std::sort(idxs.begin(), idxs.end(), std::greater<int>());  // highest first so lower indices stay valid
     idxs.erase(std::unique(idxs.begin(), idxs.end()), idxs.end());
     for (int idx : idxs) {
+        if (idx < 0 || idx >= int(app.instances.size())) continue;
         const int file = app.instFile[idx];
         std::vector<int> members;
         std::vector<IplInstance> fileInsts;
@@ -979,6 +1012,27 @@ bool deleteSelected() {
             if (app.instFile[i] == file) app.instances[i].lod = fileInsts[k++].lod;
         app.dirty.insert(file);
     }
+}
+
+// A list of placement indices after `removed` were taken out: removed ones dropped, the others shifted down.
+std::vector<int> shiftAfterRemoval(const std::vector<int>& list, std::vector<int> removed) {
+    std::sort(removed.begin(), removed.end());
+    std::vector<int> out;
+    for (int i : list) {
+        if (std::binary_search(removed.begin(), removed.end(), i)) continue;
+        out.push_back(i - int(std::lower_bound(removed.begin(), removed.end(), i) - removed.begin()));
+    }
+    return out;
+}
+
+// Delete, as in CMapView::deleteSelected (0x0045d0a0): do nothing without a selection; always take an
+// undo snapshot first (not only once per selection); remove every selected placement from its IPL file,
+// repairing the LOD links of that file (removeIplInstance); clear the selection. The file is rewritten
+// on the next save.
+bool deleteSelected() {
+    if (app.selected.empty()) return false;
+    app.history.snapshot(captureState());
+    removePlacements(withLodPartners(app.selected));  // MEd leaves the LOD behind, which crashes the game
     app.selected.clear();
     app.history.endSession();
     buildLodPartnerRanges();
@@ -987,7 +1041,7 @@ bool deleteSelected() {
 }
 
 bool newObjectTargetFile(int& file, std::string& problem);
-bool chooseObject(HWND owner, int& id);
+bool chooseObject(HWND owner, int& id, const char* title = nullptr, const char* okText = nullptr, int preselect = -1);
 
 // "New Object": pick the destination file, let the user choose an IDE object, and put it where the pixel (mx, my) of the
 // window points at (my from the top of the window).
@@ -1066,6 +1120,8 @@ void showObjectMenu(HWND hwnd, int mx, int my) {
         case kCmdCentre: if (!app.selected.empty()) centreOnObject(app.selected[0]); break;
         case kCmdDuplicate: duplicateSelected(); break;
         case kCmdCopy: copySelected(); break;
+        case kCmdReplace: replaceSelectedUi(hwnd); break;
+        case kCmdExtract: extractObjectsUi(hwnd, modelIdsOf(app.selected)); break;
         case kCmdDeleteRelocate: sinkSelected(); break;
         case kCmdDeleteHard: deleteSelected(); break;
         default: break;
@@ -1216,6 +1272,8 @@ void drawSelectionHighlight(const std::string& modelName) {
     glPopAttrib();
 }
 
+void drawRoadOverlay();
+
 void render() {
     glViewport(app.viewX, 0, app.width, app.height);
     glClearColor(0, 0, 0, 0);  // MEd clears to black
@@ -1282,6 +1340,7 @@ void render() {
     QueryPerformanceCounter(&q2);
     app.msCollect += 1000.0 * double(q1.QuadPart - q0.QuadPart) / double(qf.QuadPart);
     app.msSubmit += 1000.0 * double(q2.QuadPart - q1.QuadPart) / double(qf.QuadPart);
+    drawRoadOverlay();  // road nodes and the previewed piece (road builder)
     // Selected objects get the bounding box, axes and circle that CMapView draws (FUN_00404410).
     for (int idx : app.selected) {
         const IplInstance& inst = app.instances[idx];
@@ -1586,7 +1645,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1814,11 +1873,14 @@ void openGameFolder(HWND owner) {
     PostMessageA(owner, WM_CLOSE, 0, 0);
 }
 
+void roadAttachFirstOpen(HWND owner);
+
 void doCommand(HWND h, int id) {
     switch (id) {
         case ID_TB_OPEN: openGameFolder(h); return;
         case ID_TB_BOOKMARKS: showBookmarksWindow(h); return;  // the window keeps the focus
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
+        case ID_TB_ROADATTACH: roadAttachFirstOpen(h); return;
         case ID_TB_NEWOBJ: newObjectAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
         case ID_TB_COPY: copySelected(); break;
         case ID_TB_PASTE: pasteAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
@@ -1940,7 +2002,7 @@ std::string inspectorText() {
     t += "Quaternion: " + num(o.rotX, 4) + ", " + num(o.rotY, 4) + ", " + num(o.rotZ, 4) + ", " + num(o.rotW, 4) + "   scale " + num(o.scaleX, 2) + "\r\n";
     auto c = app.cols.find(toLower(o.model));
     t += c != app.cols.end() ? "Collision radius: " + num(c->second.boundRadius, 1) + "\r\n" : "No collision model found for this name.\r\n";
-    const std::vector<size_t> partners = findLodPartners(app.instances, size_t(idx));
+    const std::vector<size_t> partners = lodPartnersOf(idx);
     if (partners.empty()) t += "LOD partner: none\r\n";
     else {
         t += "LOD partner (moved, turned and removed with it):";
@@ -1948,6 +2010,26 @@ std::string inspectorText() {
         t += "\r\n";
     }
     if (o.z <= kSunkZ + 0.5) t += "This object is below the map (moved there instead of being deleted).\r\n";
+    if (isRoadPiece(idx)) {
+        int open = 0;
+        const std::vector<RoadEnd>& e = roadEndsOf(o.id);
+        for (const RoadEnd& r : e) open += !roadEndJoined(idx, endInWorld(o, r));
+        t += "Road piece: " + std::to_string(e.size()) + " ends, " + std::to_string(open) + " open. Click a green ball in the 3D view to attach the next piece.\r\n";
+    }
+    {  // original or added: worked out from the whole map, so it is cached briefly
+        static std::vector<bool> flags;
+        static size_t count = 0;
+        static int forIdx = -1;
+        static DWORD at = 0;
+        if (forIdx != idx || count != app.instances.size() || GetTickCount() - at > 500) {
+            flags = originalFlags();
+            count = app.instances.size();
+            forIdx = idx;
+            at = GetTickCount();
+        }
+        if (size_t(idx) < flags.size())
+            t += flags[size_t(idx)] ? "Part of the original GTA III map.\r\n" : "Added by you (not in the original game).\r\n";
+    }
     return t;
 }
 
@@ -2008,25 +2090,154 @@ void resetRotation() {
     app.history.endSession();
 }
 
-// Give the selected placements another model (MEd: Replace Object / the ID box of its properties). Only the selected
-// ones: a LOD stand-in keeps its own model. Returns false (with a warning) for an ID that no IDE defines.
-bool setModelId(HWND owner, int id) {
+// The id of the LOD stand-in model that goes with a building model ("LOD" + the name without its first three letters,
+// core lodModelNameFor), or -1 when the IDE files define none (most objects have no LOD, and a LOD has none itself).
+int lodModelIdFor(int buildingId) {
+    auto b = app.defs.find(buildingId);
+    if (b == app.defs.end() || b->second.farModel) return -1;
+    const std::string want = toLower(lodModelNameFor(b->second.name));
+    if (want.empty()) return -1;
+    for (const auto& kv : app.defs)
+        if (kv.second.model == want) return kv.first;
+    return -1;
+}
+
+// Per placement: true = part of the original GTA III map, false = added by the user (core/original.h). Worked out from
+// the current placements, so it is right after saving and reopening as well.
+std::vector<bool> originalFlags() {
+    std::vector<std::string> files(app.instances.size());
+    for (size_t i = 0; i < files.size(); ++i) files[i] = app.iplPaths[size_t(app.instFile[i])];
+    size_t n = 0;
+    const OriginalEntry* table = gta3OriginalTable(n);
+    return classifyOriginal(app.instances, files, table, n);
+}
+
+// What a replace did to the LOD stand-ins (for the command line and the self-test).
+struct ReplaceReport {
+    int replaced = 0;     // placements that got the new model
+    int lodSwitched = 0;  // stand-ins that got the new building's LOD model (only those that had another model)
+    int lodSunk = 0;      // stand-ins moved below the map because the new building has no LOD model (not those already there)
+    int lodAdded = 0;     // stand-ins added because the old building had none and the new one has a LOD model
+    int lodRemoved = 0;   // stand-ins the user had added (not original) removed from the file instead of moved below the map
+    std::vector<int> removedIdx;  // their indices before the removal
+};
+
+// Give the selected placements another model, keeping position and rotation (MEd's CMapView::replaceObject, 0x00460aa0
+// with the chooser and 0x0045ce00 for the ID typed in its properties). Returns false (with a warning) for an ID that no
+// IDE defines; does nothing (no undo step) when every selected placement already has that model.
+// A building and its LOD stand-in are replaced as a pair (the user's rule, 2026-10-12; MEd changes only the selected
+// placement and so left the old building's stand-in showing from far away):
+//   - the new model has a LOD model: every stand-in of the old building gets it (same place);
+//   - it has none: the old stand-ins go. An ORIGINAL stand-in is moved below the map (kSunkZ, the safe delete); one the
+//     user added (a duplicate, a paste, ...; originalFlags) is removed from the file, which is safe for something the
+//     original game never had (the user's rule, 2026-10-12);
+//   - the old building had no stand-in but the new model has a LOD model: one is added at the building's position and
+//     rotation, in the same file (it takes a slot of the Building pool).
+// A selected stand-in of a selected building is handled as that building's stand-in, not given the building model.
+// One undo step. Deliberate difference: MEd takes its undo snapshot before its chooser opens, so a cancelled replace
+// still left an undo step; here only a real change takes one.
+bool setModelId(HWND owner, int id, ReplaceReport* report = nullptr) {
+    ReplaceReport rep;
+    if (report) *report = rep;
     if (app.selected.empty()) return false;
     auto d = app.defs.find(id);
     if (d == app.defs.end()) {
         inspWarn(owner, "No object has the model ID " + std::to_string(id) + ". Press Choose... to pick one from the list.", "Model ID");
         return false;
     }
-    app.history.snapshot(captureState());
+    // pair up before anything changes (the pairing goes by model name)
+    std::vector<int> direct;                    // placements that get the new model
+    std::vector<std::vector<int>> standInsOf;   // per entry of `direct`: its stand-ins
+    std::vector<bool> wasBuilding;              // per entry of `direct`: not a far model before (only a building gets a new stand-in)
+    std::set<int> standIns;
     for (int idx : app.selected) {
+        if (app.defs[app.instances[idx].id].farModel) continue;
+        for (size_t p : lodPartnersOf(idx))
+            if (app.defs[app.instances[p].id].farModel) standIns.insert(int(p));
+    }
+    for (int idx : app.selected) {
+        if (standIns.count(idx) || app.instances[idx].id == id) continue;
+        direct.push_back(idx);
+        wasBuilding.push_back(!app.defs[app.instances[idx].id].farModel);
+        std::vector<int> mine;
+        if (!app.defs[app.instances[idx].id].farModel)
+            for (size_t p : lodPartnersOf(idx))
+                if (app.defs[app.instances[p].id].farModel) mine.push_back(int(p));
+        standInsOf.push_back(mine);
+    }
+    if (direct.empty()) return true;
+    const int newLod = lodModelIdFor(id);
+    const std::vector<bool> original = originalFlags();  // before anything changes
+    std::vector<int> toRemove;
+    app.history.snapshot(captureState());
+    std::set<int> done;  // a stand-in shared by two buildings is changed once
+    auto retire = [&](int s) {  // an old stand-in that has no place any more
+        if (!original[size_t(s)]) {
+            toRemove.push_back(s);
+            ++rep.lodRemoved;
+        } else {
+            rep.lodSunk += app.instances[s].z != kSunkZ;
+            app.instances[s].z = kSunkZ;
+        }
+        app.dirty.insert(app.instFile[s]);
+    };
+    for (size_t i = 0; i < direct.size(); ++i) {
+        const int idx = direct[i];
         app.instances[idx].id = id;
         app.instances[idx].model = d->second.name;
         app.dirty.insert(app.instFile[idx]);
+        ++rep.replaced;
+        if (d->second.farModel) {  // a building turned into a far model: its old stand-in would show the old building
+            for (int s : standInsOf[i])
+                if (done.insert(s).second) retire(s);
+            continue;
+        }
+        if (!standInsOf[i].empty()) {
+            for (int s : standInsOf[i]) {
+                if (!done.insert(s).second) continue;
+                if (newLod >= 0) {
+                    rep.lodSwitched += app.instances[s].id != newLod;
+                    app.instances[s].id = newLod;
+                    app.instances[s].model = app.defs[newLod].name;
+                    app.dirty.insert(app.instFile[s]);
+                } else {
+                    retire(s);
+                }
+            }
+        } else if (newLod >= 0 && wasBuilding[i]) {
+            IplInstance lod = app.instances[idx];
+            lod.id = newLod;
+            lod.model = app.defs[newLod].name;
+            app.instances.push_back(lod);
+            app.instFile.push_back(app.instFile[idx]);
+            ++rep.lodAdded;
+        }
+    }
+    if (!toRemove.empty()) {
+        rep.removedIdx = toRemove;
+        std::sort(rep.removedIdx.begin(), rep.removedIdx.end());
+        removePlacements(toRemove);
+        app.selected = shiftAfterRemoval(app.selected, toRemove);
     }
     app.history.endSession();
     buildLodPartnerRanges();
-    plRefreshAfterEdit();
+    refreshRegions();  // counts change when a stand-in was added
+    if (report) *report = rep;
     return true;
+}
+
+// Replace Object (right-click menu, the Properties panel's Choose...): pick the new model in the item chooser, which
+// starts on the current one. Position and rotation stay; the selection stays on the replaced placements.
+void replaceSelectedUi(HWND owner) {
+    if (app.selected.empty()) {
+        inspWarn(owner, "Select the object to replace first (double-click it).", "Replace Object");
+        return;
+    }
+    const int current = app.instances[app.selected[0]].id;
+    const std::string title = app.selected.size() == 1 ? "Replace Object - choose the new model for " + app.instances[app.selected[0]].model + " (type to search)"
+                                                       : "Replace Objects - choose the new model for the " + std::to_string(app.selected.size()) + " selected objects (type to search)";
+    int chosen = current;
+    if (chooseObject(owner, chosen, title.c_str(), "Replace", current)) setModelId(owner, chosen);
 }
 
 // A nudge button: field 0..2 moves, 3..5 turns, k = 0..3 is <<, <, >, >>. Runs of nudges are one undo step.
@@ -2282,8 +2493,7 @@ LRESULT CALLBACK inspectorProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (id == ID_INS_APPLY) applyTyped(w);
             else if (id == ID_INS_CHOOSE && !app.selected.empty()) {
-                int chosen;
-                if (chooseObject(GetParent(w), chosen)) setModelId(w, chosen);
+                replaceSelectedUi(GetParent(w));
             } else if (id == ID_INS_CENTRE && !app.selected.empty()) centreOnObject(app.selected[0]);
             else if (id == ID_INS_SINK) sinkSelected();
             else if (id == ID_INS_HARD) {
@@ -2594,6 +2804,7 @@ struct ChooserState {
     std::vector<int> ids;  // the ids shown, in list order
     bool done = false, ok = false;
     int chosen = -1;
+    int preselect = -1;  // the model to highlight (Replace: the current one), when the search shows it
 };
 
 void fillChooser(ChooserState& c) {
@@ -2624,8 +2835,22 @@ void fillChooser(ChooserState& c) {
         ListView_SetItemText(c.list, it.iItem, 3, const_cast<char*>(dist.c_str()));
         c.ids.push_back(r.second);
     }
-    if (!c.ids.empty()) ListView_SetItemState(c.list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    // highlight: the model typed in full, else the first whose name starts with the text, else the preselected one
+    // (Replace: the current model), else the first row. A search also finds texture dictionaries, so without this
+    // "supasave" would highlight ind_land098 (texture indsupasave) instead of SupaSave.
+    int row = -1, starts = -1, pre = -1;
+    for (size_t i = 0; i < c.ids.size(); ++i) {
+        const std::string& m = app.defs[c.ids[i]].model;
+        if (!q.empty() && m == q && row < 0) row = int(i);
+        if (!q.empty() && m.compare(0, q.size(), q) == 0 && starts < 0) starts = int(i);
+        if (c.ids[i] == c.preselect) pre = int(i);
+    }
+    if (row < 0) row = starts;
+    if (row < 0) row = pre;
+    if (row < 0) row = 0;
+    if (!c.ids.empty()) ListView_SetItemState(c.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     SendMessageA(c.list, WM_SETREDRAW, TRUE, 0);
+    if (!c.ids.empty()) ListView_EnsureVisible(c.list, row, FALSE);
 }
 
 LRESULT CALLBACK chooserProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -2670,7 +2895,7 @@ LRESULT CALLBACK chooserProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // Choose an object from the IDE files (search by name, texture dictionary or id). False when cancelled.
-bool chooseObject(HWND owner, int& id) {
+bool chooseObject(HWND owner, int& id, const char* title, const char* okText, int preselect) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSA wc = {};
@@ -2683,9 +2908,10 @@ bool chooseObject(HWND owner, int& id) {
         registered = true;
     }
     ChooserState c;
+    c.preselect = preselect;
     RECT r;
     GetWindowRect(owner, &r);
-    HWND w = CreateWindowExA(WS_EX_DLGMODALFRAME, "MEdChooser", "New Object - choose an object (type to search)", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, r.left + 80,
+    HWND w = CreateWindowExA(WS_EX_DLGMODALFRAME, "MEdChooser", title ? title : "New Object - choose an object (type to search)", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, r.left + 80,
                              r.top + 80, 560, 520, owner, nullptr, GetModuleHandle(nullptr), nullptr);
     SetWindowLongPtrA(w, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&c));
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -2706,7 +2932,7 @@ bool chooseObject(HWND owner, int& id) {
         col.cx = widths[i];
         ListView_InsertColumn(c.list, i, &col);
     }
-    make("BUTTON", "Place", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDOK);
+    make("BUTTON", okText ? okText : "Place", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, IDOK);
     make("BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, 0, IDCANCEL);
     RECT cr;
     GetClientRect(w, &cr);
@@ -3232,6 +3458,11 @@ LRESULT CALLBACK placementsProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 void showLeftTab(int tab);
+void roadSync();
+void renderRoadThumbnails();
+bool roadClick(int mx, int my);
+bool roadStripOpen();
+void closeRoadStrip();
 
 // ---- the Item tab (after MEd's "Item" tab: CIDETree with CIDEFinder, "Find Item Definition", search by name, ID or
 // texture) ------------------------------------------------------------------------------------------------------------------
@@ -3241,7 +3472,7 @@ void showLeftTab(int tab);
 // (as New Object, without the chooser); "Show where it is placed" (also double-click / Enter) opens the Placements tab
 // filtered to that model in all regions. Selecting an object in 3D highlights its definition here.
 
-enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW };
+enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW, ID_IT_EXTRACT };
 
 struct ItemUi {
     HWND panel = nullptr, search = nullptr, show = nullptr, list = nullptr, count = nullptr, tips = nullptr;
@@ -3251,6 +3482,7 @@ struct ItemUi {
     bool sortDesc = false;
     bool syncing = false;
     int lastSelectedId = -2;                // the model id last mirrored from the 3D selection
+    int lastSelectedIdx = -2;               // and the placement it belonged to (another placement of the same model, or a Replace, mirrors again)
     char text[96] = "";
 } it;
 
@@ -3285,6 +3517,7 @@ void itMirrorSelection() {
     if (!it.list) return;
     const int id = app.selected.empty() ? -1 : app.instances[app.selected[0]].id;
     it.lastSelectedId = id;
+    it.lastSelectedIdx = app.selected.empty() ? -1 : app.selected[0];
     auto f = std::find(it.rows.begin(), it.rows.end(), id);
     if (f == it.rows.end()) return;  // keep whatever the user picked in the list
     it.syncing = true;
@@ -3386,7 +3619,8 @@ void itAddToMap(HWND owner) {
 void itSyncFromSelection() {
     if (!it.list) return;
     const int id = app.selected.empty() ? -1 : app.instances[app.selected[0]].id;
-    if (id != it.lastSelectedId) itMirrorSelection();
+    const int idx = app.selected.empty() ? -1 : app.selected[0];
+    if (id != it.lastSelectedId || idx != it.lastSelectedIdx) itMirrorSelection();
 }
 
 bool itHandleKey(const MSG& m) {
@@ -3433,13 +3667,15 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             it.count = make("STATIC", "", SS_LEFT, 0, ID_IT_COUNT);
             HWND add = make("BUTTON", "Add to map", BS_PUSHBUTTON, 0, ID_IT_ADD);
-            HWND where = make("BUTTON", "Show where it is placed", BS_PUSHBUTTON, 0, ID_IT_WHERE);
+            HWND where = make("BUTTON", "Show placements", BS_PUSHBUTTON, 0, ID_IT_WHERE);
+            HWND extract = make("BUTTON", "Extract...", BS_PUSHBUTTON, 0, ID_IT_EXTRACT);
             itAddTip(it.search, "Type part of a name (tree), a texture dictionary (dyncones) or a model ID (1360). Enter: to the list. Esc: clear.");
             itAddTip(it.show, "All definitions, only those placed somewhere on the map, or only the ones not used yet");
             itAddTip(it.list, "Click a column header to sort. Placed: how many placements use it. Pool: the game pool its placements take "
                               "(Treadable is nearly full on the original map). Double-click or Enter: show where it is placed.");
             itAddTip(add, "Place the selected item in the region picked in the Placements tab, in the middle of the view");
             itAddTip(where, "Open the Placements tab with every placement of this item (all regions)");
+            itAddTip(extract, "Copy this item's model, textures and collision (and an info file) into a folder; the game's files are not changed");
             return 0;
         }
         case WM_SIZE: {
@@ -3453,9 +3689,10 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(it.list, m, y, iw, std::max(60, bottom - y), TRUE);
             y = std::max(y + 60, bottom) + 4;
             MoveWindow(it.count, m, y, iw, 30, TRUE); y += 32;
-            const int half = (iw - 4) / 2;
-            MoveWindow(GetDlgItem(w, ID_IT_ADD), m, y, half, 26, TRUE);
-            MoveWindow(GetDlgItem(w, ID_IT_WHERE), m + half + 4, y, half, 26, TRUE);
+            const int third = (iw - 8) / 3;
+            MoveWindow(GetDlgItem(w, ID_IT_ADD), m, y, third, 26, TRUE);
+            MoveWindow(GetDlgItem(w, ID_IT_WHERE), m + third + 4, y, third, 26, TRUE);
+            MoveWindow(GetDlgItem(w, ID_IT_EXTRACT), m + 2 * (third + 4), y, third, 26, TRUE);
             return 0;
         }
         case WM_COMMAND: {
@@ -3463,6 +3700,7 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == ID_IT_SEARCH && code == EN_CHANGE) itRefill();
             else if (id == ID_IT_SHOW && code == CBN_SELCHANGE) itRefill();
             else if (id == ID_IT_ADD && code == BN_CLICKED) itAddToMap(GetParent(w));
+            else if (id == ID_IT_EXTRACT && code == BN_CLICKED) extractObjectsUi(GetParent(w), itSelectedId() >= 0 ? std::vector<int>{itSelectedId()} : std::vector<int>());
             else if (id == ID_IT_WHERE && code == BN_CLICKED) {
                 if (itSelectedId() < 0) inspWarn(GetParent(w), "Click an item in the list first.", "Show where it is placed");
                 else itShowPlacements(itSelectedId());
@@ -3516,6 +3754,662 @@ void createItemPanel(HWND parent) {
     wc.lpszClassName = "MEdItem";
     RegisterClassA(&wc);
     CreateWindowExA(0, "MEdItem", "", WS_CHILD | WS_CLIPCHILDREN, 0, 0, app.leftW, 400, parent, nullptr, GetModuleHandle(nullptr), nullptr);
+}
+
+// ---- Extract Object (after MEd's CMapView::extractObject, 0x0045c7f0) -----------------------------------------------
+// Copies an object's model, texture dictionary and collision, plus an info file, into <folder>/<model>/ (core/extract.h).
+// MEd copied the DFF and TXD only and asked "Please choose a location" each time; here the folder is remembered, several
+// objects can be extracted at once (each model once), existing files are only overwritten after asking, and the result
+// is summed up with an offer to open the folder. The game's files are only read.
+
+// The IDE line of a definition, written the way the IDE files hold it (objs: id, model, txd, meshes, draw distances,
+// flags; tobj: the same plus time on and off).
+std::string ideLineOf(const IdeObject& o) {
+    std::string s = std::to_string(o.id) + ", " + o.model + ", " + o.txd + ", " + std::to_string(o.drawDistances.size());
+    for (double d : o.drawDistances) {
+        char b[32];
+        std::snprintf(b, sizeof b, "%g", d);
+        s += std::string(", ") + b;
+    }
+    s += ", " + std::to_string(o.flags);
+    if (o.timed) s += ", " + std::to_string(o.timeOn) + ", " + std::to_string(o.timeOff);
+    return s;
+}
+
+ExtractRequest extractRequestFor(int id) {
+    ExtractRequest r;
+    auto d = app.defs.find(id);
+    if (d == app.defs.end()) return r;
+    const ModelDef& def = d->second;
+    r.model = def.name;
+    r.txd = def.txd;
+    r.colFiles = app.colFiles;
+    r.genericTxdPath = app.root + "/models/generic.txd";
+    int placed = 0, sharing = 0;
+    for (const IplInstance& o : app.instances) placed += o.id == id;
+    for (const auto& kv : app.defs) sharing += kv.second.txd == def.txd;
+    r.info = "Extracted with the MEd revival map editor from " + app.root + "\r\n"
+             "Model: " + def.name + " (ID " + std::to_string(id) + ")\r\n"
+             "IDE line: " + def.ideLine + "\r\n"
+             "IDE file: " + def.ide + " (section " + (def.timed ? "tobj" : "objs") + ")\r\n"
+             "Texture dictionary: " + def.txd + ".txd, used by " + std::to_string(sharing) + " object definition(s)\r\n"
+             "Game pool of its placements: " + poolShortName(def.pool) + "\r\n"
+             "Placed on the map: " + std::to_string(placed) + " time(s)\r\n"
+             "Model and textures copied from: " + app.img.path() + "\r\n";
+    return r;
+}
+
+// The models of a selection, each once, in selection order.
+std::vector<int> modelIdsOf(const std::vector<int>& placements) {
+    std::vector<int> ids;
+    for (int idx : placements)
+        if (idx >= 0 && idx < int(app.instances.size()) && std::find(ids.begin(), ids.end(), app.instances[idx].id) == ids.end()) ids.push_back(app.instances[idx].id);
+    return ids;
+}
+
+std::vector<ExtractResult> extractModelsTo(const std::string& folder, const std::vector<int>& ids) {
+    std::vector<ExtractResult> results;
+    for (int id : ids) {
+        const ExtractRequest req = extractRequestFor(id);
+        if (req.model.empty()) continue;
+        results.push_back(extractObject(app.img, folder, req));
+    }
+    return results;
+}
+
+void extractObjectsUi(HWND owner, const std::vector<int>& ids) {
+    if (ids.empty()) {
+        inspWarn(owner, "Select an object (or pick an item in the Item tab) first.", "Extract Object");
+        return;
+    }
+    char last[MAX_PATH] = "";
+    GetPrivateProfileStringA("Extract", "folder", "", last, sizeof last, modIniPath().c_str());
+    BROWSEINFOA bi = {};
+    bi.hwndOwner = owner;
+    bi.lpszTitle = "Copy the model, textures and collision into this folder (a subfolder per object is made):";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpfn = startFolderProc;
+    bi.lParam = last[0] ? reinterpret_cast<LPARAM>(last) : 0;
+    LPITEMIDLIST pid = SHBrowseForFolderA(&bi);
+    if (!pid) return;
+    char path[MAX_PATH];
+    const bool got = SHGetPathFromIDListA(pid, path) != FALSE;
+    CoTaskMemFree(pid);
+    if (!got) return;
+    WritePrivateProfileStringA("Extract", "folder", path, modIniPath().c_str());
+    size_t existing = 0;
+    for (int id : ids) existing += extractTargetsThatExist(path, extractRequestFor(id)).size();
+    if (existing > 0) {
+        const std::string q = std::to_string(existing) + " of the files are already in that folder (from an earlier extract). Replace them?";
+        if (MessageBoxA(owner, q.c_str(), "Extract Object", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+    const std::vector<ExtractResult> results = extractModelsTo(path, ids);
+    std::string text;
+    size_t files = 0;
+    for (const ExtractResult& r : results) {
+        files += r.written.size();
+        text += r.folder.substr(r.folder.find_last_of("\\/") + 1) + ": " + std::to_string(r.written.size()) + " file(s)\r\n";
+        for (const std::string& w : r.warnings) text += "    " + w + "\r\n";
+    }
+    text = "Copied " + std::to_string(files) + " file(s) of " + std::to_string(results.size()) + " object(s) into " + path + ". The game's files were not changed.\r\n\r\n" +
+           text + "\r\nOpen the folder?";
+    if (MessageBoxA(owner, text.c_str(), "Extract Object", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+        const std::string open = results.size() == 1 ? results[0].folder : std::string(path);
+        ShellExecuteA(owner, "open", open.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
+// ---- Road builder: a road piece's ends as nodes, a strip of pieces that fit, a live preview, attach on click ------------
+// Not in MEd (it only places and moves objects freely); added for map building on the user's request (2026-10-12).
+// The ends of a road model are measured from its mesh (core/roadkit.h, checked against Rockstar's map). Selecting one road
+// piece shows a sphere on each of its ends (bright: open, dim: already joined to another piece). Clicking an open
+// sphere opens the strip along the top of the 3D view: every road piece with an end of the same width, once per
+// distinct way of joining (a slope climbing or descending, a corner turning left or right, a T-junction by its stem or
+// an arm), each with a thumbnail drawn so its joining end points down. Hovering a thumbnail shows the piece attached in
+// the 3D view; clicking places it (with its LOD stand-in if the model has one), selects it and moves the strip on to
+// the new piece's far end, so a road is built by clicking on. One undo step per piece. Esc closes the strip.
+
+constexpr int kThumbW = 120, kThumbH = 90, kStripH = 160, kStripItemW = kThumbW + 12;
+
+struct RoadVariant {
+    int id = -1;    // model id
+    int end = -1;   // which of its ends joins the target
+    std::string name, label;
+    int order = 0;  // for sorting: kind, then size
+    HBITMAP thumb = nullptr;
+};
+
+struct RoadBuilderUi {
+    std::map<int, std::vector<RoadEnd>> ends;  // model id -> ends in its own coordinates (only rd_ models have any)
+    HWND strip = nullptr, closeButton = nullptr;
+    int target = -1, targetEnd = -1;           // the placement and the end the strip attaches to
+    std::vector<RoadVariant> variants;
+    int hover = -1;                            // the variant under the mouse (previewed), -1 none
+    int scroll = 0;                            // strip scroll, pixels
+    bool tracking = false;
+    bool thumbsPending = false;
+    bool forcePreview = false;  // the command line's --preview-attach (no strip window there)
+    std::map<std::pair<int, int>, HBITMAP> thumbCache;  // (model id, end) -> thumbnail
+    GLUquadric* sphere = nullptr;
+    std::string lastMessage;
+} rb;
+
+const std::vector<RoadEnd>& roadEndsOf(int id) {
+    auto c = rb.ends.find(id);
+    if (c != rb.ends.end()) return c->second;
+    std::vector<RoadEnd>& out = rb.ends[id];
+    auto d = app.defs.find(id);
+    if (d == app.defs.end() || d->second.model.rfind("rd_", 0) != 0) return out;
+    GlModel& gm = getModel(d->second.model, d->second.txd);
+    std::vector<float> pos;
+    for (const GlGeometry& g : gm.geoms)  // in the model's own coordinates: through each atomic's frame
+        for (size_t i = 0; i + 2 < g.pos.size(); i += 3) {
+            const float x = g.pos[i], y = g.pos[i + 1], z = g.pos[i + 2];
+            pos.push_back(g.matrix[0] * x + g.matrix[4] * y + g.matrix[8] * z + g.matrix[12]);
+            pos.push_back(g.matrix[1] * x + g.matrix[5] * y + g.matrix[9] * z + g.matrix[13]);
+            pos.push_back(g.matrix[2] * x + g.matrix[6] * y + g.matrix[10] * z + g.matrix[14]);
+        }
+    out = roadEndsFor(d->second.name, pos);
+    return out;
+}
+
+bool isRoadPiece(int idx) { return idx >= 0 && idx < int(app.instances.size()) && !roadEndsOf(app.instances[idx].id).empty(); }
+
+// An end of a placed piece is joined when another placed road piece has an end meeting it.
+bool roadEndJoined(int idx, const RoadEnd& w) {
+    for (size_t j = 0; j < app.instances.size(); ++j) {
+        if (int(j) == idx) continue;
+        const IplInstance& o = app.instances[j];
+        if (std::fabs(o.x - w.x) > 80 || std::fabs(o.y - w.y) > 80) continue;
+        if (!app.regionOn.empty() && !app.regionOn[app.instFile[j]]) continue;
+        for (const RoadEnd& e : roadEndsOf(o.id))
+            if (endsMeet(w, endInWorld(o, e))) return true;
+    }
+    return false;
+}
+
+// The piece whose nodes are shown: exactly one road piece selected (or the strip's target).
+int roadNodePiece() {
+    if (((rb.strip && IsWindowVisible(rb.strip)) || rb.forcePreview) && isRoadPiece(rb.target)) return rb.target;
+    return app.selected.size() == 1 && isRoadPiece(app.selected[0]) ? app.selected[0] : -1;
+}
+
+// What joining by end `k` of model `id` does, seen from that end: the other ends straight on, to the left or right, and
+// how far they climb. Gives the label, a sort key, and a key that is the same for two ends that give the same result.
+std::string roadVariantShape(int id, int k, std::string& label, int& order) {
+    const std::vector<RoadEnd>& e = roadEndsOf(id);
+    const RoadEnd& j = e[size_t(k)];
+    const double tx = -j.dx, ty = -j.dy;  // into the piece
+    const double lx = -ty, ly = tx;       // to the left
+    std::vector<std::string> parts;
+    std::string key;
+    int straight = 0, left = 0, right = 0;
+    double climb = 0, shift = 0, length = 0, turn = 0;
+    for (size_t o = 0; o < e.size(); ++o) {
+        if (int(o) == k) continue;
+        const double rx = e[o].x - j.x, ry = e[o].y - j.y, rz = e[o].z - j.z;
+        const double along = rx * tx + ry * ty, side = rx * lx + ry * ly;
+        const double dl = e[o].dx * lx + e[o].dy * ly, ds = e[o].dx * tx + e[o].dy * ty;
+        auto r1 = [](double v) { return std::round(v * 10) / 10 + 0.0; };  // + 0.0: no "-0.0" next to "0.0"
+        char b[96];
+        auto r2 = [](double v) { return std::round(v * 100) / 100 + 0.0; };
+        std::snprintf(b, sizeof b, "%.1f,%.1f,%.1f,%.2f,%.2f;", r1(along), r1(side), r1(rz), r2(dl), r2(ds));
+        parts.push_back(b);
+        turn = std::atan2(dl, ds) * 57.29577951308232;  // where the other end leads: 0 straight on, + to the left
+        climb = rz;
+        if (ds > 0.5) { ++straight; shift = side; length = along; }
+        else if (dl > 0.5) ++left;
+        else ++right;
+    }
+    const char* w = j.width < 25 ? "narrow road" : j.width < 35 ? "road" : "wide road";
+    if (e.size() == 2 && std::fabs(turn) > 1 && std::fabs(std::fabs(turn) - 90) > 1) {  // a bend that is not a quarter turn
+        char b[96];
+        std::snprintf(b, sizeof b, "bends %s %.1f%s", turn > 0 ? "left" : "right", std::fabs(turn), "\xb0");  // the degree sign in the ANSI code page
+        label = b;
+        if (std::fabs(climb) > 0.05) {
+            std::snprintf(b, sizeof b, ", %s %.2f", climb > 0 ? "climbs" : "descends", std::fabs(climb));
+            label += b;
+        }
+        order = 2500 + int(std::fabs(turn) * 10) + (turn > 0 ? 0 : 1);
+    } else if (e.size() == 2 && straight == 1) {
+        char b[96];
+        if (std::fabs(climb) > 0.05) std::snprintf(b, sizeof b, "%s %.2f over %.0f", climb > 0 ? "climbs" : "descends", std::fabs(climb), length);
+        else if (std::fabs(shift) > 0.5) std::snprintf(b, sizeof b, "%.0f long, shifts %s %.0f", length, shift > 0 ? "left" : "right", std::fabs(shift));
+        else std::snprintf(b, sizeof b, "straight, %.0f long", length);
+        label = b;
+        order = (std::fabs(climb) > 0.05 ? 1000 : std::fabs(shift) > 0.5 ? 2000 : 0) + int(length);
+    } else if (e.size() == 2) {
+        label = left ? "turns left" : "turns right";
+        order = 3000 + (left ? 0 : 1);
+    } else if (e.size() == 3) {
+        label = straight ? (std::string("T-junction: on, branch ") + (left ? "left" : "right")) : "T-junction: left and right";
+        order = 4000 + (straight ? (left ? 1 : 2) : 0);
+    } else if (e.size() == 4) {
+        label = "crossroads";
+        order = 5000;
+    } else {
+        label = "dead end";
+        order = 6000;
+    }
+    (void)w;  // every piece in the strip fits the end's width, so the width is not repeated in the label
+    std::sort(parts.begin(), parts.end());  // the same ends in any order are the same shape
+    for (const std::string& part : parts) key += part;
+    return key;
+}
+
+// Every road piece that has an end of this width, once per distinct way of joining.
+std::vector<RoadVariant> roadVariantsFor(double width) {
+    std::vector<RoadVariant> out;
+    for (const auto& kv : app.defs) {
+        if (kv.second.model.rfind("rd_", 0) != 0) continue;
+        const std::vector<RoadEnd>& e = roadEndsOf(kv.first);
+        if (e.size() < 2) continue;  // a piece with one measurable end cannot be built on
+        std::set<std::string> seen;
+        for (size_t k = 0; k < e.size(); ++k) {
+            if (std::fabs(e[k].width - width) > 0.6) continue;
+            RoadVariant v;
+            v.id = kv.first;
+            v.end = int(k);
+            v.name = kv.second.name.size() > 3 ? kv.second.name.substr(3) : kv.second.name;
+            if (!seen.insert(roadVariantShape(kv.first, int(k), v.label, v.order)).second) continue;  // the same result as another end
+            out.push_back(v);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const RoadVariant& a, const RoadVariant& b) { return a.order != b.order ? a.order < b.order : a.name < b.name; });
+    return out;
+}
+
+// Where a variant goes when it is attached to the strip's target end.
+bool roadVariantPlacement(const RoadVariant& v, IplInstance& out) {
+    if (!isRoadPiece(rb.target)) return false;
+    const std::vector<RoadEnd>& te = roadEndsOf(app.instances[rb.target].id);
+    if (rb.targetEnd < 0 || rb.targetEnd >= int(te.size())) return false;
+    const std::vector<RoadEnd>& ve = roadEndsOf(v.id);
+    if (v.end < 0 || v.end >= int(ve.size())) return false;
+    const RoadEnd target = endInWorld(app.instances[rb.target], te[size_t(rb.targetEnd)]);
+    out = IplInstance();
+    out.id = v.id;
+    out.model = app.defs[v.id].name;
+    return attachPlacement(target, ve[size_t(v.end)], out.x, out.y, out.z, out.rotX, out.rotY, out.rotZ, out.rotW);
+}
+
+void roadStripRefresh();
+
+// Point the strip at an end of a placed piece.
+void roadSetTarget(int idx, int end) {
+    rb.target = idx;
+    rb.targetEnd = end;
+    rb.hover = -1;
+    rb.scroll = 0;
+    const std::vector<RoadEnd>& e = roadEndsOf(app.instances[idx].id);
+    rb.variants = roadVariantsFor(e[size_t(end)].width);
+    for (RoadVariant& v : rb.variants) {
+        auto t = rb.thumbCache.find({v.id, v.end});
+        v.thumb = t == rb.thumbCache.end() ? nullptr : t->second;
+        if (!v.thumb) rb.thumbsPending = true;
+    }
+    roadStripRefresh();
+}
+
+LRESULT CALLBACK roadStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp);
+
+void openRoadStrip(int idx, int end) {
+    if (!isRoadPiece(idx)) return;
+    if (!rb.strip) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = roadStripProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_HAND);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdRoadStrip";
+        RegisterClassA(&wc);
+        rb.strip = CreateWindowExA(WS_EX_CLIENTEDGE, "MEdRoadStrip", "", WS_CHILD | WS_CLIPCHILDREN, app.viewX, app.toolbarH, app.width, kStripH, app.hwnd, nullptr,
+                                   GetModuleHandle(nullptr), nullptr);
+        rb.closeButton = CreateWindowA("BUTTON", "Close (Esc)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, 0, 0, 90, 22, rb.strip, (HMENU)1, GetModuleHandle(nullptr), nullptr);
+        SendMessageA(rb.closeButton, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    }
+    roadSetTarget(idx, end);
+    MoveWindow(rb.strip, app.viewX, app.toolbarH, app.width, kStripH, TRUE);
+    MoveWindow(rb.closeButton, app.width - 100, 2, 90, 22, TRUE);
+    ShowWindow(rb.strip, SW_SHOW);
+}
+
+void closeRoadStrip() {
+    if (rb.strip) ShowWindow(rb.strip, SW_HIDE);
+    rb.hover = -1;
+    rb.target = -1;
+    rb.targetEnd = -1;
+}
+
+bool roadStripOpen() { return rb.strip && IsWindowVisible(rb.strip); }
+
+// Place a variant at the target end: the piece (and its LOD stand-in when the model has one) into the target's file,
+// one undo step, selected; the strip moves on to the new piece's end straight ahead (else its first open end).
+int placeRoadVariant(int vi) {
+    if (vi < 0 || vi >= int(rb.variants.size())) return -1;
+    const RoadVariant v = rb.variants[size_t(vi)];
+    IplInstance p;
+    if (!roadVariantPlacement(v, p)) {
+        rb.lastMessage = "That end is tilted, so a level piece cannot be attached to it.";
+        if (!insp.quiet) MessageBoxA(app.hwnd, rb.lastMessage.c_str(), "Attach road piece", MB_ICONINFORMATION);
+        return -1;
+    }
+    const int file = app.instFile[size_t(rb.target)];
+    app.history.snapshot(captureState());
+    app.instances.push_back(p);
+    app.instFile.push_back(file);
+    const int idx = int(app.instances.size()) - 1;
+    const int lod = lodModelIdFor(v.id);
+    if (lod >= 0) {
+        IplInstance l = p;
+        l.id = lod;
+        l.model = app.defs[lod].name;
+        app.instances.push_back(l);
+        app.instFile.push_back(file);
+    }
+    app.dirty.insert(file);
+    app.selected.assign(1, idx);
+    app.history.endSession();
+    buildLodPartnerRanges();
+    refreshRegions();
+    // carry on from the new piece: the end straight ahead of the joining one, else the first open one
+    const std::vector<RoadEnd>& e = roadEndsOf(v.id);
+    const RoadEnd& j = e[size_t(v.end)];
+    int next = -1;
+    for (size_t k = 0; k < e.size(); ++k)
+        if (int(k) != v.end && e[k].dx * j.dx + e[k].dy * j.dy < -0.5 && !roadEndJoined(idx, endInWorld(app.instances[idx], e[k]))) next = int(k);
+    for (size_t k = 0; k < e.size() && next < 0; ++k)
+        if (int(k) != v.end && !roadEndJoined(idx, endInWorld(app.instances[idx], e[k]))) next = int(k);
+    if (next >= 0 && roadStripOpen()) roadSetTarget(idx, next);
+    else closeRoadStrip();
+    return idx;
+}
+
+// The node under the mouse (client coordinates of the 3D view), -1 for none; `open` says whether it is free.
+int roadNodeAt(int mx, int my, bool* open = nullptr) {
+    const int piece = roadNodePiece();
+    if (piece < 0) return -1;
+    glViewport(app.viewX, 0, app.width, app.height);
+    setViewMatrices(-1, -1);
+    GLdouble mv[16], pr[16];
+    GLint vp[4];
+    glGetDoublev(GL_MODELVIEW_MATRIX, mv);
+    glGetDoublev(GL_PROJECTION_MATRIX, pr);
+    glGetIntegerv(GL_VIEWPORT, vp);
+    const std::vector<RoadEnd>& e = roadEndsOf(app.instances[piece].id);
+    int best = -1;
+    double bestD = 18;
+    for (size_t k = 0; k < e.size(); ++k) {
+        const RoadEnd w = endInWorld(app.instances[piece], e[k]);
+        GLdouble sx, sy, sz;
+        if (!gluProject(w.x, w.y, w.z + 1.5, mv, pr, vp, &sx, &sy, &sz) || sz < 0 || sz > 1) continue;
+        const double d = std::hypot(sx - mx, (vp[3] - sy) - my);
+        if (d < bestD) { bestD = d; best = int(k); }
+    }
+    if (best >= 0 && open) *open = !roadEndJoined(piece, endInWorld(app.instances[piece], e[size_t(best)]));
+    return best;
+}
+
+// A click (no drag) in the 3D view: on an open node it opens the strip there. True when it was a node.
+bool roadClick(int mx, int my) {
+    bool open = false;
+    const int k = roadNodeAt(mx, my, &open);
+    if (k < 0) return false;
+    if (!open) {
+        rb.lastMessage = "That end is already joined to another road piece.";
+        return true;
+    }
+    openRoadStrip(roadNodePiece(), k);
+    return true;
+}
+
+// Drawn after the map: the nodes of the selected road piece and the previewed piece.
+void drawRoadOverlay() {
+    if (!rb.sphere) rb.sphere = gluNewQuadric();
+    // the preview: the hovered piece where it would go, with a cyan box round it
+    if ((roadStripOpen() || rb.forcePreview) && rb.hover >= 0 && rb.hover < int(rb.variants.size())) {
+        IplInstance p;
+        if (roadVariantPlacement(rb.variants[size_t(rb.hover)], p)) {
+            const ModelDef& def = app.defs[p.id];
+            GlModel& gm = getModel(def.model, def.txd);
+            glPushMatrix();
+            applyPlacement(p);
+            drawModel(gm);
+            glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT | GL_POLYGON_BIT);
+            glDisable(GL_LIGHTING);
+            glDisable(GL_TEXTURE_2D);
+            glColor3f(0, 1, 1);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            double lo[2] = {1e9, 1e9}, hi[2] = {-1e9, -1e9};  // the model's own extent
+            for (const GlGeometry& g : gm.geoms)
+                for (size_t i = 0; i + 2 < g.pos.size(); i += 3)
+                    for (int k = 0; k < 2; ++k) { lo[k] = std::min(lo[k], double(g.pos[i + k])); hi[k] = std::max(hi[k], double(g.pos[i + k])); }
+            glBegin(GL_LINE_LOOP);
+            glVertex3d(lo[0], lo[1], 0.3); glVertex3d(hi[0], lo[1], 0.3); glVertex3d(hi[0], hi[1], 0.3); glVertex3d(lo[0], hi[1], 0.3);
+            glEnd();
+            glPopAttrib();
+            glPopMatrix();
+        }
+    }
+    const int piece = roadNodePiece();
+    if (piece < 0) return;
+    glPushAttrib(GL_ENABLE_BIT | GL_CURRENT_BIT);
+    glDisable(GL_TEXTURE_2D);
+    const std::vector<RoadEnd>& e = roadEndsOf(app.instances[piece].id);
+    for (size_t k = 0; k < e.size(); ++k) {
+        const RoadEnd w = endInWorld(app.instances[piece], e[k]);
+        const bool joined = roadEndJoined(piece, w);
+        const bool isTarget = (roadStripOpen() || rb.forcePreview) && piece == rb.target && int(k) == rb.targetEnd;
+        if (isTarget) glColor3f(1, 0.85f, 0);        // the end the strip attaches to: yellow
+        else if (joined) glColor3f(0.35f, 0.35f, 0.35f);  // joined: dim
+        else glColor3f(0.1f, 0.9f, 0.2f);            // open: green
+        glPushMatrix();
+        glTranslated(w.x, w.y, w.z + 1.5);
+        gluSphere(rb.sphere, isTarget ? 1.8 : 1.4, 16, 12);
+        glPopMatrix();
+    }
+    glPopAttrib();
+}
+
+// Thumbnails are drawn into the back buffer before a frame and read back (the frame then clears over them): the piece
+// turned so its joining end points down, seen from above and behind that end.
+void renderRoadThumbnails() {
+    if (!rb.thumbsPending) return;
+    rb.thumbsPending = false;
+    for (RoadVariant& v : rb.variants) {
+        if (v.thumb) continue;
+        auto c = rb.thumbCache.find({v.id, v.end});
+        if (c != rb.thumbCache.end()) { v.thumb = c->second; continue; }
+        const ModelDef& def = app.defs[v.id];
+        GlModel& gm = getModel(def.model, def.txd);
+        const RoadEnd& j = roadEndsOf(v.id)[size_t(v.end)];
+        double lo[3] = {1e9, 1e9, 1e9}, hi[3] = {-1e9, -1e9, -1e9};
+        for (const GlGeometry& g : gm.geoms)
+            for (size_t i = 0; i + 2 < g.pos.size(); i += 3)
+                for (int k = 0; k < 3; ++k) { lo[k] = std::min(lo[k], double(g.pos[i + k])); hi[k] = std::max(hi[k], double(g.pos[i + k])); }
+        const double cx = (lo[0] + hi[0]) / 2, cy = (lo[1] + hi[1]) / 2, cz = (lo[2] + hi[2]) / 2;
+        const double r = std::max(5.0, std::hypot(hi[0] - lo[0], hi[1] - lo[1]) / 2);
+        glViewport(app.viewX, 0, kThumbW, kThumbH);
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(app.viewX, 0, kThumbW, kThumbH);
+        glClearColor(0.18f, 0.2f, 0.24f, 1);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glDisable(GL_SCISSOR_TEST);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        gluPerspective(40, double(kThumbW) / kThumbH, 1, 4000);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        gluLookAt(0, -r * 1.9, r * 1.7, 0, 0, 0, 0, 0, 1);  // from the south, above
+        const GLfloat lightPos[4] = {0.3f, -1, 1, 0};
+        glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
+        glRotated(std::atan2(-1.0, 0.0) * 57.29577951 - std::atan2(j.dy, j.dx) * 57.29577951, 0, 0, 1);  // joining end towards the camera
+        glTranslated(-cx, -cy, -cz);
+        glEnable(GL_DEPTH_TEST);
+        drawModel(gm);
+        std::vector<unsigned char> px(size_t(kThumbW) * kThumbH * 4);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(app.viewX, 0, kThumbW, kThumbH, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = kThumbW;
+        bi.bmiHeader.biHeight = kThumbH;  // bottom-up, as glReadPixels gives it
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (bmp && bits) {
+            unsigned char* d = static_cast<unsigned char*>(bits);
+            for (size_t i = 0; i < size_t(kThumbW) * kThumbH; ++i) {  // RGBA -> BGRA
+                d[i * 4] = px[i * 4 + 2];
+                d[i * 4 + 1] = px[i * 4 + 1];
+                d[i * 4 + 2] = px[i * 4];
+                d[i * 4 + 3] = 255;
+            }
+        }
+        rb.thumbCache[{v.id, v.end}] = bmp;
+        v.thumb = bmp;
+    }
+    glClearColor(0, 0, 0, 0);
+    glViewport(app.viewX, 0, app.width, app.height);
+    setViewMatrices(-1, -1);  // the frame's light is set under this view, as every frame
+    if (rb.strip) InvalidateRect(rb.strip, nullptr, FALSE);
+}
+
+int roadStripItemAt(int x, int y) {
+    if (y < 26 || y > 26 + kThumbH + 34) return -1;
+    const int i = (x + rb.scroll - 6) / kStripItemW;
+    if (x + rb.scroll - 6 < 0 || i < 0 || i >= int(rb.variants.size())) return -1;
+    return i;
+}
+
+void roadStripRefresh() {
+    if (rb.strip) InvalidateRect(rb.strip, nullptr, TRUE);
+}
+
+LRESULT CALLBACK roadStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(w, &ps);
+            RECT cr;
+            GetClientRect(w, &cr);
+            HDC mem = CreateCompatibleDC(dc);  // drawn off screen, so scrolling does not flicker
+            HBITMAP back = CreateCompatibleBitmap(dc, cr.right, cr.bottom);
+            HGDIOBJ oldBack = SelectObject(mem, back);
+            FillRect(mem, &cr, GetSysColorBrush(COLOR_BTNFACE));
+            SelectObject(mem, GetStockObject(DEFAULT_GUI_FONT));
+            SetBkMode(mem, TRANSPARENT);
+            std::string head;
+            if (isRoadPiece(rb.target)) {
+                const RoadEnd& e = roadEndsOf(app.instances[rb.target].id)[size_t(rb.targetEnd)];
+                head = "Attach to the yellow end of " + app.instances[rb.target].model + " (" + std::to_string(int(std::round(e.width))) + " wide): " +
+                       std::to_string(rb.variants.size()) + " pieces fit. Hover to preview, click to place. Mouse wheel scrolls.";
+            }
+            TextOutA(mem, 8, 6, head.c_str(), int(head.size()));
+            HDC tdc = CreateCompatibleDC(dc);
+            for (size_t i = 0; i < rb.variants.size(); ++i) {
+                const int x = 6 + int(i) * kStripItemW - rb.scroll, y = 26;
+                if (x + kStripItemW < 0 || x > cr.right) continue;
+                const RoadVariant& v = rb.variants[i];
+                RECT box = {x - 2, y - 2, x + kThumbW + 2, y + kThumbH + 34};
+                if (int(i) == rb.hover) FillRect(mem, &box, GetSysColorBrush(COLOR_HIGHLIGHT));
+                if (v.thumb) {
+                    HGDIOBJ o = SelectObject(tdc, v.thumb);
+                    BitBlt(mem, x, y, kThumbW, kThumbH, tdc, 0, 0, SRCCOPY);
+                    SelectObject(tdc, o);
+                } else {
+                    RECT t = {x, y, x + kThumbW, y + kThumbH};
+                    FillRect(mem, &t, GetSysColorBrush(COLOR_3DSHADOW));
+                }
+                SetTextColor(mem, GetSysColor(int(i) == rb.hover ? COLOR_HIGHLIGHTTEXT : COLOR_BTNTEXT));
+                RECT t1 = {x, y + kThumbH + 2, x + kThumbW, y + kThumbH + 16};
+                DrawTextA(mem, v.name.c_str(), -1, &t1, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                RECT t2 = {x - 4, y + kThumbH + 16, x + kThumbW + 4, y + kThumbH + 32};
+                DrawTextA(mem, v.label.c_str(), -1, &t2, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+            DeleteDC(tdc);
+            BitBlt(dc, 0, 0, cr.right, cr.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, oldBack);
+            DeleteObject(back);
+            DeleteDC(mem);
+            EndPaint(w, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_MOUSEMOVE: {
+            if (!rb.tracking) {
+                TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, w, 0};
+                TrackMouseEvent(&t);
+                rb.tracking = true;
+            }
+            const int i = roadStripItemAt(int(short(LOWORD(lp))), int(short(HIWORD(lp))));
+            if (i != rb.hover) {
+                rb.hover = i;
+                InvalidateRect(w, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            rb.tracking = false;
+            if (rb.hover != -1) {
+                rb.hover = -1;
+                InvalidateRect(w, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP: {
+            const int i = roadStripItemAt(int(short(LOWORD(lp))), int(short(HIWORD(lp))));
+            if (i >= 0) placeRoadVariant(i);
+            InvalidateRect(w, nullptr, FALSE);
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {
+            const int total = int(rb.variants.size()) * kStripItemW + 12;
+            RECT cr;
+            GetClientRect(w, &cr);
+            rb.scroll = std::max(0, std::min(rb.scroll - GET_WHEEL_DELTA_WPARAM(wp) / 120 * kStripItemW, std::max(0, total - int(cr.right))));
+            const POINT pt = {int(short(LOWORD(lp))), int(short(HIWORD(lp)))};
+            POINT c = pt;
+            ScreenToClient(w, &c);
+            rb.hover = roadStripItemAt(c.x, c.y);
+            InvalidateRect(w, nullptr, FALSE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == 1) closeRoadStrip();
+            return 0;
+        case WM_USER + 1:  // tests: hover item wp (-1 none) without the real mouse, which would report leaving at once
+            rb.hover = int(wp) >= 0 && int(wp) < int(rb.variants.size()) ? int(wp) : -1;
+            InvalidateRect(w, nullptr, FALSE);
+            return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// Ctrl+R: the strip on the selected road piece's first open end (the same as clicking that node).
+void roadAttachFirstOpen(HWND owner) {
+    const int piece = app.selected.size() == 1 ? app.selected[0] : -1;
+    if (!isRoadPiece(piece)) {
+        rb.lastMessage = "Select one road piece (a model named rd_...) first; its ends show as balls you can click.";
+        if (!insp.quiet) MessageBoxA(owner, rb.lastMessage.c_str(), "Attach road piece", MB_ICONINFORMATION);
+        return;
+    }
+    const std::vector<RoadEnd>& e = roadEndsOf(app.instances[piece].id);
+    for (size_t k = 0; k < e.size(); ++k)
+        if (!roadEndJoined(piece, endInWorld(app.instances[piece], e[k]))) {
+            openRoadStrip(piece, int(k));
+            return;
+        }
+    rb.lastMessage = "Every end of this road piece is already joined to another piece.";
+    if (!insp.quiet) MessageBoxA(owner, rb.lastMessage.c_str(), "Attach road piece", MB_ICONINFORMATION);
+}
+
+// Once a frame: the strip closes when its target is no longer there (undo, delete, another selection).
+void roadSync() {
+    if (!roadStripOpen()) return;
+    const bool targetOk = isRoadPiece(rb.target) && std::find(app.selected.begin(), app.selected.end(), rb.target) != app.selected.end() && app.selected.size() == 1;
+    if (!targetOk) closeRoadStrip();
 }
 
 // The tabs at the top of the left column: Scene (which regions are shown), Placements and Item.
@@ -4193,7 +5087,7 @@ void runInspectorSelfTest(SelfTest& t) {
         stinsp::hold(stinsp::nudgeId(0, 2), 1200);
         const double moved = app.instances[cone].x - xs;
         const double steps = moved / 0.1;
-        ST_CHECK(t, steps >= 6 && std::fabs(steps - std::round(steps)) < 1e-6, "holding > repeats whole steps (" + num(steps, 2) + " steps)");
+        ST_CHECK(t, steps >= 2 && std::fabs(steps - std::round(steps)) < 1e-6, "holding > repeats whole steps ("  /* at least the press and one repeat: a busy PC delays the timer */ + num(steps, 2) + " steps)");
         ST_CHECK(t, app.history.undoCount() == std::min(undoBefore + 1, kUndoLimit), "a held button is one undo step");
         const double after = app.instances[cone].x;
         stinsp::click(stinsp::nudgeId(0, 2));
@@ -4471,6 +5365,9 @@ void runItemSelfTest(SelfTest& t) {
         stitem::search("");
         int barrier = -1;
         for (size_t i = 0; i < app.instances.size(); ++i) if (app.instances[i].model == "bar_barrier10") { barrier = int(i); break; }
+        if (barrier < 0) barrier = 0;  // earlier random edits may have replaced every barrier: any placement will do
+        app.selected.clear();          // a NEW selection (the same one again would rightly leave the list alone)
+        itSyncFromSelection();
         app.selected.assign(1, barrier);
         itSyncFromSelection();
         ST_CHECK(t, itSelectedId() == app.instances[barrier].id, "selecting in 3D highlights the item");
@@ -4557,12 +5454,491 @@ void stBookmarkInvariants(SelfTest& t, const std::string& when) {
     }
 }
 
+// Extract Object: copies only. Every file written must equal what the game holds, the map and the game's files must not
+// change, and a selection gives each model once.
+void runExtractSelfTest(SelfTest& t) {
+    namespace fs = std::filesystem;
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string out = std::string(tmp) + "med_selftest_extract_" + std::to_string(GetCurrentProcessId());  // own folder per run (runs may go in parallel)
+    std::error_code ec;
+    fs::remove_all(out, ec);
+    auto fingerprint = [](const std::string& p) {
+        std::error_code e;
+        return std::to_string(fs::file_size(p, e)) + "@" + std::to_string(fs::last_write_time(p, e).time_since_epoch().count());
+    };
+    std::vector<std::string> gameFiles = app.colFiles;
+    gameFiles.push_back(app.img.path());
+    std::vector<std::string> before;
+    for (const std::string& f : gameFiles) before.push_back(fingerprint(f));
+    auto mapState = [] {
+        std::string s = std::to_string(app.instances.size()) + "/" + std::to_string(app.history.undoCount()) + "/" + std::to_string(app.dirty.size());
+        for (const IplInstance& o : app.instances) s += std::to_string(o.id) + "," + std::to_string(o.x) + "," + std::to_string(o.y) + "," + std::to_string(o.z) + "," + std::to_string(o.rotW) + ";";
+        return s;
+    };
+    const std::string mapBefore = mapState();
+
+    // a spread of models: every 25th definition plus the ones the guide talks about
+    std::vector<int> ids;
+    int n = 0;
+    for (const auto& kv : app.defs)
+        if (n++ % 25 == 0) ids.push_back(kv.first);
+    for (const auto& kv : app.defs)
+        for (const char* name : {"trafficcone", "hospitaland", "lodpitaland"})
+            if (kv.second.model == name) ids.push_back(kv.first);
+    const std::vector<ExtractResult> results = extractModelsTo(out, ids);
+    ST_CHECK(t, results.size() == ids.size(), "one result per model (" + std::to_string(ids.size()) + ")");
+    int withCol = 0;
+    for (size_t i = 0; i < results.size() && i < ids.size(); ++i) {
+        const ModelDef& def = app.defs[ids[i]];
+        const ExtractResult& r = results[i];
+        const std::string dir = out + "/" + def.name;
+        std::vector<unsigned char> want, got;
+        std::string err;
+        bool ok;
+        const bool inImg = app.img.extract(def.name + ".dff", want, err);
+        std::string bytes = inImg ? slurp(dir + "/" + def.name + ".dff", ok) : std::string();
+        ST_CHECK(t, !inImg || std::string(want.begin(), want.end()) == bytes, def.name + ".dff is a byte copy of the archive entry");
+        if (def.txd != "generic" && app.img.extract(def.txd + ".txd", want, err)) {
+            bytes = slurp(dir + "/" + def.txd + ".txd", ok);
+            ST_CHECK(t, ok && std::string(want.begin(), want.end()) == bytes, def.name + ": " + def.txd + ".txd is a byte copy");
+        }
+        bytes = slurp(dir + "/" + def.name + ".col", ok);
+        if (ok) {
+            ++withCol;
+            std::vector<ColModel> models;
+            ST_CHECK(t, parseCol(std::vector<unsigned char>(bytes.begin(), bytes.end()), models, err) && models.size() == 1 && toLower(models[0].name) == def.model,
+                     def.name + ".col is a valid one-model COL file of that model");
+            ST_CHECK(t, !r.colSource.empty(), def.name + ": the COL source is named");
+        } else {
+            ST_CHECK(t, r.colSource.empty() && !r.warnings.empty(), def.name + ": a missing collision is reported, not hidden");
+        }
+        const std::string info = slurp(dir + "/" + def.name + ".txt", ok);
+        ST_CHECK(t, ok && info.find("IDE line: " + def.ideLine) != std::string::npos, def.name + ".txt holds the IDE line");
+        ST_CHECK(t, extractTargetsThatExist(out, extractRequestFor(ids[i])).size() == r.written.size(), def.name + ": every file written is found again (overwrite question)");
+    }
+    ST_CHECK(t, withCol * 10 >= int(ids.size()) * 9, "nearly every model has its collision copied (" + std::to_string(withCol) + " of " + std::to_string(ids.size()) + ")");
+    for (size_t i = 0; i < gameFiles.size(); ++i) ST_CHECK(t, fingerprint(gameFiles[i]) == before[i], "extracting does not touch " + gameFiles[i]);
+    ST_CHECK(t, mapState() == mapBefore, "extracting does not change the map, the undo list or the unsaved files");
+
+    // a selection: each model once, in order; bad indexes ignored
+    int a = -1, b = -1;
+    for (int i = 0; i < int(app.instances.size()) && b < 0; ++i) {
+        if (a < 0) a = i;
+        else if (app.instances[i].id != app.instances[a].id) b = i;
+    }
+    int a2 = -1;
+    for (int i = 0; i < int(app.instances.size()); ++i)
+        if (i != a && app.instances[i].id == app.instances[a].id) a2 = i;
+    const std::vector<int> m = modelIdsOf({a, b, a2 >= 0 ? a2 : a, -5, int(app.instances.size()) + 3});
+    ST_CHECK(t, m.size() == 2 && m[0] == app.instances[a].id && m[1] == app.instances[b].id, "a selection gives each model once");
+    ST_CHECK(t, modelIdsOf({}).empty() && extractModelsTo(out, {-12345}).empty(), "nothing selected or an unknown id extracts nothing");
+    fs::remove_all(out, ec);
+}
+
+// Replace Object: a building and its LOD stand-in are replaced as a pair; everything else stays exactly as it was, and
+// one undo brings the whole map back.
+std::string stMapState() {
+    std::string s = std::to_string(app.instances.size()) + "|";
+    char b[256];
+    for (size_t i = 0; i < app.instances.size(); ++i) {
+        const IplInstance& o = app.instances[i];
+        std::snprintf(b, sizeof b, "%d,%s,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%d;", o.id, o.model.c_str(), o.x, o.y, o.z, o.rotX, o.rotY, o.rotZ, o.rotW, app.instFile[i]);
+        s += b;
+    }
+    return s;
+}
+
+int stModelId(const char* name) {
+    for (const auto& kv : app.defs)
+        if (kv.second.model == toLower(name)) return kv.first;
+    return -1;
+}
+
+int stPlacementOf(const char* name) {
+    for (size_t i = 0; i < app.instances.size(); ++i)
+        if (toLower(app.instances[i].model) == toLower(name)) return int(i);
+    return -1;
+}
+
+void runReplaceSelfTest(SelfTest& t) {
+    insp.quiet = true;
+    const int supaSave = stModelId("SupaSave"), lodSupaSave = stModelId("LODaSave"), petfoodId = stModelId("petfoodfactory");
+    ST_CHECK(t, supaSave >= 0 && lodSupaSave >= 0 && petfoodId >= 0, "the test models are defined");
+    if (supaSave < 0 || lodSupaSave < 0 || petfoodId < 0) return;
+    // the earlier sections edit the map at random, so pick the placements from what is there now: the hospital when it
+    // is still a pair, else any building with exactly one stand-in; and any building with no stand-in and no LOD model
+    const std::vector<bool> origAtStart = originalFlags();
+    auto isPairBuilding = [&](int i) {
+        if (!origAtStart[size_t(i)]) return false;
+        const IplInstance& o = app.instances[size_t(i)];
+        if (app.defs[o.id].farModel || o.id == supaSave || o.id == petfoodId) return false;
+        const std::vector<size_t> p = findLodPartners(app.instances, size_t(i));
+        return p.size() == 1 && origAtStart[p[0]] && app.defs[app.instances[p[0]].id].farModel && app.instances[p[0]].id != lodSupaSave && app.instances[p[0]].z != kSunkZ && findLodPartners(app.instances, p[0]).size() == 1;
+    };
+    int hospital = stPlacementOf("hospitaland"), petfood = -1;
+    if (hospital >= 0 && !isPairBuilding(hospital)) hospital = -1;
+    for (int i = 0; i < int(app.instances.size()) && hospital < 0; ++i) if (isPairBuilding(i)) hospital = i;
+    for (int i = 0; i < int(app.instances.size()) && petfood < 0; ++i) {
+        const IplInstance& o = app.instances[size_t(i)];
+        if (!app.defs[o.id].farModel && o.id != supaSave && lodModelIdFor(o.id) < 0 && findLodPartners(app.instances, size_t(i)).empty()) petfood = i;
+    }
+    ST_CHECK(t, hospital >= 0 && petfood >= 0, "a building with a stand-in and one without are on the map");
+    if (hospital < 0 || petfood < 0) return;
+    ST_CHECK(t, lodModelIdFor(supaSave) == lodSupaSave && lodModelIdFor(petfoodId) == -1 && lodModelIdFor(lodSupaSave) == -1, "the LOD model of a building is found by name");
+    const std::vector<size_t> hospLods = findLodPartners(app.instances, size_t(hospital));
+    ST_CHECK(t, hospLods.size() == 1, "the building has its LOD stand-in");
+    if (hospLods.size() != 1) return;
+    const int hospLod = int(hospLods[0]);
+    const std::string before = stMapState();
+    const size_t undoBefore = app.history.undoCount();
+    ReplaceReport rep;
+
+    // refused or nothing to do: no change, no undo step
+    app.selected.clear();
+    ST_CHECK(t, !setModelId(app.hwnd, supaSave, &rep), "nothing selected: nothing to replace");
+    app.selected = {hospital};
+    ST_CHECK(t, !setModelId(app.hwnd, 999999, &rep), "an unknown model ID is refused");
+    ST_CHECK(t, setModelId(app.hwnd, app.instances[hospital].id, &rep) && rep.replaced == 0, "the same model again changes nothing");
+    ST_CHECK(t, stMapState() == before && app.history.undoCount() == undoBefore, "refusals and no-ops leave the map and the undo list alone");
+
+    const IplInstance hospWas = app.instances[hospital], lodWas = app.instances[hospLod];
+    const size_t countWas = app.instances.size();
+
+    // 1. the new building has a LOD model: the stand-in gets it
+    app.selected = {hospital};
+    ST_CHECK(t, setModelId(app.hwnd, supaSave, &rep), "hospital -> SupaSave");
+    ST_CHECK(t, rep.replaced == 1 && rep.lodSwitched == 1 && rep.lodSunk == 0 && rep.lodAdded == 0, "one replaced, its stand-in switched");
+    {
+        const IplInstance &h = app.instances[hospital], &l = app.instances[hospLod];
+        ST_CHECK(t, h.id == supaSave && h.model == app.defs[supaSave].name && h.x == hospWas.x && h.y == hospWas.y && h.z == hospWas.z && h.rotW == hospWas.rotW && h.rotZ == hospWas.rotZ,
+                 "the building has the new model at the same place and turn");
+        ST_CHECK(t, l.id == lodSupaSave && l.x == lodWas.x && l.y == lodWas.y && l.z == lodWas.z && l.rotW == lodWas.rotW, "the stand-in has the new LOD model at the same place");
+        const std::vector<size_t> p = findLodPartners(app.instances, size_t(hospital));
+        ST_CHECK(t, p.size() == 1 && int(p[0]) == hospLod, "the new pair is a pair");
+        ST_CHECK(t, app.instances.size() == countWas && app.history.undoCount() == std::min(undoBefore + 1, kUndoLimit), "nothing added, one undo step");
+        ST_CHECK(t, app.selected == std::vector<int>{hospital}, "the selection stays on the replaced object");
+    }
+    stInvariants(t, "replace with LOD");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo brings the whole map back");
+    ST_CHECK(t, redoAction() && app.instances[hospital].id == supaSave && app.instances[hospLod].id == lodSupaSave, "redo replaces again");
+    ST_CHECK(t, undoAction() && stMapState() == before, "and undo again");
+
+    // 2. the new building has no LOD model: the old stand-in goes below the map
+    app.selected = {hospital};
+    ST_CHECK(t, setModelId(app.hwnd, petfoodId, &rep) && rep.replaced == 1 && rep.lodSunk == 1 && rep.lodSwitched == 0 && rep.lodAdded == 0, "hospital -> petfoodfactory");
+    ST_CHECK(t, app.instances[hospLod].z == kSunkZ && app.instances[hospLod].id == lodWas.id && app.instances[hospLod].x == lodWas.x, "the old stand-in is below the map, otherwise unchanged");
+    stInvariants(t, "replace without LOD");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo");
+
+    // 3. the old building had no stand-in, the new one has a LOD model: one is added
+    const IplInstance petWas = app.instances[petfood];
+    app.selected = {petfood};
+    ST_CHECK(t, setModelId(app.hwnd, supaSave, &rep) && rep.replaced == 1 && rep.lodAdded == 1, "petfoodfactory -> SupaSave adds a stand-in");
+    {
+        const IplInstance& n = app.instances.back();
+        ST_CHECK(t, app.instances.size() == countWas + 1 && n.id == lodSupaSave && n.x == petWas.x && n.y == petWas.y && n.z == petWas.z && n.rotW == petWas.rotW &&
+                        app.instFile.back() == app.instFile[petfood],
+                 "the new stand-in sits at the building's place and turn, in its file");
+        const std::vector<size_t> p = findLodPartners(app.instances, size_t(petfood));
+        ST_CHECK(t, p.size() == 1 && p[0] == app.instances.size() - 1, "and pairs with it");
+    }
+    stInvariants(t, "replace adds LOD");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo removes the added stand-in");
+
+    // 4. building and stand-in both selected: the stand-in is not turned into a building
+    app.selected = {hospital, hospLod};
+    ST_CHECK(t, setModelId(app.hwnd, supaSave, &rep) && rep.replaced == 1 && rep.lodSwitched == 1, "building + its stand-in selected");
+    ST_CHECK(t, app.instances[hospital].id == supaSave && app.instances[hospLod].id == lodSupaSave, "the stand-in gets the LOD model, not the building");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo");
+
+    // 5. only the stand-in selected: just it changes (the user asked for exactly that one)
+    app.selected = {hospLod};
+    ST_CHECK(t, setModelId(app.hwnd, lodSupaSave, &rep) && rep.replaced == 1 && rep.lodSwitched + rep.lodSunk + rep.lodAdded == 0, "a stand-in alone");
+    ST_CHECK(t, app.instances[hospLod].id == lodSupaSave && app.instances[hospital].id == hospWas.id, "the building is untouched");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo");
+
+    // 6. a building turned into a far model: the old stand-in would show the old building, so it goes below the map
+    app.selected = {hospital};
+    ST_CHECK(t, setModelId(app.hwnd, lodSupaSave, &rep) && rep.replaced == 1 && rep.lodSunk == 1, "building -> a LOD model");
+    ST_CHECK(t, undoAction() && stMapState() == before, "undo");
+
+    // 7. the user's case: a DUPLICATED building replaced by one without a LOD model: the duplicate's stand-in (added, not in
+    //    the original game) is removed from the file; the original pair is untouched
+    {
+        ST_CHECK(t, originalFlags()[size_t(hospital)] && originalFlags()[size_t(hospLod)], "the original pair counts as original");
+        app.selected = {hospital};
+        const size_t n0 = app.instances.size();
+        ST_CHECK(t, duplicateSelected() == 2 && app.instances.size() == n0 + 2, "duplicate the building and its stand-in");
+        std::vector<bool> orig = originalFlags();
+        ST_CHECK(t, !orig[n0] && !orig[n0 + 1] && orig[size_t(hospital)] && orig[size_t(hospLod)], "the copies are added, the originals stay original");
+        int copy = -1, copyLod = -1;
+        for (int s2 : {int(n0), int(n0 + 1)}) (app.defs[app.instances[s2].id].farModel ? copyLod : copy) = s2;
+        ST_CHECK(t, copy >= 0 && copyLod >= 0, "a building copy and a stand-in copy");
+        app.selected = {copy};
+        const std::string dup = stMapState();
+        ST_CHECK(t, setModelId(app.hwnd, petfoodId, &rep) && rep.replaced == 1 && rep.lodRemoved == 1 && rep.lodSunk == 0, "the copy -> petfoodfactory removes the copied stand-in");
+        ST_CHECK(t, app.instances.size() == n0 + 1 && app.instances[size_t(copy)].id == petfoodId && app.selected == std::vector<int>{copy}, "one placement fewer, the copy replaced and still selected");
+        ST_CHECK(t, app.instances[size_t(hospital)].id == hospWas.id && app.instances[size_t(hospLod)].id == lodWas.id && app.instances[size_t(hospLod)].z == lodWas.z,
+                 "the original building and stand-in are untouched");
+        stInvariants(t, "replace a duplicate");
+        ST_CHECK(t, undoAction() && stMapState() == dup, "undo brings the copied stand-in back");
+        // the ORIGINAL replaced while the copy exists: its (original) stand-in is only moved below the map
+        app.selected = {hospital};
+        ST_CHECK(t, setModelId(app.hwnd, petfoodId, &rep) && rep.lodSunk == 1 && rep.lodRemoved == 0 && app.instances.size() == n0 + 2, "the original -> petfoodfactory sinks the original stand-in");
+        ST_CHECK(t, undoAction() && stMapState() == dup, "undo");
+        // the copy replaced by a building WITH a LOD model: the copied stand-in is switched, nothing removed
+        app.selected = {copy};
+        ST_CHECK(t, setModelId(app.hwnd, supaSave, &rep) && rep.lodSwitched == 1 && rep.lodRemoved == 0 && app.instances[size_t(copyLod)].id == lodSupaSave, "the copy -> SupaSave switches its stand-in");
+        ST_CHECK(t, undoAction() && stMapState() == dup, "undo");
+        ST_CHECK(t, undoAction() && stMapState() == before, "undo the duplicate too");
+    }
+
+    // 8. many random replaces: only the intended placements change, the count grows by what was added, undo restores
+    unsigned seed = 4242u;
+    auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return n <= 0 ? 0 : int((seed >> 8) % unsigned(n)); };
+    std::vector<int> ids;
+    for (const auto& kv : app.defs) ids.push_back(kv.first);
+    for (int round = 0; round < 300; ++round) {
+        const std::string was = stMapState();
+        const std::vector<IplInstance> old = app.instances;
+        app.selected.clear();
+        const int k = 1 + rnd(3);
+        for (int j = 0; j < k; ++j) {
+            const int idx = rnd(int(app.instances.size()));
+            if (std::find(app.selected.begin(), app.selected.end(), idx) == app.selected.end()) app.selected.push_back(idx);
+        }
+        const int to = ids[size_t(rnd(int(ids.size())))];
+        const std::vector<int> sel = app.selected;
+        const std::vector<int> oldFile = app.instFile;
+        const std::vector<bool> wasOriginal = originalFlags();
+        const size_t undoWas = app.history.undoCount();
+        if (!setModelId(app.hwnd, to, &rep)) { ST_CHECK(t, false, "a known model is accepted"); continue; }
+        ST_CHECK(t, app.instances.size() == old.size() + size_t(rep.lodAdded) - size_t(rep.lodRemoved), "the count changes exactly by the added and removed stand-ins");
+        // line the old placements up with the new ones: the removed ones (reported by Replace) are skipped, the rest keep
+        // their order
+        int changedId = 0, sunk = 0, removed = 0;
+        size_t j = 0;
+        for (size_t i = 0; i < old.size(); ++i) {
+            const IplInstance& a = old[i];
+            if (std::binary_search(rep.removedIdx.begin(), rep.removedIdx.end(), int(i))) {  // must be a stand-in the user had added
+                ++removed;
+                ST_CHECK(t, app.defs[a.id].farModel && !wasOriginal[i], "only an added LOD stand-in is removed from the file");
+                continue;
+            }
+            const IplInstance& b = app.instances[j++];
+            ST_CHECK(t, app.instFile[j - 1] == oldFile[i] && a.x == b.x && a.y == b.y && a.rotX == b.rotX && a.rotY == b.rotY && a.rotZ == b.rotZ && a.rotW == b.rotW,
+                     "no kept placement moves sideways, turns or changes file");
+            if (a.z != b.z) { ++sunk; ST_CHECK(t, b.z == kSunkZ && app.defs[b.id].farModel && wasOriginal[i], "only an original LOD stand-in changes height, to below the map"); }
+            if (a.id != b.id) {
+                ++changedId;
+                const bool selected = std::find(sel.begin(), sel.end(), int(i)) != sel.end();
+                ST_CHECK(t, (selected && (b.id == to || b.id == lodModelIdFor(to))) || (!selected && b.id == lodModelIdFor(to)), "a model only changes to the new model or its LOD model");
+            }
+        }
+        ST_CHECK(t, removed == rep.lodRemoved, "the removed count matches");
+        ST_CHECK(t, changedId == rep.replaced + rep.lodSwitched && sunk == rep.lodSunk, "the report matches what changed");
+        for (size_t i = j; i < app.instances.size(); ++i) ST_CHECK(t, app.instances[i].id == lodModelIdFor(to), "an added placement is the LOD model");
+        for (int i : app.selected) ST_CHECK(t, i >= 0 && i < int(app.instances.size()), "the selection still points at placements");
+        const bool anyChange = rep.replaced > 0;
+        ST_CHECK(t, app.history.undoCount() == (anyChange ? std::min(undoWas + 1, kUndoLimit) : undoWas), "one undo step, or none when nothing changed");
+        if (round % 25 == 0) stInvariants(t, "random replace");
+        if (anyChange) ST_CHECK(t, undoAction() && stMapState() == was, "undo restores the map exactly");
+    }
+    ST_CHECK(t, stMapState() == before, "after all rounds the map is as it was");
+    app.selected.clear();
+    stInvariants(t, "replace done");
+}
+
+// Road builder: nodes, strip, preview, attach. Every placed piece must meet the end it was attached to, nothing else in
+// the map may change, previews change nothing, and undo brings the map back exactly.
+void runRoadSelfTest(SelfTest& t) {
+    insp.quiet = true;
+    closeRoadStrip();
+    // a road piece in open space (far from the map) so both ends are free
+    int straightId = -1;
+    for (const auto& kv : app.defs) if (kv.second.model == "rd_road2a50") straightId = kv.first;
+    ST_CHECK(t, straightId >= 0 && roadEndsOf(straightId).size() == 2, "rd_Road2A50 is a road piece with two ends");
+    if (straightId < 0) return;
+    const int file = app.instFile[0];
+    if (!app.regionOn.empty()) app.regionOn[size_t(file)] = 1;  // earlier random steps may have hidden it (hidden pieces join nothing)
+    const std::string before = stMapState();
+    const size_t undo0 = app.history.undoCount();
+    const int piece = addNewObject(straightId, file, 3000, 3000, 20);
+    ST_CHECK(t, piece >= 0 && isRoadPiece(piece), "a straight placed in open space");
+    const std::string withPiece = stMapState();
+    for (const RoadEnd& e : roadEndsOf(straightId)) ST_CHECK(t, !roadEndJoined(piece, endInWorld(app.instances[piece], e)), "both ends of a lone piece are open");
+
+    // the joined check agrees with a brute-force search on Rockstar's own roads (all placements)
+    {
+        int checked = 0;
+        for (size_t i = 0; i < app.instances.size() && checked < 60; ++i) {
+            if (!isRoadPiece(int(i)) || app.instances[i].z <= kDeletedDepth) continue;
+            for (const RoadEnd& e : roadEndsOf(app.instances[i].id)) {
+                const RoadEnd w = endInWorld(app.instances[i], e);
+                bool brute = false;
+                for (size_t j = 0; j < app.instances.size() && !brute; ++j) {
+                    if (j == i || (!app.regionOn.empty() && !app.regionOn[app.instFile[j]])) continue;
+                    for (const RoadEnd& f : roadEndsOf(app.instances[j].id)) brute = brute || endsMeet(w, endInWorld(app.instances[j], f));
+                }
+                ST_CHECK(t, brute == roadEndJoined(int(i), w), "joined / open agrees with a search of the whole map");
+            }
+            ++checked;
+        }
+    }
+
+    // every distinct variant of every width attaches so that its joining end meets the target end, turned about z only
+    for (double width : {20.0, 30.0, 40.0}) {
+        const std::vector<RoadVariant> vs = roadVariantsFor(width);
+        ST_CHECK(t, !vs.empty(), "pieces fit a road " + num(width, 0) + " wide");
+        for (const RoadVariant& v : vs) {
+            const std::vector<RoadEnd>& ve = roadEndsOf(v.id);
+            ST_CHECK(t, v.end >= 0 && v.end < int(ve.size()) && std::fabs(ve[size_t(v.end)].width - width) <= 0.6 && ve.size() >= 2, v.name + ": the joining end fits");
+        }
+    }
+    app.selected.assign(1, piece);
+    openRoadStrip(piece, 1);
+    ST_CHECK(t, roadStripOpen() && rb.target == piece && rb.targetEnd == 1 && !rb.variants.empty(), "the strip opens on the chosen end");
+    const RoadEnd target = endInWorld(app.instances[piece], roadEndsOf(straightId)[1]);
+    for (size_t i = 0; i < rb.variants.size(); ++i) {
+        IplInstance p;
+        ST_CHECK(t, roadVariantPlacement(rb.variants[i], p), rb.variants[i].name + " can be placed");
+        ST_CHECK(t, endsMeet(target, endInWorld(p, roadEndsOf(p.id)[size_t(rb.variants[i].end)]), 1e-6), rb.variants[i].name + " " + rb.variants[i].label + ": its end meets the target end");
+        ST_CHECK(t, p.rotX == 0 && p.rotY == 0, rb.variants[i].name + ": turned about the vertical only");
+    }
+
+    // hovering previews and changes nothing
+    for (int i : {0, 3, int(rb.variants.size()) - 1, -1}) {
+        SendMessageA(rb.strip, WM_USER + 1, WPARAM(i), 0);
+        ST_CHECK(t, rb.hover == (i >= 0 ? i : -1), "hover follows the strip");
+        render();
+        ST_CHECK(t, stMapState() == withPiece && app.history.undoCount() == std::min(undo0 + 1, kUndoLimit), "a preview changes nothing");
+    }
+
+    // clicking a thumbnail places it: one placement (plus a LOD stand-in if the model has one), selected, one undo step,
+    // and the strip moves on to the new piece's far end
+    {
+        const int n0 = int(app.instances.size());
+        const size_t u0 = app.history.undoCount();
+        const RoadVariant v = rb.variants[0];
+        const int x = 6 + 0 * kStripItemW + 20, y = 26 + 20;
+        SendMessageA(rb.strip, WM_LBUTTONUP, 0, MAKELPARAM(x, y));
+        const int added = int(app.instances.size()) - n0;
+        ST_CHECK(t, added == (lodModelIdFor(v.id) >= 0 ? 2 : 1), "a click places the piece (and its LOD stand-in)");
+        const int fresh = n0;
+        ST_CHECK(t, app.selected == std::vector<int>{fresh} && app.instances[size_t(fresh)].id == v.id, "the new piece is selected");
+        ST_CHECK(t, app.history.undoCount() == std::min(u0 + 1, kUndoLimit), "one undo step");
+        ST_CHECK(t, roadEndJoined(piece, target), "the target end is joined now");
+        ST_CHECK(t, roadStripOpen() && rb.target == fresh && rb.targetEnd != v.end, "the strip moved on to the new piece's other end");
+        ST_CHECK(t, !roadEndJoined(fresh, endInWorld(app.instances[size_t(fresh)], roadEndsOf(v.id)[size_t(rb.targetEnd)])), "and that end is open");
+        stInvariants(t, "road piece placed");
+    }
+
+    // build a random road of 15 pieces (the undo list keeps 20 steps); every joint meets; then undo all of it exactly
+    {
+        unsigned seed = 909u;
+        auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return n <= 0 ? 0 : int((seed >> 8) % unsigned(n)); };
+        const std::string start = stMapState();
+        int placed = 0;
+        for (int k = 0; k < 15 && roadStripOpen(); ++k) {
+            const int tgt = rb.target, te = rb.targetEnd;
+            const RoadEnd tw = endInWorld(app.instances[size_t(tgt)], roadEndsOf(app.instances[size_t(tgt)].id)[size_t(te)]);
+            const int vi = rnd(int(rb.variants.size()));
+            const RoadVariant v = rb.variants[size_t(vi)];
+            const int idx = placeRoadVariant(vi);
+            if (idx < 0) { ST_CHECK(t, false, "a level end always takes a piece"); break; }
+            ++placed;
+            ST_CHECK(t, endsMeet(tw, endInWorld(app.instances[size_t(idx)], roadEndsOf(v.id)[size_t(v.end)]), 1e-4), "random road: the joint meets (" + v.name + " " + v.label + ")");
+            if (!roadStripOpen()) openRoadStrip(idx, 0);  // a dead end: carry on from another end so the road keeps growing
+            if (!isRoadPiece(rb.target)) break;
+            if (roadEndJoined(rb.target, endInWorld(app.instances[size_t(rb.target)], roadEndsOf(app.instances[size_t(rb.target)].id)[size_t(rb.targetEnd)]))) break;
+        }
+        ST_CHECK(t, placed >= 5, "a road of several pieces was built (" + std::to_string(placed) + ")");
+        stInvariants(t, "random road");
+        int undone = 0;
+        while (stMapState() != start && undone < placed && undoAction()) ++undone;
+        ST_CHECK(t, stMapState() == start, "undo takes the whole road back exactly");
+        roadSync();
+        ST_CHECK(t, !roadStripOpen() || isRoadPiece(rb.target), "after undo the strip is closed or points at a piece that exists");
+    }
+
+    // clicking a node opens the strip on that end; a joined node does not
+    {
+        closeRoadStrip();
+        app.selected.assign(1, piece);
+        centreOnObject(piece);
+        glViewport(app.viewX, 0, app.width, app.height);
+        setViewMatrices(-1, -1);
+        GLdouble mv[16], pr[16];
+        GLint vp[4];
+        glGetDoublev(GL_MODELVIEW_MATRIX, mv);
+        glGetDoublev(GL_PROJECTION_MATRIX, pr);
+        glGetIntegerv(GL_VIEWPORT, vp);
+        for (int k = 0; k < 2; ++k) {
+            const RoadEnd w = endInWorld(app.instances[piece], roadEndsOf(straightId)[size_t(k)]);
+            GLdouble sx, sy, sz;
+            if (!gluProject(w.x, w.y, w.z + 1.5, mv, pr, vp, &sx, &sy, &sz) || sz < 0 || sz > 1) continue;
+            closeRoadStrip();
+            const bool hit = roadClick(int(sx), int(vp[3] - sy));
+            ST_CHECK(t, hit, "a click on the node is recognised");
+            const bool joined = roadEndJoined(piece, w);
+            ST_CHECK(t, joined ? !roadStripOpen() : (roadStripOpen() && rb.targetEnd == k), joined ? "a joined node does not open the strip" : "an open node opens the strip on that end");
+        }
+        closeRoadStrip();
+        ST_CHECK(t, !roadClick(5, 5), "a click away from the nodes is not a node");
+    }
+
+    // Ctrl+R: the strip on the first open end; with no road piece selected it only explains
+    {
+        closeRoadStrip();
+        app.selected.assign(1, piece);
+        doCommand(app.hwnd, ID_TB_ROADATTACH);
+        ST_CHECK(t, roadStripOpen() && rb.target == piece, "Ctrl+R opens the strip on the selected road piece");
+        closeRoadStrip();
+        int other = -1;
+        for (size_t i = 0; i < app.instances.size() && other < 0; ++i) if (!isRoadPiece(int(i))) other = int(i);
+        app.selected.assign(1, other);
+        rb.lastMessage.clear();
+        doCommand(app.hwnd, ID_TB_ROADATTACH);
+        ST_CHECK(t, !roadStripOpen() && !rb.lastMessage.empty(), "Ctrl+R on something that is not a road piece explains instead");
+    }
+
+    // a tilted piece takes no level piece; nothing changes
+    {
+        app.selected.assign(1, piece);
+        const std::string s0 = stMapState();
+        IplInstance keep = app.instances[piece];
+        eulerDegToQuat(12, 0, 0, true, app.instances[piece].rotX, app.instances[piece].rotY, app.instances[piece].rotZ, app.instances[piece].rotW);
+        openRoadStrip(piece, 0);
+        const std::string tilted = stMapState();
+        ST_CHECK(t, placeRoadVariant(0) < 0 && stMapState() == tilted, "a tilted end refuses a piece and changes nothing");
+        app.instances[piece] = keep;
+        ST_CHECK(t, stMapState() == s0, "restored");
+    }
+
+    // Esc closes the strip without losing the selection; selecting something else closes it too
+    openRoadStrip(piece, 0);
+    SendMessageA(app.hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+    ST_CHECK(t, !roadStripOpen() && app.selected == std::vector<int>{piece}, "Esc closes the strip and keeps the selection");
+    openRoadStrip(piece, 0);
+    app.selected.clear();
+    roadSync();
+    ST_CHECK(t, !roadStripOpen(), "a new selection closes the strip");
+
+    // back to how it was
+    for (int k = 0; k < 2 && stMapState() != before; ++k) undoAction();  // its own two steps: the lone straight and the clicked piece
+    ST_CHECK(t, stMapState() == before, "the road test leaves the map as it found it");
+    closeRoadStrip();
+    app.selected.clear();
+    stInvariants(t, "road test done");
+}
+
 void runBookmarksSelfTest(SelfTest& t) {
     const std::string realFile = app.bookmarkFile;
     const std::vector<Bookmark> realList = app.bookmarks;
     char tmp[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp);
-    app.bookmarkFile = std::string(tmp) + "med_selftest_bookmarks.ini";
+    app.bookmarkFile = std::string(tmp) + "med_selftest_bookmarks_" + std::to_string(GetCurrentProcessId()) + ".ini";  // own file per run
     const std::string medText =
         "<bookmark id=0>GTA III - INDUSTSE - Portland Hospital</bookmark><location id=0>1145.68:-576.017:13.528:15.6316:204.8:358.4:0</location>\r\n"
         "<bookmark id=1>GTA VC - OCEANDRV - Ocean Hotel</bookmark><location id=1>229.921:-1262.81:19.484:25.0519:102:359.2:0</location>\r\n"
@@ -4916,6 +6292,12 @@ int runPlacementsSelfTest() {
     showLeftTab(1);
     // the Bookmarks window (on a temporary file)
     runBookmarksSelfTest(t);
+    // Extract Object (copies into a temporary folder)
+    runExtractSelfTest(t);
+    // Replace Object (building and LOD stand-in as a pair)
+    runReplaceSelfTest(t);
+    // the road builder (nodes, strip, preview, attach)
+    runRoadSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -4926,7 +6308,7 @@ int runPlacementsSelfTest() {
     const int steps = std::getenv("MED_SELFTEST_STEPS") ? std::atoi(std::getenv("MED_SELFTEST_STEPS")) : 1500;
     std::printf("random sequence: seed %u, %d steps\n", seed, steps);
     for (int step = 0; step < steps; ++step) {
-        const int op = rnd(18);
+        const int op = rnd(19);
         const int rows = int(pl.rows.size());
         std::string what;
         switch (op) {
@@ -4948,6 +6330,13 @@ int runPlacementsSelfTest() {
             case 15: what = "new object"; if (pl.region >= 0 && id >= 0) addNewObject(id, pl.region, rnd(100), rnd(100), 10); break;
             case 16: what = "select in 3D"; if (!app.instances.empty()) app.selected.assign(1, rnd(int(app.instances.size()))); break;
             case 17: what = "show hidden regions"; setShowEmptyRegions(rnd(2) == 1); break;
+            case 18: {  // replace with a random model (half of the time one that has a LOD model)
+                what = "replace";
+                std::vector<int> all;
+                for (const auto& kv : app.defs) if (rnd(2) == 0 || lodModelIdFor(kv.first) >= 0) all.push_back(kv.first);
+                if (!all.empty() && !app.selected.empty()) setModelId(app.hwnd, all[size_t(rnd(int(all.size())))]);
+                break;
+            }
         }
         const int failuresBefore = t.failures;
         stInvariants(t, "random step " + std::to_string(step) + " (" + what + ")");
@@ -4978,6 +6367,9 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             if (pl.panel) MoveWindow(pl.panel, 0, app.toolbarH + app.leftTabH, app.leftW, std::max<int>(HIWORD(l) - app.toolbarH - app.leftTabH, 1), TRUE);
             if (it.panel) MoveWindow(it.panel, 0, app.toolbarH + app.leftTabH, app.leftW, std::max<int>(HIWORD(l) - app.toolbarH - app.leftTabH, 1), TRUE);
             if (app.inspector) MoveWindow(app.inspector, LOWORD(l) - app.inspectorW, app.toolbarH, app.inspectorW, std::max<int>(HIWORD(l) - app.toolbarH, 1), TRUE);
+            if (roadStripOpen()) closeRoadStrip();  // reopened by clicking a node again, at the new size
+            // repaint the panels completely: without this, maximising or resizing left old pixels where controls had been
+            RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
             return 0;
         case WM_NOTIFY: {
             const NMHDR* nh = reinterpret_cast<const NMHDR*>(l);
@@ -4993,7 +6385,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_COMMAND:
             if (std::getenv("MED_DEBUG")) { std::printf("WM_COMMAND id %d code %d from %p\n", int(LOWORD(w)), int(HIWORD(w)), (void*)l); std::fflush(stdout); }
-            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_VIEWEMPTY) doCommand(h, LOWORD(w));
+            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_ROADATTACH) doCommand(h, LOWORD(w));
             return 0;
         case WM_KEYDOWN:
             if (w < 256) app.keys[w] = true;
@@ -5006,6 +6398,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 centreOnObject(app.selected[0]);
                 return 0;
             }
+            if (w == VK_ESCAPE && roadStripOpen()) { closeRoadStrip(); return 0; }  // Esc first closes the road strip
             if (w == VK_ESCAPE) { app.selected.clear(); app.history.endSession(); }  // MEd: Esc cancels the selection
             if (w == 'S' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 saveFromUi(h);
@@ -5013,6 +6406,10 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && w == 'Z') {
                 if (GetKeyState(VK_SHIFT) & 0x8000) redoAction(); else undoAction();
+                return 0;
+            }
+            if ((GetKeyState(VK_CONTROL) & 0x8000) && w == 'R') {  // road builder: attach at the first open end
+                doCommand(h, ID_TB_ROADATTACH);
                 return 0;
             }
             if ((GetKeyState(VK_CONTROL) & 0x8000) && w == 'L') {  // LOD view on or off
@@ -5074,17 +6471,23 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             SetFocus(h);
             app.dragging = true;
             GetCursorPos(&app.lastMouse);
+            app.downMouse = app.lastMouse;
             SetCapture(h);
             // Alt + left button with a selection drags the selected objects over the plane z - h.
             app.movingObjects = (GetKeyState(VK_MENU) & 0x8000) && !app.selected.empty() &&
                                 unprojectToPlane(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH, app.lastPick);
             return 0;
-        case WM_LBUTTONUP:
+        case WM_LBUTTONUP: {
             app.dragging = false;
+            POINT up;
+            GetCursorPos(&up);
+            const bool click = std::abs(up.x - app.downMouse.x) <= 3 && std::abs(up.y - app.downMouse.y) <= 3;
+            if (click && !app.movingObjects) roadClick(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH);  // a road node opens the piece strip
             if (app.movingObjects) plRefreshAfterEdit();
             app.movingObjects = false;
             ReleaseCapture();
             return 0;
+        }
         case WM_MOUSEMOVE:
             if (app.dragging) {
                 POINT p;
@@ -5231,14 +6634,20 @@ int main(int argc, char** argv) {
     bool saveAfter = false;
     int undoCount = 0, redoCount = 0;
     double rotateBy = 0;
+    std::string replaceWith;  // --replace model: Replace Object on the selection
+    struct AttachStep { int targetEnd; std::string model; int modelEnd; bool preview; };
+    std::vector<AttachStep> attaches;  // --attach / --preview-attach targetEnd model modelEnd (road builder, on the selection)
+    bool listRoadEnds = false;          // --road-ends: print the selected road piece's ends
     bool selfTest = false;
     std::string newRegionName, moveToRegion, newObjectModel, pasteRegion;
+    std::vector<std::pair<std::string, std::string>> extracts;  // --extract model folder (repeatable)
     double pastePos[3] = {0, 0, 0};
     double newObjectPos[3] = {0, 0, 0};
     bool deleteAfter = false, duplicateAfter = false, sinkAfter = false, centreAfter = false, checkAfter = false;
     std::string onlyRegions;
     int benchmark = 0;
     std::string selectModel, pickTestModel;
+    bool addedOnly = false;
     double moveBy[3] = {0, 0, 0};
     // MEd's bookmarks live in MEdv032/ of this project; look next to the game folder first, then up from the program
     // (build/dev/med_viewer.exe is two levels below the project), so a game folder kept anywhere still finds them.
@@ -5264,6 +6673,7 @@ int main(int argc, char** argv) {
         else if (a == "--select") { selectX = int(num(1)); selectY = int(num(2)); i += 2; }
         else if (a == "--delete") deleteAfter = true;
         else if (a == "--select-model" && i + 1 < argc) selectModel = argv[++i];
+        else if (a == "--added-only") addedOnly = true;
         else if (a == "--pick-test" && i + 1 < argc) pickTestModel = argv[++i];
         else if (a == "--only" && i + 1 < argc) onlyRegions = argv[++i];
         else if (a == "--lod-near") app.lodNear = float(num(1)), ++i;
@@ -5276,10 +6686,19 @@ int main(int argc, char** argv) {
         else if (a == "--sink") sinkAfter = true;
         else if (a == "--duplicate") duplicateAfter = true;
         else if (a == "--new-region" && i + 1 < argc) newRegionName = argv[++i];
+        else if (a == "--extract" && i + 2 < argc) { extracts.emplace_back(argv[i + 1], argv[i + 2]); i += 2; }
         else if (a == "--copy-paste" && i + 4 < argc) { pasteRegion = argv[i + 1]; pastePos[0] = std::atof(argv[i + 2]); pastePos[1] = std::atof(argv[i + 3]); pastePos[2] = std::atof(argv[i + 4]); i += 4; }
         else if (a == "--new-object" && i + 4 < argc) { newObjectModel = argv[i + 1]; newObjectPos[0] = std::atof(argv[i + 2]); newObjectPos[1] = std::atof(argv[i + 3]); newObjectPos[2] = std::atof(argv[i + 4]); i += 4; }
         else if (a == "--move-to-region" && i + 1 < argc) moveToRegion = argv[++i];
         else if (a == "--rotate") rotateBy = num(1), ++i;
+        else if ((a == "--attach" || a == "--preview-attach") && i + 3 < argc) {
+            attaches.push_back({std::atoi(argv[i + 1]), argv[i + 2], std::atoi(argv[i + 3]), a == "--preview-attach"});
+            i += 3;
+        } else if (a == "--road-ends") listRoadEnds = true;
+        else if (a == "--roads-only") app.roadsOnly = true;
+        else if (a == "--replace" && i + 1 < argc) {
+            replaceWith = argv[++i];
+        }
         else if (a == "--centre") centreAfter = true;
         else if (a == "--undo") undoCount = int(num(1)), ++i;
         else if (a == "--redo") redoCount = int(num(1)), ++i;
@@ -5380,8 +6799,10 @@ int main(int argc, char** argv) {
         if (!selectModel.empty()) {  // test helper: select the placement of this model nearest to the camera
             int best = -1;
             double bestDist = 1e30;
+            const std::vector<bool> orig = originalFlags();
             for (size_t i = 0; i < app.instances.size(); ++i) {
                 if (toLower(app.instances[i].model) != toLower(selectModel)) continue;
+                if (addedOnly && orig[i]) continue;  // --added-only: only placements the user added
                 double d = std::hypot(app.instances[i].x - app.cam.x, app.instances[i].y - app.cam.y);
                 if (d < bestDist) { bestDist = d; best = int(i); }
             }
@@ -5441,6 +6862,17 @@ int main(int argc, char** argv) {
             if (addIplRegion(app.root, newRegionName, rel, err)) { app.iplPaths.push_back(rel); initRegions(); std::printf("created region %s (%zu regions listed)\n", rel.c_str(), regions.size()); }
             else std::printf("new region failed: %s\n", err.c_str());
         }
+        for (const auto& [extractModel, extractFolder] : extracts) {  // test helper: Extract Object without the dialogs
+            int id = -1;
+            for (const auto& kv : app.defs) if (kv.second.model == toLower(extractModel)) id = kv.first;
+            for (const ExtractResult& r : extractModelsTo(extractFolder, {id})) {
+                std::printf("extracted into %s:\n", r.folder.c_str());
+                for (const std::string& f : r.written) std::printf("  wrote %s\n", f.c_str());
+                for (const std::string& w : r.warnings) std::printf("  warning: %s\n", w.c_str());
+                if (!r.colSource.empty()) std::printf("  collision from %s\n", r.colSource.c_str());
+            }
+            if (id < 0) std::printf("no model named %s\n", extractModel.c_str());
+        }
         if (!pasteRegion.empty() && !app.selected.empty()) {  // test helper: Copy, then Paste into this region at x y z
             int file = -1;
             for (const Region& r : regions) if (toLower(r.name) == toLower(pasteRegion) + ".ipl") file = r.file;
@@ -5464,6 +6896,48 @@ int main(int argc, char** argv) {
             const size_t n = file >= 0 ? moveSelectedToRegion(file) : 0;
             std::printf("moved %zu placement(s) to region %s (files changed %zu)\n", n, moveToRegion.c_str(), app.dirty.size());
             for (const Region& r : regions) if (r.count > 0 || toLower(r.name) == toLower(moveToRegion) + ".ipl") if (toLower(r.name).find(toLower(moveToRegion)) != std::string::npos) std::printf("  region %s now has %d objects\n", r.name.c_str(), r.count);
+        }
+        for (const AttachStep& st : attaches) {  // test helper: the road builder without the strip
+            if (app.selected.size() != 1 || !isRoadPiece(app.selected[0])) { std::printf("attach: select one road piece first\n"); break; }
+            int id = -1;
+            for (const auto& kv : app.defs) if (kv.second.model == toLower(st.model)) id = kv.first;
+            if (id < 0) { std::printf("attach: no model %s\n", st.model.c_str()); break; }
+            rb.target = app.selected[0];
+            rb.targetEnd = st.targetEnd;
+            RoadVariant v;
+            v.id = id;
+            v.end = st.modelEnd;
+            rb.variants.assign(1, v);
+            if (st.preview) { rb.hover = 0; rb.forcePreview = true; std::printf("previewing %s end %d at end %d\n", st.model.c_str(), st.modelEnd, st.targetEnd); continue; }
+            const int idx = placeRoadVariant(0);
+            if (idx < 0) { std::printf("attach: refused (%s)\n", rb.lastMessage.c_str()); break; }
+            const IplInstance& n = app.instances[idx];
+            std::printf("attached %s by its end %d at end %d: now at %.4f %.4f %.4f rotation %.6g %.6g %.6g %.6g (placements %zu, undo %zu)\n", n.model.c_str(), st.modelEnd,
+                        st.targetEnd, n.x, n.y, n.z, n.rotX, n.rotY, n.rotZ, n.rotW, app.instances.size(), app.history.undoCount());
+        }
+        if (listRoadEnds && app.selected.size() == 1 && isRoadPiece(app.selected[0])) {
+            const IplInstance& o = app.instances[app.selected[0]];
+            const std::vector<RoadEnd>& e = roadEndsOf(o.id);
+            for (size_t k = 0; k < e.size(); ++k) {
+                const RoadEnd w = endInWorld(o, e[k]);
+                std::printf("  end %zu of %s: %.4f %.4f %.4f facing %.3f %.3f, width %.1f, %s\n", k, o.model.c_str(), w.x, w.y, w.z, w.dx, w.dy, w.width,
+                            roadEndJoined(app.selected[0], w) ? "joined" : "open");
+            }
+            const std::vector<RoadVariant> vs = roadVariantsFor(e[0].width);
+            std::printf("  %zu pieces fit end 0:\n", vs.size());
+            for (const RoadVariant& v : vs) std::printf("    %-18s end %d  %s\n", v.name.c_str(), v.end, v.label.c_str());
+        }
+        if (!replaceWith.empty() && !app.selected.empty()) {
+            int id = -1;
+            for (const auto& kv : app.defs) if (kv.second.model == toLower(replaceWith)) id = kv.first;
+            ReplaceReport rep;
+            const bool ok = id >= 0 && setModelId(app.hwnd, id, &rep);
+            const IplInstance& o = app.instances[app.selected[0]];
+            std::printf("replace with %s: %s, now %d %s at %.4f %.4f %.4f rotation %.6g %.6g %.6g %.6g; replaced %d, LOD stand-ins switched %d, moved below the map %d, added %d, removed %d; placements %zu, undo %zu, files changed %zu\n",
+                        replaceWith.c_str(), ok ? "done" : "FAILED", o.id, o.model.c_str(), o.x, o.y, o.z, o.rotX, o.rotY, o.rotZ, o.rotW, rep.replaced, rep.lodSwitched, rep.lodSunk,
+                        rep.lodAdded, rep.lodRemoved, app.instances.size(), app.history.undoCount(), app.dirty.size());
+            for (size_t p : lodPartnersOf(app.selected[0]))
+                std::printf("  its LOD stand-in is now %s at %.4f %.4f %.4f\n", app.instances[p].model.c_str(), app.instances[p].x, app.instances[p].y, app.instances[p].z);
         }
         if (rotateBy != 0 && !app.selected.empty()) {
             rotateSelected(rotateBy);
@@ -5532,6 +7006,16 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    if (!selectModel.empty()) {  // also in the live window (tests): the placement of this model nearest to the camera
+        int best = -1;
+        double bestDist = 1e30;
+        for (size_t i = 0; i < app.instances.size(); ++i) {
+            if (toLower(app.instances[i].model) != toLower(selectModel)) continue;
+            const double d = std::hypot(app.instances[i].x - app.cam.x, app.instances[i].y - app.cam.y);
+            if (d < bestDist) { bestDist = d; best = int(i); }
+        }
+        if (best >= 0) app.selected.assign(1, best);
+    }
     MSG msg;
     app.lastTick = GetTickCount();
     bool running = true;
@@ -5548,6 +7032,8 @@ int main(int argc, char** argv) {
         updateCamera();
         updateToolbarState();
         refreshInspector();
+        roadSync();
+        renderRoadThumbnails();
         render();
         SwapBuffers(app.dc);
         // the project (the opened game folder's name, for example ProjectUpstate) leads the title

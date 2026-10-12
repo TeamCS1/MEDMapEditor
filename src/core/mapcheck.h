@@ -80,6 +80,9 @@ constexpr int kOriginalLodWithoutBuilding = 221;  // LOD placements with no buil
 constexpr int kOriginalBuildingWithoutLod = 42;   // buildings whose LOD model exists but no LOD placed
 constexpr int kOriginalDuplicates = 6;            // placements with the same id and position as another
 constexpr int kPlacementPoolCapacity = 5500 + 1214 + 2802;  // buildings + treadables + dummies
+// The editor's Delete (move below the map) puts placements at z = -200; at or below this depth a placement counts as
+// deleted for the LOD pairing checks (the original map has nothing below -100).
+constexpr double kDeletedDepth = -199.0;
 
 CheckResult checkMap(const CheckInput& input);
 

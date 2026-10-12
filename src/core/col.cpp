@@ -92,7 +92,9 @@ bool parseCol(const std::vector<unsigned char>& data, std::vector<ColModel>& out
         if (tag == "COL2" || tag == "COL3" || tag == "COL4") return failWith(error, "San Andreas collision (" + tag + ") is not supported yet");
         if (tag != "COLL") return failWith(error, "unknown collision tag at offset " + std::to_string(r.pos()));
         ColModel m;
+        m.fileOffset = r.pos();
         if (!parseColl(r, m, error)) return false;
+        m.fileSize = r.pos() - m.fileOffset;
         out.push_back(std::move(m));
     }
     return true;

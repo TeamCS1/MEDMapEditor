@@ -82,7 +82,7 @@ It starts at the first of MEd's own bookmarks (Portland Hospital).
 - Small things (traffic cones, bins) can be double-clicked a few pixels beside them: the editor looks up to about 6 pixels around the cursor for a small object that is in front of the ground or wall behind it.
 - **Shift + double-click** adds or removes objects from the selection.
 - **Double-click empty ground**, or press **Esc**, to clear the selection.
-- **Right-click** an object for its menu (Centre on Object, Duplicate Object, Delete options; Properties, Extract, Replace and Copy are shown greyed out because they are not built yet).
+- **Right-click** an object for its menu (Centre on Object, Extract Object..., Duplicate Object, Replace Object..., Copy, Delete options; Properties is shown greyed out because the Properties panel on the right already does that job). With several objects selected (or Shift + right-click) the menu offers Duplicate, Replace, Copy, Extract and Delete for all of them.
 - **Move it:**
   - **Alt + left mouse button, drag** slides the selected objects over the ground.
   - **Alt + arrow keys** (or W/A/S/D) nudge them; **Alt + Ctrl + arrows** or **Alt + Page Up/Down** move them up and down.
@@ -93,7 +93,7 @@ It starts at the first of MEd's own bookmarks (Portland Hospital).
   - **Position X / Y / Z** and **Rotation X / Y / Z** (angles in degrees; Z is the heading, the turn seen from above; X and Y tilt the object). Type a value and press **Enter** (or **Apply typed values**); **Esc** puts the stored value back. A box you are typing in is not overwritten.
   - The **`<<` `<` `>` `>>`** buttons next to each box step it, like MEd: position by 10 / 0.1 units, rotation by 10 / 0.2 degrees. **Hold a button to repeat.** A run of steps on the same selection is one undo step.
   - **Rotate -90 / Rotate +90**: a quarter turn (clockwise / counter-clockwise seen from above). **Reset**: no rotation at all.
-  - **Model ID** with **Choose...**: give the selected objects another model (MEd's Replace Object); an unknown ID is refused.
+  - **Model ID** with **Choose...**: give the selected objects another model (the same as **Replace Object**, see below); an unknown ID is refused.
   - With **several objects selected**, the boxes show the first one; the buttons move and turn every one of them (each about its own position); a typed position moves the group so the first lands on it; a typed angle is given to all of them.
   - A building and its **LOD stand-in move and turn together**, everywhere (panel, Alt+drag, Alt+keys).
   - Bad input (a word, an empty box, `5,5`) shows a short warning and changes nothing.
@@ -143,8 +143,60 @@ The **Item** tab (MEd's name for it) lists every object definition from the IDE 
 - **Show**: all items, only the ones **placed on the map**, or only the ones **not placed yet**.
 - Columns: **Name**, **ID**, **Placed** (how many times it is on the map), **Pool** (which game pool its placements use: Building, Treadable or Dummy; Treadable is nearly full on the original map, so watch those), **Texture**, **Draw** distance and the **IDE file**. Click a header to sort.
 - **Add to map**: puts the picked item in the region chosen in the Placements tab, in the middle of the view (like New Object, without the pop-up list).
-- **Show where it is placed** (or double-click / Enter): opens the Placements tab with every placement of that item, in all regions.
+- **Show placements** (or double-click / Enter): opens the Placements tab with every placement of that item, in all regions.
+- **Extract...**: copies the item's files into a folder (see below).
 - Selecting an object in the 3D view highlights its definition here.
+
+### Replace Object (swap a placed object for another model)
+
+Right-click an object > **Replace Object...** (or **Replace Objects...** with several selected), or press **Choose...** next to Model ID in the Properties panel. A list of every object opens with the current model highlighted; type to search, then press **Replace** (or double-click). The object keeps its position and rotation and stays selected. Typing a number in the Model ID box and pressing Apply does the same.
+
+A building and its **LOD stand-in** (the low-detail copy the game draws from far away) are replaced as a pair:
+
+| The old building... | The new model... | What happens to the LOD stand-in |
+|---|---|---|
+| has a stand-in | has a LOD model | it becomes the new model's LOD model, in the same place |
+| has a stand-in | has no LOD model | it goes, so the old building no longer shows from far away: a stand-in from the **original game** is moved below the map (like Delete, the safe way); one **you added** (by Duplicate, Paste, ...) is removed from the file, since the game never had it |
+| has no stand-in | has a LOD model | one is added at the building's position (it takes a slot in the Building pool) |
+| has no stand-in | has no LOD model | nothing |
+
+**Original or added?** The editor knows which placements belong to the original GTA III map and which you added (Duplicate, Paste, New Object, Add to map, a stand-in added by Replace), also after saving and reopening. The Properties panel says which ("Part of the original GTA III map" or "Added by you"). It works this out from the files: it carries a fingerprint of every original placement (file, model and position, as a hash). An original you moved still counts as original. Anything doubtful counts as original, so it is only ever moved below the map, never removed. For a game other than GTA III 1.0 everything counts as original.
+
+When a copy sits exactly on top of its original (right after Duplicate or Paste), each building is paired with its own stand-in: an original with the original one, a copy with the copied one. So moving, deleting or replacing the copy never takes the original's stand-in along.
+
+The LOD model of a building is the one named `LOD` plus the building's name without its first three letters (`hospitaland` -> `LODpitaland`, `SupaSave` -> `LODaSave`). The whole replace is one undo step. Picking the model the object already has changes nothing.
+
+### Building roads (attach road pieces end to end)
+
+GTA III's roads are built from a kit of pieces (models named `rd_...`): straights 5 to 50 long in three widths (20, 30 and 40), slopes, pieces that shift a lane sideways, corners, T-junctions and crossroads. The editor can join them for you so they line up exactly.
+
+1. **Select a road piece** (double-click it). A ball appears on each of its ends: **green** = open, **grey** = already joined to another piece. A T-junction has 3 balls, crossroads 4.
+2. **Click a green ball** (or press **Ctrl+R** for the first open end). A strip opens along the top of the 3D view with every piece that fits that end's width, each with a picture and a short description: "straight, 50 long", "climbs 9.85 over 50", "descends 5.00 over 50", "shifts left 25", "turns left", "T-junction: on, branch right", "crossroads". Pieces that can join in more than one way are shown once per way. The pictures are drawn with the joining end at the bottom, so you can see which way a corner turns.
+3. **Hover a picture**: the piece is shown attached at the yellow ball, without placing it.
+4. **Click the picture** to place it. It goes into the same region as the piece you attached it to (with its LOD stand-in if the model has one), it is selected, and the strip moves on to its far end: keep clicking to build a road. Each piece is one undo step. **Esc** closes the strip; the mouse wheel scrolls it.
+
+How it lines up: the editor measures where each piece's ends are, which way they face and how high the road surface is there from the model itself, so slopes chain correctly (a `Road2C50` climbs 9.85, not 10) and bends work too (`turn4` bends 22.5 degrees: four of them make a quarter circle; `RoadS1` is a diagonal S-bend; `Road2B50s` a skewed piece). This was checked against Rockstar's own map: 928 ends of the offered pieces meet their neighbours there to within 0.02 units, none is slightly off.
+
+Which pieces are offered: 55 of the 64 kit pieces (all straights, slopes, lane shifts, bends, corners, T-junctions and crossroads). Not offered, because Rockstar's map shows their measured ends are wrong or never joins them to another kit piece: `CrossRda1rw22`, `CrossRda1w22`, `RoadInd1way40`, `opera_custma`, `opera_custmb`, `specialrd11`, `specialrdmall`, `warehsearea`, `CrossRoadsa24` (one-offs built for one spot). `Road1C50kb` has only one measurable end. A tilted piece cannot take a new piece. Built roads are ordinary placements: Check Map, Delete, Undo and Save treat them like everything else.
+
+Tip from the user's first road: when you remove a tunnel or bridge, check the ground there. Terrain is part of the map too, and a road built where a tunnel was runs inside the hill.
+
+### Extract Object (copy an object's files out of the game)
+
+Right-click an object > **Extract Object...** (or **Extract Objects...** with several selected), or pick an item in the Item tab and press **Extract...**. Choose a folder; the editor remembers it for next time.
+
+Each object gets its own subfolder named after the model, holding **copies**:
+
+| File | What it is |
+|---|---|
+| `<model>.dff` | the 3D model, byte for byte as stored in `models/gta3.img` |
+| `<txd>.txd` | its texture dictionary (from `gta3.img`, or `models/generic.txd`) |
+| `<model>.col` | its collision, copied out of the area's COL file as a valid one-model COL file |
+| `<model>.txt` | its IDE line, IDE file, pool, how often it is placed and where each file came from |
+
+Nothing is removed or changed in the game: the archive and the COL files are only read (the tests check that their size and date stay the same). If files from an earlier extract are already in the folder you are asked before they are replaced. Afterwards a summary lists what was copied and anything that could not be found (for example a model without collision), and offers to open the folder. Several selected placements of the same model give one copy.
+
+The original MEd copied only the `.dff` and `.txd`. Uses: editing a model in a 3D tool, making a new object from an existing one, or keeping a reference copy. The DFF and TXD can end in some zero bytes, because the archive stores files in 2048-byte blocks; MEd's copies were the same and tools read them normally.
 
 ---
 
@@ -295,4 +347,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-Properties editing beyond position (rotation, ID, model swap), Replace, adding new objects, editing IDE or COL files, importing models, the IMG tool, Vice City and San Andreas, full-screen mode, . See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+Editing IDE or COL files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.

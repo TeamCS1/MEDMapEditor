@@ -23,6 +23,7 @@ add_library(med_core
     src/core/pools.cpp
     src/core/region.cpp
     src/core/bookmarks.cpp
+    src/core/extract.cpp src/core/original.cpp src/core/roadkit.cpp
     src/core/poollimits.cpp
     src/core/txd.cpp)
 target_include_directories(med_core PUBLIC src/core)
@@ -59,6 +60,18 @@ add_test(NAME region COMMAND test_region)
 add_executable(test_bookmarks tests/test_bookmarks.cpp)
 target_link_libraries(test_bookmarks PRIVATE med_core)
 add_test(NAME bookmarks COMMAND test_bookmarks ${CMAKE_SOURCE_DIR}/MEdv032/bookmarks.ini)
+
+add_executable(test_extract tests/test_extract.cpp)
+target_link_libraries(test_extract PRIVATE med_core)
+add_test(NAME extract COMMAND test_extract)
+add_executable(test_original tests/test_original.cpp)
+target_link_libraries(test_original PRIVATE med_core)
+add_test(NAME original COMMAND test_original)
+add_executable(test_roadkit tests/test_roadkit.cpp)
+target_link_libraries(test_roadkit PRIVATE med_core)
+add_test(NAME roadkit COMMAND test_roadkit)
+add_executable(road_ends tools/road_ends.cpp)
+target_link_libraries(road_ends PRIVATE med_core)
 
 add_executable(test_camera tests/test_camera.cpp)
 add_test(NAME camera COMMAND test_camera)

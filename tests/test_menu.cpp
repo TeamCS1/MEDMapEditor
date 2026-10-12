@@ -33,14 +33,15 @@ int main() {
     // the single-object menu has MEd's entries; only Centre on Object is live
     auto single = objectMenu(false);
     CHECK(find(single, kCmdCentre) && find(single, kCmdCentre)->enabled);
-    CHECK(find(single, kCmdExtract) && !find(single, kCmdExtract)->enabled);
+    CHECK(find(single, kCmdExtract) && find(single, kCmdExtract)->enabled);  // Extract Object is live
     CHECK(find(single, kCmdDuplicate) && find(single, kCmdDuplicate)->enabled);
-    CHECK(find(single, kCmdReplace) && !find(single, kCmdReplace)->enabled);
+    CHECK(find(single, kCmdReplace) && find(single, kCmdReplace)->enabled);  // Replace Object is live
     CHECK(find(single, kCmdProperties) && !find(single, kCmdProperties)->enabled);
     // the multiple-objects menu is the "Selected Items" one and has no per-object entries
     auto multi = objectMenu(true);
+    CHECK(find(multi, kCmdReplace) && find(multi, kCmdReplace)->enabled);    // and for several objects
     CHECK(multi[0].text == "Selected Items" && !multi[0].enabled);
-    CHECK(!find(multi, kCmdCentre) && !find(multi, kCmdExtract));
+    CHECK(!find(multi, kCmdCentre) && find(multi, kCmdExtract) && find(multi, kCmdExtract)->enabled);  // several objects can be extracted
 
     // which menu: Shift always, or several selected and the click is on one of them
     CHECK(useMultipleMenu(true, 0, false));

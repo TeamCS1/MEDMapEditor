@@ -41,6 +41,7 @@ struct ColModel {
     std::vector<ColBox> boxes;
     std::vector<float> vertices;  // 3 per vertex
     std::vector<ColFace> faces;
+    size_t fileOffset = 0, fileSize = 0;  // where this model's record ("COLL", size, data) sits in the file it was read from
 };
 
 // Parse every model in the file. Returns false (with `error`) on malformed data; models parsed
