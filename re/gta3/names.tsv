@@ -1,0 +1,21 @@
+# addr<TAB>name for gta3.exe 1.0 (applied with scripts/ApplyNames.java to project GTA3)
+0048bed0	CGame_Initialise
+0048d770	LoadingScreen
+0048d6a0	PickLoadingSplashName
+0048e7e0	CGame_InitialiseWithGta3Dat
+00476290	CFileLoader_LoadLevel
+00476250	LoadLevel_progressTick
+00478370	CFileLoader_LoadScene_ipl
+00478550	CFileLoader_LoadScene_zonesOnly
+004786b0	CFileLoader_LoadObjectInstance
+004777c0	LoadObjectInstance_recordVariant_maybe
+00478b20	CFileLoader_LoadCollisionFile
+00476ac0	CFileLoader_LoadObjectTypes_ide
+00476750	CFileLoader_LoadModelFile
+00476810	CFileLoader_LoadHierFile
+004765b0	CFileLoader_LoadTexDictionary
+004a7680	FindBigBuildings_step_maybe
+00439400	CTheScripts_StartTestScript_maybe
+00439040	CTheScripts_Process_maybe
+0046d3f0	CCamera_Process_maybe
+0050bbc0	CStreaming_LoadScene_maybe

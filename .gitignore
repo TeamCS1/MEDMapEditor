@@ -1,0 +1,28 @@
+# The game itself (Rockstar's files): never published. Point the editor at your own GTA III install.
+GTA_3_1.0/
+GTA_3_1.0.7z
+*.7z
+
+# Build output
+build/
+
+# Reverse engineering: the Ghidra databases are large and can be rebuilt (see CLAUDE.md, Tooling)
+re/project/
+re/MEd.exe
+# gta3.exe, its Ghidra database and the decompiled game code belong to Rockstar; only our own name list is kept
+re/gta3/*
+!re/gta3/names.tsv
+# Ghidra logs
+re/out/*.log
+re/out/*.err
+re/**/*.log
+re/**/*.err
+
+# The original MEd release: MEd.exe and its readme are kept (its licence allows redistribution);
+# the Visual C++ 7.1 runtime DLLs are Microsoft's and are not
+MEdv032/*.dll
+MEdv032.rar
+
+# Editor settings and per-machine files
+med_viewer.ini
+*.med-backup
