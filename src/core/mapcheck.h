@@ -13,6 +13,7 @@
 //  - The game has fixed pools for placements: buildings 5500, treadables 1214, dummies 2802 (0x004a1770).
 #pragma once
 #include <map>
+#include "paths.h"
 #include "poollimits.h"
 #include <string>
 #include <vector>
@@ -41,6 +42,9 @@ struct CheckInput {
     // says when a map is over them and only calls it an error when it is over these as well. Vanilla unless a
     // limit adjuster file was found.
     PoolLimits limits;
+    // The game's path tables (nodes, car path links, connections, road objects): the original sizes unless the
+    // III.PathLimits plugin was found in the game folder (readPathLimitsPlugin; the editor does not ship it).
+    PathTableLimits pathLimits;
 };
 
 struct CheckSummary {
@@ -48,6 +52,7 @@ struct CheckSummary {
     int poolUsed[3] = {0, 0, 0};  // placements per pool: buildings, treadables, dummies (see pools.h)
     int lodWithoutBuilding = 0, buildingWithoutLod = 0, duplicates = 0;      // all of them, including the ones the original game has
     int newLodWithoutBuilding = 0, newBuildingWithoutLod = 0, newDuplicates = 0;  // those the original game does not have
+    PathBudget paths;  // how full the game's path tables get while it loads this map
 };
 
 struct CheckResult {

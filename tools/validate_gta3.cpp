@@ -357,6 +357,15 @@ int main(int argc, char** argv) {
             if (shown++ < 25) std::printf("  [%s] %s %s:%d  %s\n", i.severity == Severity::Error ? "ERROR" : i.severity == Severity::Warning ? "warning" : "note", i.code.c_str(), i.file.c_str(), i.line, i.message.c_str());
         }
         problems += cr.count(Severity::Error) + cr.count(Severity::Warning);
+        // the path budget of the unmodified game: the simulation of the game's path preparation must give these (it
+        // was checked against the game's own counts on a modified map, 2026-10-12)
+        const PathBudget& pb = cr.summary.paths;
+        std::printf("PATHS: %d road objects, %d car + %d ped nodes (%d ped kept), %d car path links, %d connections (tables 1250 / 4930 / 2076 / 10260)\n", pb.objects,
+                    pb.carNodes, pb.pedNodesCreated, pb.pedNodesKept, pb.carLinks, pb.connections);
+        if (pb.objects != 1213 || pb.nodesPeak() != 4923 || pb.carNodes != 1964 || pb.carLinks != 2071 || pb.connections != 10220) {
+            std::printf("PATHS: DIFFERENT from the measured original (1213 objects, 4923 nodes of which 1964 car, 2071 car links, 10220 connections)\n");
+            ++problems;
+        }
     }
     std::printf("IPL save of unchanged data: %d byte-identical, %d differ, %d refused\n", saveIdentical, saveDiffers, saveRefused);
     problems += saveRefused;

@@ -181,6 +181,39 @@ Which pieces are offered: 55 of the 64 kit pieces (all straights, slopes, lane s
 
 Tip from the user's first road: when you remove a tunnel or bridge, check the ground there. Terrain is part of the map too, and a road built where a tunnel was runs inside the hill.
 
+### Traffic and pedestrian paths (View > Show traffic paths, and the path budget)
+
+Cars and pedestrians in GTA III follow paths that come with the road pieces themselves: each piece of the `rd_` road kit (and many other road and pavement models) carries a few path nodes for cars and for pedestrians in its IDE data. When the game starts it joins the placed pieces into one network: two pieces join where their connection points are less than 1 unit apart. Place road pieces end to end (the road builder does that exactly) and the traffic carries on from one to the next.
+
+**View > Show traffic paths** draws that network in the 3D view, exactly as the game builds it:
+
+| Colour | Meaning |
+|---|---|
+| Orange lines | car paths (thick where two pieces join) |
+| Light blue lines | pedestrian paths |
+| Red marks | a car path ends here with nothing to join: traffic cannot continue |
+| Pink marks | the same for pedestrians |
+| Grey dots | pedestrian nodes the game drops because nothing joins them |
+
+Use it to check a new road: no red mark at a joint means cars can drive on from the old road onto the new one.
+
+**The path budget.** The game keeps the whole network in small fixed tables, and Rockstar's map fills them almost completely:
+
+| Table | Size | The original map uses |
+|---|---|---|
+| Path nodes (car + pedestrian) | 4930 | 4923 |
+| Car path links | 2076 | 2071 |
+| Connections | 10260 | 10220 |
+| Road objects (placed pieces with paths) | 1250 | 1213 |
+
+So a handful of extra road pieces already overflows them, and the game then crashes while loading, typically with "Unhandled exception c0000005 at 00429caa". No limit adjuster raises these tables for GTA III. The editor shows them in three places, worked out exactly the way the game does it:
+
+- **Check Map**: an error for every table the map overflows, and notes for how full each one is.
+- **The Pools window**: a "Path tables" section with bars.
+- **The road builder strip**: how many nodes and car links are left, and what the piece under the mouse adds.
+
+A plugin that raises these tables changes the limits. If its settings file (`III.PathLimits.ini`) is in the game folder next to `III.PathLimits.asi`, the editor uses its sizes; otherwise the original ones. The editor does not come with such a plugin.
+
 ### Looking at a model, its textures and its collision (the three viewers)
 
 As in MEd, each object definition has three viewers. Open them from the **Item** tab (pick an item, then **DFF Properties**, **View TXD** or **View Collision**) or by right-clicking an object on the map (**DFF Properties...**, **View TXD...**, **Collision Properties...**). Each opens in its own window, several can be open at once, and none of them changes anything.
@@ -240,7 +273,10 @@ Right-drag still turns the view and a left-drag on empty space still moves it, a
 - **Add Box / Add Sphere**: a new box or sphere around the model, already selected. For a bin or a dumpster, one box is usually all it needs: Add Box, then pull its sides to fit.
 - **Move** shifts the selection by the X, Y, Z you type. **Apply typed size** sets the exact Min / Max of one selected box, or the centre and radius of one sphere.
 - **Delete selected** (or Del) removes it. Deleting mesh faces can leave holes.
-- **Surface material**: the colour beside each number is the one MEd draws it in. It shows how many shapes of this model use each one. With nothing selected it sets the material for the next new box or sphere.
+- **Surface material**: what the surface is made of. The game uses it for sounds, bullet-hit effects and how well tyres grip. Each entry shows the number, its name (for example 2 Grass, 19 Water, 22 Solid wood), its grip group, MEd's colour for it, and how many shapes of this model use it. With nothing selected it sets the material for the next new box or sphere.
+  - The grip groups are the rows of the game's `data/surface.dat`: road, hard, loose, wet and rubber. Grass, gravel, sand, hedges and cardboard are "loose", water alone is "wet", and the wood and pavement types grip like road.
+  - The names are the modding community's (from re3). Which group each number falls in comes from the game's own code, and it agrees with every name. Numbers 33 and 34 are not used in GTA III.
+  - Tip: open a similar Rockstar object in the collision viewer and use the same material as it does.
 - **Open edges** are drawn in red: edges that only one face uses, so the mesh has a hole or a border there. A building's walls should normally be closed; ground pieces have borders by nature.
 - **Undo / Redo** (Ctrl+Z / Ctrl+Y), up to 50 steps.
 

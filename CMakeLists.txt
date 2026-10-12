@@ -23,7 +23,7 @@ add_library(med_core
     src/core/pools.cpp
     src/core/region.cpp
     src/core/bookmarks.cpp
-    src/core/extract.cpp src/core/original.cpp src/core/roadkit.cpp src/core/importer.cpp src/core/coledit.cpp
+    src/core/extract.cpp src/core/original.cpp src/core/roadkit.cpp src/core/importer.cpp src/core/coledit.cpp src/core/paths.cpp
     src/core/poollimits.cpp
     src/core/txd.cpp)
 target_include_directories(med_core PUBLIC src/core)
@@ -76,6 +76,9 @@ add_test(NAME importer COMMAND test_importer)
 add_executable(test_coledit tests/test_coledit.cpp)
 target_link_libraries(test_coledit PRIVATE med_core)
 add_test(NAME coledit COMMAND test_coledit)
+add_executable(test_paths tests/test_paths.cpp)
+target_link_libraries(test_paths PRIVATE med_core)
+add_test(NAME paths COMMAND test_paths)
 add_executable(road_ends tools/road_ends.cpp)
 target_link_libraries(road_ends PRIVATE med_core)
 

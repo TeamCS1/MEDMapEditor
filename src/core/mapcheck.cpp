@@ -191,12 +191,14 @@ CheckResult checkMap(const CheckInput& in) {
     std::map<int, Def> defs;
     std::set<int> pathIds;                // model ids with ped/car path data (treadables)
     std::set<std::string> lodModelTails;  // tails of LOD models that exist in the IDE
+    std::map<int, PathModelData> pathData;  // the IDE "path" blocks (traffic and pedestrian paths)
     for (const Listed& l : ides) {
         bool ok;
         std::string text = readFile(root + "/" + l.path, ok);
         if (!ok) continue;
         IdeFile f = parseIde(text, GameVersion::GTA3);
         collectPathModelIds(f, pathIds);
+        collectIdePaths(text, pathData);
         for (const IdeObject& o : f.objects) {
             auto it = defs.find(o.id);
             if (it != defs.end() && toLower(it->second.model) != toLower(o.model))
@@ -385,6 +387,40 @@ CheckResult checkMap(const CheckInput& in) {
                 add(r, Severity::Info, "pool-nearly-full", what + " slots are used. Only " + std::to_string(kPoolCapacity[k] - used[k]) + " more of this kind fit.");
             else
                 add(r, Severity::Info, "pool-usage", what + " slots are used.");
+        }
+        // ---- the path tables: the game builds its traffic and pedestrian network from the placed road pieces ----
+        std::set<int> dynamicIds;
+        for (const auto& kv : defs)
+            if (objectDat.count(toLower(kv.second.model))) dynamicIds.insert(kv.first);
+        std::vector<PathPlacement> roads;
+        for (const Placed& pl : placed)
+            if (pathData.count(pl.p.id) && defs.count(pl.p.id)) roads.push_back({pl.p.id, pl.p.x, pl.p.y, pl.p.z, pl.p.rx, pl.p.ry, pl.p.rz, pl.p.rw});
+        const PathBudget b = simulatePathBudget(pathData, dynamicIds, roads);
+        r.summary.paths = b;
+        const PathTableLimits& lim = in.pathLimits;
+        const PathTableLimits original;
+        struct Table { const char* name; int used, limit, original; const char* hint; };
+        const Table tables[] = {
+            {"Path nodes (car and pedestrian, while loading)", b.nodesPeak(), lim.nodes, original.nodes, "CarPathNodes / PedPathNodes"},
+            {"Car path links", b.carLinks, lim.carLinks, original.carLinks, "CarPathNodes"},
+            {"Path connections", b.connections, lim.connections, original.connections, "CarPathNodes / PedPathNodes"},
+            {"Road objects (placed pieces with paths)", b.objects, lim.objects, original.objects, "CarPathNodes / PedPathNodes"},
+            {"Temporary path points while loading", std::max(b.carPoints, b.pedPoints), lim.temp, original.temp, "CarPathNodes / PedPathNodes"},
+        };
+        for (const Table& t : tables) {
+            const std::string what = std::string(t.name) + ": " + std::to_string(t.used) + " of " + std::to_string(t.limit);
+            if (t.used > t.limit) {
+                if (lim.plugin)
+                    add(r, Severity::Error, "path-overflow", what + ". The game overflows this table while loading and crashes. Raise " + t.hint + " in " + lim.source + " (the III.PathLimits plugin found in this game folder).", lim.source);
+                else
+                    add(r, Severity::Error, "path-overflow", what + ". The game overflows this fixed table while loading and crashes (typically \"Unhandled exception c0000005 at 00429caa\"). Remove road pieces, or use a plugin that raises GTA III's path tables (no limit adjuster does).");
+            } else if (t.used > t.original) {
+                add(r, Severity::Info, "path-over-original", what + ": " + std::to_string(t.used - t.original) + " over the original game's size; this game folder has the III.PathLimits plugin, which raises it to " + std::to_string(t.limit) + ".");
+            } else if (t.used * 100 >= t.limit * 98) {
+                add(r, Severity::Info, "path-nearly-full", what + ". Only " + std::to_string(t.limit - t.used) + " left: road pieces with traffic or pedestrian paths will soon overflow it.");
+            } else {
+                add(r, Severity::Info, "path-usage", what + ".");
+            }
         }
     }
 

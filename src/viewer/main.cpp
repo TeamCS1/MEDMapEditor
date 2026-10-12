@@ -64,6 +64,7 @@
 #include "roadkit.h"
 #include "importer.h"
 #include "coledit.h"
+#include "paths.h"
 #include "bookmarks.h"
 #include "region.h"
 #include "rotation.h"
@@ -155,6 +156,9 @@ struct App {
     std::vector<Bookmark> bookmarks;  // the Bookmarks window's list (MEd's format)
     std::string bookmarkFile;         // where it is saved: bookmarks.ini next to the editor
     PoolLimits limits;                     // pool sizes the game can really have: vanilla, or from a limit adjuster file in the game folder
+    std::map<int, PathModelData> pathData; // the IDE path blocks (traffic and pedestrian paths of road pieces)
+    std::set<int> dynamicIds;              // models listed in object.dat (they never become road objects)
+    PathTableLimits pathLimits;            // the game's path tables: original, or from the III.PathLimits plugin's ini when it is in the game folder
     bool forceVanilla = false;             // --vanilla: ignore the adjuster file
     std::vector<IplInstance> instances;
     std::map<std::string, ColModel> cols;  // collision bounds by model name (used for the selection box)
@@ -183,6 +187,7 @@ struct App {
     std::vector<char> regionOn;    // per IPL file: drawn and pickable
     std::vector<char> regionHideable;  // per IPL file: empty when the map was loaded (GTA3.ZON, CULL.IPL): hidden from the lists unless View > Show hidden regions
     bool showEmptyRegions = false;     // View > Show hidden regions (off at start)
+    bool showPaths = false;            // View > Show traffic paths (--paths)
     bool showLod = true;                 // draw the far stand-ins at all
     std::vector<IplInstance> clipboard;  // Copy: the copied placements
     size_t clipboardAnchor = 0;          // the one that lands on the mouse point when pasting (the last copied selected placement)
@@ -203,6 +208,7 @@ struct App {
     bool dragging = false;
     POINT lastMouse = {0, 0};
     POINT downMouse = {0, 0};
+    float farExtra = 0;      // --far n: every draw distance n longer (overview screenshots)
     bool roadsOnly = false;  // --roads-only: draw road pieces only (screenshots)  // where the left button went down (a click without a drag opens a road node)
     DWORD lastTick = 0;
     double tickRemainder = 0;  // milliseconds not yet turned into 1 ms keyboard ticks
@@ -274,6 +280,7 @@ bool loadGameData() {
         if (!ok) continue;
         IdeFile f = parseIde(text, GameVersion::GTA3);
         collectPathModelIds(f, pathIds);
+        collectIdePaths(text, app.pathData);
         for (const IdeObject& o : f.objects) {
             ModelDef d;
             d.model = toLower(o.model);
@@ -288,6 +295,13 @@ bool loadGameData() {
         }
     }
     for (auto& kv : app.defs) kv.second.pool = poolFor(objectDat.count(kv.second.model) > 0, pathIds.count(kv.first) > 0);
+    for (const auto& kv : app.defs)
+        if (objectDat.count(kv.second.model)) app.dynamicIds.insert(kv.first);
+    app.pathLimits = PathTableLimits();
+    if (readPathLimitsPlugin(app.root, app.pathLimits) && !app.forceVanilla)
+        std::printf("path limits from %s: %d nodes, %d car path links, %d connections\n", app.pathLimits.source.c_str(), app.pathLimits.nodes, app.pathLimits.carLinks,
+                    app.pathLimits.connections);
+    else app.pathLimits = PathTableLimits();
     for (const std::string& p : ipls) {
         std::string text = slurp(app.root + "/" + p, ok);
         if (!ok) continue;
@@ -558,7 +572,7 @@ void collectVisible() {
         if (swapped && !def.farModel) continue;  // LOD view: the normal model gives way to its stand-in
         double dx = inst.x - v.eyeX, dy = inst.y - v.eyeY, dz = inst.z - v.eyeZ;
         double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (!swapped && dist > def.drawDistance + 20) continue;
+        if (!swapped && dist > def.drawDistance + 20 + app.farExtra) continue;
         if (def.farModel && !swapped) {  // a LOD stand-in appears only beyond a minimum distance, and after its building has dropped out of range
             if (!app.showLod) continue;
             const double partner = i < app.lodPartnerMin.size() ? app.lodPartnerMin[i] : 0;
@@ -1294,6 +1308,7 @@ void drawSelectionHighlight(const std::string& modelName) {
 }
 
 void drawRoadOverlay();
+void drawPathOverlay();
 
 void render() {
     glViewport(app.viewX, 0, app.width, app.height);
@@ -1362,6 +1377,7 @@ void render() {
     app.msCollect += 1000.0 * double(q1.QuadPart - q0.QuadPart) / double(qf.QuadPart);
     app.msSubmit += 1000.0 * double(q2.QuadPart - q1.QuadPart) / double(qf.QuadPart);
     drawRoadOverlay();  // road nodes and the previewed piece (road builder)
+    if (app.showPaths) drawPathOverlay();  // View > Show traffic paths
     // Selected objects get the bounding box, axes and circle that CMapView draws (FUN_00404410).
     for (int idx : app.selected) {
         const IplInstance& inst = app.instances[idx];
@@ -1411,6 +1427,7 @@ CheckResult runCheck() {
     CheckInput in;
     in.root = app.root;
     in.limits = app.limits;
+    in.pathLimits = app.pathLimits;
     for (int fileIndex : app.dirty) {
         bool ok;
         std::string original = slurp(app.root + "/" + app.iplPaths[fileIndex], ok);
@@ -1580,6 +1597,129 @@ void showCheckWindow(HWND owner) {
 
 HWND poolsWnd = nullptr;
 
+// ---- the path budget: how full the game's path tables get with the map as it is now (core/paths.h) ----
+
+// The road pieces in the order the game loads them: by IPL file (gta3.dat order), then in each file from the top.
+std::vector<PathPlacement> pathPlacementsInLoadOrder() {
+    std::vector<size_t> order;
+    for (size_t i = 0; i < app.instances.size(); ++i)
+        if (app.pathData.count(app.instances[i].id) && app.defs.count(app.instances[i].id)) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [](size_t a, size_t b) { return app.instFile[a] < app.instFile[b]; });
+    std::vector<PathPlacement> out;
+    for (size_t i : order) {
+        const IplInstance& o = app.instances[i];
+        out.push_back({o.id, o.x, o.y, o.z, o.rotX, o.rotY, o.rotZ, o.rotW});
+    }
+    return out;
+}
+
+// Worked out again only when a road piece was added, removed, moved or turned (moving a piece changes what it joins).
+PathNetwork gPathNetwork;  // the network of the cached budget (for View > Show traffic paths)
+
+const PathBudget& currentPathBudget() {
+    static PathBudget cached;
+    static uint64_t cachedKey = 0;
+    const std::vector<PathPlacement> roads = pathPlacementsInLoadOrder();
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* p, size_t n) {
+        for (size_t k = 0; k < n; ++k) h = (h ^ static_cast<const uint8_t*>(p)[k]) * 1099511628211ull;
+    };
+    for (const PathPlacement& r : roads) {  // field by field: the struct has padding
+        mix(&r.id, sizeof r.id);
+        const double v[7] = {r.x, r.y, r.z, r.rx, r.ry, r.rz, r.rw};
+        mix(v, sizeof v);
+    }
+    const size_t n = roads.size();
+    mix(&n, sizeof n);
+    if (h != cachedKey) {
+        cached = simulatePathBudget(app.pathData, app.dynamicIds, roads, &gPathNetwork);
+        cachedKey = h;
+    }
+    return cached;
+}
+
+// View > Show traffic paths: the network the game builds from the placed road pieces. Car paths orange, pedestrian
+// paths light blue, links inside a piece thinner than joints between pieces, nodes as dots (grey: pedestrian nodes
+// the game drops because nothing joins them), and red marks where a path ends with nothing to join (a dead end).
+void drawPathOverlay() {
+    currentPathBudget();  // brings gPathNetwork up to date
+    const PathNetwork& n = gPathNetwork;
+    glPushAttrib(GL_ENABLE_BIT | GL_LINE_BIT | GL_POINT_BIT | GL_CURRENT_BIT | GL_DEPTH_BUFFER_BIT);
+    glDisable(GL_TEXTURE_2D);
+    glDisable(GL_LIGHTING);
+    glDisable(GL_FOG);
+    glDisable(GL_ALPHA_TEST);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    const float lift = 0.4f;  // just above the road surface, so the road does not hide it
+    for (int pass = 0; pass < 2; ++pass) {  // links inside pieces, then the joints between pieces (thicker)
+        glLineWidth(pass == 0 ? 1.5f : 3.0f);
+        glBegin(GL_LINES);
+        for (const PathNetwork::Link& l : n.links) {
+            if (l.betweenPieces != (pass == 1)) continue;
+            const PathNetwork::Node &a = n.nodes[size_t(l.a)], &b = n.nodes[size_t(l.b)];
+            if (l.car) glColor3f(1.0f, 0.55f, 0.0f);
+            else glColor3f(0.35f, 0.8f, 1.0f);
+            glVertex3f(a.x, a.y, a.z + lift);
+            glVertex3f(b.x, b.y, b.z + lift);
+        }
+        glEnd();
+    }
+    glPointSize(5.0f);
+    glBegin(GL_POINTS);
+    for (const PathNetwork::Node& p : n.nodes) {
+        if (!p.kept) glColor3f(0.55f, 0.55f, 0.55f);
+        else if (p.car) glColor3f(1.0f, 0.75f, 0.2f);
+        else glColor3f(0.6f, 0.9f, 1.0f);
+        glVertex3f(p.x, p.y, p.z + lift);
+    }
+    glEnd();
+    glPointSize(9.0f);
+    glBegin(GL_POINTS);
+    for (const PathNetwork::Point& p : n.openPoints) {
+        if (p.car) glColor3f(1.0f, 0.1f, 0.1f);
+        else glColor3f(0.85f, 0.2f, 0.6f);
+        glVertex3f(p.x, p.y, p.z + lift);
+    }
+    glEnd();
+    glPopAttrib();
+}
+
+std::string pathBudgetText() {
+    const PathBudget& b = currentPathBudget();
+    const PathTableLimits& l = app.pathLimits;
+    const PathTableLimits orig;
+    struct Row { const char* name; int used, limit, original; };
+    const Row rows[] = {
+        {"Path nodes", b.nodesPeak(), l.nodes, orig.nodes},
+        {"Car links", b.carLinks, l.carLinks, orig.carLinks},
+        {"Connections", b.connections, l.connections, orig.connections},
+        {"Road objects", b.objects, l.objects, orig.objects},
+    };
+    std::string t;
+    char buf[256];
+    for (const Row& r : rows) {
+        const int bar = 24, filled = std::min(bar, int(int64_t(r.used) * bar / std::max(r.limit, 1)));
+        std::snprintf(buf, sizeof buf, "%-12s %5d / %5d  %5.1f%%  [%s%s]  %d free%s\r\n", r.name, r.used, r.limit, 100.0 * r.used / std::max(r.limit, 1),
+                      std::string(filled, '#').c_str(), std::string(bar - filled, '.').c_str(), std::max(r.limit - r.used, 0),
+                      r.used > r.limit ? "  OVER: the game crashes while loading" : r.used > r.original ? "  (over the original size)" : "");
+        t += buf;
+    }
+    std::snprintf(buf, sizeof buf, "\r\nPath nodes while loading: %d car + %d pedestrian (the game then drops %d pedestrian nodes with no connection).\r\n", b.carNodes,
+                  b.pedNodesCreated, b.pedNodesCreated - b.pedNodesKept);
+    t += buf;
+    t += "Road pieces with traffic or pedestrian paths (the rd_ road kit and many others) fill these tables. The original\r\n";
+    t += "map leaves only 7 nodes and 5 car links free, so a few extra pieces already overflow them and the game crashes\r\n";
+    t += "while loading. No limit adjuster raises them for GTA III.\r\n";
+    if (l.plugin) {
+        std::snprintf(buf, sizeof buf, "The III.PathLimits plugin is in this game folder (%s): the limits above are its settings.\r\n", l.source.c_str());
+        t += buf;
+    } else {
+        t += "The limits above are the original game's (no path limit plugin was found in this game folder).\r\n";
+    }
+    return t;
+}
+
 std::string poolsText() {
     int used[kPoolCount] = {0, 0, 0};
     for (const IplInstance& o : app.instances) {
@@ -1620,6 +1760,8 @@ std::string poolsText() {
     } else {
         t += "No adjuster file was found in the game folder, so the editor cannot tell whether you have one.\r\n";
     }
+    t += "\r\nPath tables (traffic and pedestrian paths, built by the game at start-up)\r\n";
+    t += pathBudgetText();
     return t;
 }
 
@@ -1666,7 +1808,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT, ID_TB_VIEWPATHS };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1906,6 +2048,7 @@ void doCommand(HWND h, int id) {
         case ID_TB_OPEN: openGameFolder(h); return;
         case ID_TB_BOOKMARKS: showBookmarksWindow(h); return;  // the window keeps the focus
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
+        case ID_TB_VIEWPATHS: app.showPaths = !app.showPaths; break;
         case ID_TB_ROADATTACH: roadAttachFirstOpen(h); return;
         case ID_TB_VIEWFILE: viewFileUi(h); return;
         case ID_TB_IMPORT: { const std::string dff = importAtStart; importAtStart.clear(); importModelUi(h, dff); return; }
@@ -1938,6 +2081,7 @@ void showToolbarMenu(HWND owner, int buttonId) {
         AppendMenuA(menu, MF_STRING, ID_TB_IMPORT, "Import Model (DFF + TXD + COL)...");
     } else if (buttonId == ID_TB_VIEWMENU) {
         AppendMenuA(menu, MF_STRING | (app.showEmptyRegions ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWEMPTY, "Show hidden regions");
+        AppendMenuA(menu, MF_STRING | (app.showPaths ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWPATHS, "Show traffic paths (cars orange, pedestrians blue, dead ends red)");
     } else {
         AppendMenuA(menu, MF_STRING, ID_TB_POOLS, "Pools");
         AppendMenuA(menu, MF_STRING, ID_TB_CHECK, "Check Map" "\tF7");
@@ -4355,6 +4499,21 @@ LRESULT CALLBACK roadStripProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 const RoadEnd& e = roadEndsOf(app.instances[rb.target].id)[size_t(rb.targetEnd)];
                 head = "Attach to the yellow end of " + app.instances[rb.target].model + " (" + std::to_string(int(std::round(e.width))) + " wide): " +
                        std::to_string(rb.variants.size()) + " pieces fit. Hover to preview, click to place. Mouse wheel scrolls.";
+                // the path budget: every kit piece brings traffic and pedestrian paths, and the game's tables are small
+                const PathBudget& pb = currentPathBudget();
+                const PathTableLimits& pl = app.pathLimits;
+                head += "   Paths: " + std::to_string(std::max(pl.nodes - pb.nodesPeak(), 0)) + " nodes and " + std::to_string(std::max(pl.carLinks - pb.carLinks, 0)) +
+                        " car links left";
+                if (pb.nodesPeak() > pl.nodes || pb.carLinks > pl.carLinks || pb.connections > pl.connections || pb.objects > pl.objects) head += " (ALREADY OVER: see Check Map)";
+                if (rb.hover >= 0 && rb.hover < int(rb.variants.size())) {
+                    auto pd = app.pathData.find(rb.variants[size_t(rb.hover)].id);
+                    if (pd != app.pathData.end()) {
+                        const PathCost c = pathCostOf(pd->second);
+                        head += "; this piece adds " + std::to_string(c.carNodes) + " car + " + std::to_string(c.pedNodes) + " pedestrian nodes";
+                    } else {
+                        head += "; this piece has no paths";
+                    }
+                }
             }
             TextOutA(mem, 8, 6, head.c_str(), int(head.size()));
             HDC tdc = CreateCompatibleDC(dc);
@@ -4541,7 +4700,6 @@ enum { ID_MV_ZOOMIN = 9001, ID_MV_ZOOMOUT, ID_MV_RESET, ID_MV_ROTATE, ID_MV_WIRE
 enum { ID_CE_TABS = 9301, ID_CE_ADDBOX, ID_CE_ADDSPHERE, ID_CE_SELSIDE, ID_CE_SELALL, ID_CE_SELNONE, ID_CE_DELETE, ID_CE_DIST, ID_CE_OUT, ID_CE_IN,
        ID_CE_MX, ID_CE_MY, ID_CE_MZ, ID_CE_MOVE, ID_CE_MAT, ID_CE_F0, ID_CE_F1, ID_CE_F2, ID_CE_F3, ID_CE_F4, ID_CE_F5, ID_CE_APPLY,
        ID_CE_SHOWREF, ID_CE_UNDO, ID_CE_REDO, ID_CE_STATUS, ID_CE_REGION, ID_CE_NEWREGION, ID_CE_SAVE, ID_CE_LBL };
-constexpr int kColMaterialCount = 35;  // MEd's colour table (0x004040b0) knows materials 0 to 34
 
 ModelViewer* viewerOf(HWND w) {
     for (auto& v : viewers)
@@ -4642,8 +4800,9 @@ std::string colInfoText(const ModelViewer& v) {
     for (const ColSphere& x : c.spheres) ++used[x.surface.material];
     for (const ColFace& x : c.faces) ++used[x.material];
     if (!used.empty()) {
-        t += "\r\nSurface materials (shapes):\r\n";
-        for (const auto& kv : used) t += "  " + std::to_string(kv.first) + ": " + std::to_string(kv.second) + "\r\n";
+        t += "\r\nSurface materials (number, name, grip: shapes):\r\n";
+        for (const auto& kv : used)
+            t += "  " + std::to_string(kv.first) + " " + colMaterialName(kv.first) + " (" + gripGroupName(colMaterialGrip(kv.first)) + " grip): " + std::to_string(kv.second) + "\r\n";
     }
     return t;
 }
@@ -5610,7 +5769,7 @@ void ceCreateControls(ModelViewer& v, HFONT font) {
     for (int id : {ID_CE_MX, ID_CE_MY, ID_CE_MZ}) make("EDIT", "0", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, id);
     make("BUTTON", "Move", BS_PUSHBUTTON, 0, ID_CE_MOVE);
     HWND mat = make("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL, 0, ID_CE_MAT);
-    for (int k = 0; k <= kColMaterialCount - 1; ++k) SendMessageA(mat, CB_ADDSTRING, 0, (LPARAM)("Material " + std::to_string(k)).c_str());
+    for (int k = 0; k <= kColMaterialCount - 1; ++k) SendMessageA(mat, CB_ADDSTRING, 0, (LPARAM)(std::to_string(k) + " " + colMaterialName(k)).c_str());
     for (int k = 0; k < 6; ++k) make("EDIT", "", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_CE_F0 + k);
     make("BUTTON", "Apply typed size", BS_PUSHBUTTON, 0, ID_CE_APPLY);
     HWND ref = make("BUTTON", "Show the model's outline", BS_AUTOCHECKBOX, 0, ID_CE_SHOWREF);
@@ -5767,7 +5926,8 @@ void ceDrawMaterialItem(ModelViewer& v, const DRAWITEMSTRUCT* di) {
     for (const ColBox& x : v.col.boxes) used += x.surface.material == k;
     for (const ColSphere& x : v.col.spheres) used += x.surface.material == k;
     for (const ColFace& x : v.col.faces) used += x.material == k;
-    std::string text = "Material " + std::to_string(k) + (used ? "  (" + std::to_string(used) + " here)" : std::string());
+    std::string text = std::to_string(k) + "  " + colMaterialName(k) + (k <= 32 ? std::string("  - ") + gripGroupName(colMaterialGrip(k)) + " grip" : std::string()) +
+                       (used ? "  (" + std::to_string(used) + " here)" : std::string());
     SetBkMode(di->hDC, TRANSPARENT);
     SetTextColor(di->hDC, GetSysColor(sel ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
     RECT tr = di->rcItem;
@@ -10234,7 +10394,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_COMMAND:
             if (std::getenv("MED_DEBUG")) { std::printf("WM_COMMAND id %d code %d from %p\n", int(LOWORD(w)), int(HIWORD(w)), (void*)l); std::fflush(stdout); }
-            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_IMPORT) doCommand(h, LOWORD(w));
+            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_VIEWPATHS) doCommand(h, LOWORD(w));
             return 0;
         case WM_KEYDOWN:
             if (w < 256) app.keys[w] = true;
@@ -10513,6 +10673,7 @@ int main(int argc, char** argv) {
     bool colEditAtStart = false;  // --col-edit: the collision window opened by --open-col starts on its Edit tab
     std::vector<std::string> openFilesAtStart;  // --open-file path (repeatable): loose files in the viewers
     bool addedOnly = false;
+    bool selectAdded = false;  // --select-added: select every placement that is not part of the original game (and list them)
     double moveBy[3] = {0, 0, 0};
     // MEd's bookmarks live in MEdv032/ of this project; look next to the game folder first, then up from the program
     // (build/dev/med_viewer.exe is two levels below the project), so a game folder kept anywhere still finds them.
@@ -10539,6 +10700,7 @@ int main(int argc, char** argv) {
         else if (a == "--delete") deleteAfter = true;
         else if (a == "--select-model" && i + 1 < argc) selectModel = argv[++i];
         else if (a == "--added-only") addedOnly = true;
+        else if (a == "--select-added") selectAdded = true;
         else if (a == "--open-dff" && i + 1 < argc) openDffAtStart = argv[++i];
         else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
         else if (a == "--col-edit") colEditAtStart = true;
@@ -10550,6 +10712,7 @@ int main(int argc, char** argv) {
         else if (a == "--lod-near") app.lodNear = float(num(1)), ++i;
         else if (a == "--no-lod") app.showLod = false;
         else if (a == "--lod-view") app.lodView = true;
+        else if (a == "--paths") app.showPaths = true;
         else if (a == "--selftest") selfTest = true;
         else if (a == "--vanilla") app.forceVanilla = true;
         else if (a == "--benchmark") benchmark = int(num(1)), ++i;
@@ -10571,6 +10734,7 @@ int main(int argc, char** argv) {
             i += 3;
         } else if (a == "--road-ends") listRoadEnds = true;
         else if (a == "--roads-only") app.roadsOnly = true;
+        else if (a == "--far" && i + 1 < argc) app.farExtra = float(std::atof(argv[++i]));
         else if (a == "--replace" && i + 1 < argc) {
             replaceWith = argv[++i];
         }
@@ -10683,6 +10847,17 @@ int main(int argc, char** argv) {
             }
             if (best >= 0) app.selected.assign(1, best);
             std::printf("%s\n", best >= 0 ? ("selected " + app.instances[best].model + " by name").c_str() : "no such model");
+        }
+        if (selectAdded) {
+            const std::vector<bool> orig = originalFlags();
+            app.selected.clear();
+            for (size_t i = 0; i < app.instances.size(); ++i)
+                if (!orig[i]) {
+                    app.selected.push_back(int(i));
+                    const IplInstance& o = app.instances[i];
+                    std::printf("  added: %s (id %d) in %s at %.4f %.4f %.4f\n", o.model.c_str(), o.id, app.iplPaths[size_t(app.instFile[i])].c_str(), o.x, o.y, o.z);
+                }
+            std::printf("selected %zu added placement(s)\n", app.selected.size());
         }
         if (!pickTestModel.empty()) {  // test helper: click the centre of every drawn placement of this model and report what is hit
             glViewport(app.viewX, 0, app.width, app.height);
