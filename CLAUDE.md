@@ -4,6 +4,10 @@ MEd v0.32 is an abandoned GTA III / Vice City / San Andreas map editor (Tony Wro
 
 Goal: keep the original C++ and Qt design, same class layout, buildable with a current toolchain. Start with GTA III, then Vice City and San Andreas.
 
+## Version control (2026-10-12)
+
+- Git repository, branch `main`, pushed to https://github.com/TeamCS1/MEDMapEditor (PUBLIC). `.gitignore` keeps out: the game (`GTA_3_1.0/`, `*.7z`), `build/`, the Ghidra databases (`re/project/`), `re/MEd.exe` (duplicate), everything under `re/gta3/` except our own `re/gta3/names.tsv` (gta3.exe, its database and the decompiled game code are Rockstar's), MEd's Visual C++ DLLs, `MEdv032.rar`, Ghidra logs, `med_viewer.ini`, `*.med-backup`. `.gitattributes`: `MEdv032/**` is stored byte for byte (a test compares `MEdv032/bookmarks.ini` exactly). NEVER commit game files or anything decompiled from gta3.exe. The GTA3 Mod Manager is a separate product in its own folder and is not in this repository. Commit and push only when the user asks.
+
 ## Layout
 
 - `MEdv032/` – the original release, never modify. `MEd.exe`, `readme.txt`, `MEd.ini`, `bookmarks.ini`, VC7.1 runtime DLLs. `../MEdv032.rar` is the same release.
