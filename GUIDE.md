@@ -193,6 +193,28 @@ As in MEd, each object definition has three viewers. Open them from the **Item**
 
 Differences from MEd, on purpose: the view turns about the middle of the model and starts at a distance that fits it (MEd: about the model's origin, always 52 units away, so a cone was a dot), and the picture keeps its true shape (MEd stretched it to a square).
 
+### Importing your own models
+
+**File > Import Model (DFF + TXD + COL)...** and pick the model's `.dff`. The Import Model window opens with the `.txd` and `.col` of the same name beside it already filled in (or the only `.txd` in that folder). It checks everything again as you type and lists what still stops the import under **Not ready yet**, or says **Ready to import** with a summary of what will be written. The **Import** button only works when nothing is wrong.
+
+| Part of the window | What it does |
+|---|---|
+| **Model / Textures / Collision** | the three files; **Browse...** picks another, **View** opens it in the viewers first, **No collision file** clears the collision |
+| **Without a collision file it starts as** | only when there is no `.col`: **Empty** (a clean slate: nothing is solid, you would walk and drive through it until you build its collision), **One box around the model** (solid straight away; good for simple props such as a bin), **Copy the model's triangles** (solid in exactly the model's shape; good for roads and buildings) |
+| **Name** | the model's name in the game: up to 19 letters, digits, `_` or `-`, and not used by any model yet (starts as the file name) |
+| **Model ID** | must be free and below 5500, the size of the game's model table; **Suggest** gives the first free one (GTA III uses 0 to 3152, so new models start at 3153) |
+| **Draw distance, Flags** | the IDE values (200 and 0 to start with) |
+| **Region** | **your own regions only** (made with **New region...**, also here); Rockstar's files are not changed |
+
+The rules it checks:
+
+- **Textures are required.** A dictionary with the same name as one already in the game is reused only if it is the very same file (then it is shared, not added again); a different file with that name is refused, so rename yours. The game has room for 850 dictionaries and uses about 720. A texture the model asks for that is not in the dictionary is a note (the game draws that part plain).
+- **A collision file** may hold several models: the one named like the model is used (or its only model), and it is renamed to the model's name.
+- **Where it goes.** The model and textures are added to the end of `models/gta3.img` (nothing already in it moves; `gta3.dir` is backed up first as `gta3.dir.before-<name>.med-backup`). The definition line goes into the region's own `data/maps/<region>/<region>.ide` and the collision into its own `<region>.col`; both are added to `data/gta3.dat` (backed up once as `gta3.dat.med-backup`). The collision file is listed with level 0, which the game keeps loaded everywhere. Every import is written down in `models/med-imports.txt` with how to undo it.
+- **A game folder that shares its `gta3.img` with another folder** (a hard link, as test copies sometimes do) is refused, because the import would change the other folder too.
+
+Afterwards a message lists the files that changed, and the model is in the **Item** tab straight away, ready to place with **Add to map** like any other (it takes a Building slot). Tested on a copy of GTA III: imported models load on the next start, are drawn with their textures, and Check Map reports no problem with them. Not tested yet in the game itself.
+
 ### Extract Object (copy an object's files out of the game)
 
 Right-click an object > **Extract Object...** (or **Extract Objects...** with several selected), or pick an item in the Item tab and press **Extract...**. Choose a folder; the editor remembers it for next time.
@@ -322,7 +344,7 @@ Switching mods on and off, launching the game with chosen mods, and the limit ad
 3. **Stay under 9,516 placements.**
 4. **Run Check Map** before every game test.
 5. **Test in the game** after each batch of edits, and keep the original game folder as your backup.
-6. **Only IPL edits are supported.** Adding new models (IDE, COL, DFF, TXD) is not built yet.
+6. **New models only through Import Model.** It writes the model, textures and collision the way the game reads them, with backups and an undo note. Rockstar's own IDE and COL files are never edited.
 
 ---
 
@@ -359,4 +381,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-Importing new models, editing collision (planned in that order), editing IDE files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+Editing collision (next: an Edit tab beside the collision viewer, with boxes, spheres, push/pull of faces and deleting faces), changing or removing an imported model from inside the editor (for now `models/med-imports.txt` says how to undo an import), editing Rockstar's IDE files, the IMG tool, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.

@@ -32,6 +32,8 @@ struct ColFace {
 struct ColModel {
     int version = 1;
     std::string name;       // matches the DFF name, e.g. "hospital"
+    std::string nameField;  // the 22 bytes of the name as stored (Rockstar's tool left memory leftovers after the
+                            // terminator); writeColl reuses them while the name is unchanged, so records come back exact
     uint16_t modelId = 0;
     float boundRadius = 0;
     float boundCenter[3] = {0, 0, 0};
@@ -47,5 +49,13 @@ struct ColModel {
 // Parse every model in the file. Returns false (with `error`) on malformed data; models parsed
 // before the error stay in `out`.
 bool parseCol(const std::vector<unsigned char>& data, std::vector<ColModel>& out, std::string& error);
+
+// One "COLL" (version 1) record for a model: the exact layout parseCol reads (name cut to 21 characters plus the
+// terminator, the unknown count written as 0, face padding 0). parseCol(writeColl(m)) gives m back.
+std::vector<unsigned char> writeColl(const ColModel& m);
+
+// Set the bounding box, sphere centre and radius from the model's shapes: the box holds every sphere, box and mesh
+// vertex; the centre is the box's middle; the radius reaches the farthest point. A model without shapes keeps its bounds.
+void computeColBounds(ColModel& m);
 
 }  // namespace med

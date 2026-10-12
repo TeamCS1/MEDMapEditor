@@ -19,3 +19,8 @@
 00439040	CTheScripts_Process_maybe
 0046d3f0	CCamera_Process_maybe
 0050bbc0	CStreaming_LoadScene_maybe
+00527440	CTxdStore_Initialise_maybe
+005274e0	CTxdStore_AddTxdSlot_maybe
+005275d0	CTxdStore_FindTxdSlot_maybe
+004f6b40	CBaseModelInfo_SetTexDictionary_maybe
+00476520	CFileLoader_ReloadLevelCollision_maybe

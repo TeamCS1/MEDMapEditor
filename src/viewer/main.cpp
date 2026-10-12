@@ -62,6 +62,7 @@
 #include "extract.h"
 #include "original.h"
 #include "roadkit.h"
+#include "importer.h"
 #include "bookmarks.h"
 #include "region.h"
 #include "rotation.h"
@@ -1664,7 +1665,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1894,7 +1895,10 @@ void openGameFolder(HWND owner) {
 
 void roadAttachFirstOpen(HWND owner);
 void viewFileUi(HWND owner);
+void importModelUi(HWND owner, const std::string& dffPath = "");
 bool openLooseFile(HWND owner, const std::string& path);
+
+std::string importAtStart;  // --import-window dff: the Import Model window opens on this model once the editor is up
 
 void doCommand(HWND h, int id) {
     switch (id) {
@@ -1903,6 +1907,7 @@ void doCommand(HWND h, int id) {
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
         case ID_TB_ROADATTACH: roadAttachFirstOpen(h); return;
         case ID_TB_VIEWFILE: viewFileUi(h); return;
+        case ID_TB_IMPORT: { const std::string dff = importAtStart; importAtStart.clear(); importModelUi(h, dff); return; }
         case ID_TB_NEWOBJ: newObjectAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
         case ID_TB_COPY: copySelected(); break;
         case ID_TB_PASTE: pasteAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
@@ -1929,6 +1934,7 @@ void showToolbarMenu(HWND owner, int buttonId) {
         AppendMenuA(menu, MF_STRING, ID_TB_SAVEMOD, "Save as Mod...");
         AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuA(menu, MF_STRING, ID_TB_VIEWFILE, "View a DFF / TXD / COL file...");
+        AppendMenuA(menu, MF_STRING, ID_TB_IMPORT, "Import Model (DFF + TXD + COL)...");
     } else if (buttonId == ID_TB_VIEWMENU) {
         AppendMenuA(menu, MF_STRING | (app.showEmptyRegions ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWEMPTY, "Show hidden regions");
     } else {
@@ -5526,6 +5532,358 @@ void updateTxdViewers() {
     txdViewers.erase(std::remove_if(txdViewers.begin(), txdViewers.end(), [](const std::unique_ptr<TxdViewer>& v) { return v->closed; }), txdViewers.end());
 }
 
+// ---- Import Model (rules: CLAUDE.md "Import rules"; core: core/importer.h) ---------------------------------------------
+// File > Import Model...: pick the .dff; the .txd and .col with the same name beside it are filled in. The window checks
+// everything as you change it (planImport, nothing written) and lists the problems and notes; Import is only enabled
+// when there are no problems. The three files can be looked at in the viewers first. The destination is one of the
+// user's own regions (made with New region): its own .ide and .col get the definition and the collision, gta3.dat lists
+// them, the model and textures are appended to gta3.img. Afterwards the model is in the Item tab, ready to place.
+
+struct ImportUi {
+    HWND wnd = nullptr, dff = nullptr, txd = nullptr, col = nullptr, name = nullptr, id = nullptr, draw = nullptr, flags = nullptr, region = nullptr, checks = nullptr;
+    HWND startEmpty = nullptr, startBox = nullptr, startMesh = nullptr, importBtn = nullptr;
+    bool done = false, imported = false;
+    std::string lastError;
+    int importedId = -1;
+    bool quiet = false;
+    std::set<int> ids;               // what the game uses (gameIdsAndNames), read when the window opens
+    std::set<std::string> names;
+    bool scanned = false;
+} imp;
+
+enum { ID_IM_DFF = 9201, ID_IM_DFF_BROWSE, ID_IM_DFF_VIEW, ID_IM_TXD, ID_IM_TXD_BROWSE, ID_IM_TXD_VIEW, ID_IM_COL, ID_IM_COL_BROWSE, ID_IM_COL_CLEAR,
+       ID_IM_COL_VIEW, ID_IM_EMPTY, ID_IM_BOX, ID_IM_MESH, ID_IM_NAME, ID_IM_ID, ID_IM_SUGGEST, ID_IM_DRAW, ID_IM_FLAGS, ID_IM_REGION, ID_IM_NEWREGION,
+       ID_IM_CHECKS, ID_IM_IMPORT, ID_IM_CANCEL, ID_IM_LABEL };
+
+std::string imText(HWND h) {
+    char b[1024] = "";
+    GetWindowTextA(h, b, sizeof b);
+    return trim(b);
+}
+
+// The user's own regions (made with New region): they get the model's .ide and .col.
+std::vector<std::string> userRegionNames() {
+    std::vector<std::string> out;
+    for (const std::string& rel : regionsAddedSinceBackup(app.root)) {  // "DATA/MAPS/<name>/<name>.IPL"
+        std::string s = rel;
+        std::replace(s.begin(), s.end(), '\\', '/');
+        const size_t a = s.find_last_of('/');
+        std::string file = a == std::string::npos ? s : s.substr(a + 1);
+        if (file.size() > 4) out.push_back(file.substr(0, file.size() - 4));
+    }
+    return out;
+}
+
+void imFillRegions(const std::string& select = "") {
+    SendMessageA(imp.region, CB_RESETCONTENT, 0, 0);
+    int pick = 0, k = 0;
+    for (const std::string& r : userRegionNames()) {
+        SendMessageA(imp.region, CB_ADDSTRING, 0, (LPARAM)r.c_str());
+        if (toLower(r) == toLower(select)) pick = k;
+        ++k;
+    }
+    SendMessageA(imp.region, CB_SETCURSEL, k ? pick : -1, 0);
+}
+
+ImportRequest imRequest() {
+    ImportRequest r;
+    r.gameRoot = app.root;
+    r.dffPath = imText(imp.dff);
+    r.txdPath = imText(imp.txd);
+    r.colPath = imText(imp.col);
+    r.name = imText(imp.name);
+    const std::string idText = imText(imp.id), drawText = imText(imp.draw), flagText = imText(imp.flags);
+    char* end = nullptr;
+    const long id = std::strtol(idText.c_str(), &end, 10);
+    r.id = (!idText.empty() && end && *end == 0) ? int(id) : -1;
+    const double dd = std::strtod(drawText.c_str(), &end);
+    r.drawDistance = (!drawText.empty() && end && *end == 0) ? dd : -1;
+    const long fl = std::strtol(flagText.c_str(), &end, 10);
+    r.flags = (!flagText.empty() && end && *end == 0) ? int(fl) : 0;
+    r.start = SendMessageA(imp.startBox, BM_GETCHECK, 0, 0) == BST_CHECKED ? CollisionStart::Box
+            : SendMessageA(imp.startMesh, BM_GETCHECK, 0, 0) == BST_CHECKED ? CollisionStart::Mesh
+                                                                            : CollisionStart::Empty;
+    const int sel = int(SendMessageA(imp.region, CB_GETCURSEL, 0, 0));
+    if (sel >= 0) {
+        char b[256] = "";
+        SendMessageA(imp.region, CB_GETLBTEXT, WPARAM(sel), (LPARAM)b);
+        r.region = b;
+    }
+    return r;
+}
+
+// Check everything again (nothing written) and show the result.
+// `rescan`: read the game's IDE files again for the ids and names in use (about 150 ms on GTA III, so it is done when the
+// window opens and right before importing, not on every key press).
+ImportPlan imRecheck(bool rescan = false) {
+    const DWORD t0 = GetTickCount();
+    if (rescan || !imp.scanned) {
+        imp.ids.clear();
+        imp.names.clear();
+        gameIdsAndNames(app.root, imp.ids, imp.names);
+        imp.scanned = true;
+    }
+    const DWORD t1 = GetTickCount();
+    ImportRequest r = imRequest();
+    ImportPlan p = planImport(r, app.img, imp.ids, imp.names);
+    if (std::getenv("MED_DEBUG")) std::printf("import check: game ids %lu ms, plan %lu ms\n", t1 - t0, GetTickCount() - t1), std::fflush(stdout);
+    if (imText(imp.id).size() && r.id < 0) p.problems.insert(p.problems.begin(), "The model ID must be a whole number.");
+    if (imText(imp.flags).size() && r.flags == 0 && imText(imp.flags) != "0") p.problems.insert(p.problems.begin(), "The flags must be a whole number.");
+    const bool noCol = r.colPath.empty();
+    for (HWND h : {imp.startEmpty, imp.startBox, imp.startMesh}) EnableWindow(h, noCol);
+    std::string text;
+    if (p.problems.empty()) text = "Ready to import " + r.name + " (ID " + std::to_string(r.id) + ") into region " + r.region + ".\r\n";
+    else {
+        text = "Not ready yet:\r\n";
+        for (const std::string& s : p.problems) text += "  - " + s + "\r\n";
+    }
+    if (p.problems.empty() || !p.notes.empty()) {
+        if (!p.notes.empty()) text += "\r\nWorth knowing:\r\n";
+        for (const std::string& s : p.notes) text += "  - " + s + "\r\n";
+        if (p.problems.empty()) {
+            text += "\r\nCollision: ";
+            text += p.collisionFromFile ? "from " + r.colPath : r.start == CollisionStart::Box ? std::string("one box around the model")
+                                                              : r.start == CollisionStart::Mesh ? "the model's own triangles (" + std::to_string(p.collision.faces.size()) + " faces)"
+                                                                                                : std::string("empty (a clean slate)");
+            text += "\r\nThe model and textures go into models/gta3.img (gta3.dir is backed up first); the definition into data/maps/" + r.region + "/" + r.region +
+                    ".ide; the collision into data/maps/" + r.region + "/" + r.region + ".col (level 0, always loaded).\r\n";
+        }
+    }
+    SetWindowTextA(imp.checks, text.c_str());
+    EnableWindow(imp.importBtn, p.problems.empty());
+    return p;
+}
+
+// A file beside the model with the same name and this extension, else "".
+std::string imBeside(const std::string& dff, const std::string& ext) {
+    std::error_code ec;
+    const std::filesystem::path p(dff);
+    const std::filesystem::path c = p.parent_path() / (p.stem().string() + ext);
+    return std::filesystem::exists(c, ec) ? c.string() : std::string();
+}
+
+void imSetModel(const std::string& dff) {
+    SetWindowTextA(imp.dff, dff.c_str());
+    std::string txd = imBeside(dff, ".txd");
+    if (txd.empty()) {  // the only .txd in that folder
+        std::error_code ec;
+        std::vector<std::string> found;
+        for (const auto& e : std::filesystem::directory_iterator(std::filesystem::path(dff).parent_path(), ec))
+            if (toLower(e.path().extension().string()) == ".txd") found.push_back(e.path().string());
+        if (found.size() == 1) txd = found[0];
+    }
+    SetWindowTextA(imp.txd, txd.c_str());
+    SetWindowTextA(imp.col, imBeside(dff, ".col").c_str());
+    SetWindowTextA(imp.name, std::filesystem::path(dff).stem().string().c_str());
+}
+
+std::string imPickFile(HWND owner, const char* filter, const char* title) {
+    char last[MAX_PATH] = "";
+    GetPrivateProfileStringA("Import", "folder", "", last, sizeof last, modIniPath().c_str());
+    char name[MAX_PATH] = "";
+    OPENFILENAMEA o = {};
+    o.lStructSize = sizeof o;
+    o.hwndOwner = owner;
+    o.lpstrFilter = filter;
+    o.lpstrFile = name;
+    o.nMaxFile = sizeof name;
+    o.lpstrInitialDir = last[0] ? last : nullptr;
+    o.lpstrTitle = title;
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameA(&o)) return "";
+    const std::string folder = std::filesystem::path(name).parent_path().string();
+    WritePrivateProfileStringA("Import", "folder", folder.c_str(), modIniPath().c_str());
+    return name;
+}
+
+// After a successful import: the new definition, its collision and the region's COL file are known at once.
+void imLoadImported(const ImportRequest& r, const ImportPlan& p) {
+    ModelDef d;
+    d.model = toLower(r.name);
+    d.name = r.name;
+    d.txd = toLower(p.txdName);
+    d.ide = r.region + ".ide";
+    d.ideLine = ideObjsLine(r.id, r.name, p.txdName, r.drawDistance, r.flags);
+    d.drawDistance = r.drawDistance;
+    d.farModel = isFarModel(d.model, d.drawDistance);
+    d.pool = Pool::Building;  // not in object.dat and no path data: a building slot
+    app.defs[r.id] = d;
+    app.cols[d.model] = p.collision;
+    const std::string colPath = app.root + "/data/maps/" + r.region + "/" + r.region + ".col";
+    bool known = false;
+    for (const std::string& c : app.colFiles) known = known || toLower(c) == toLower(colPath);
+    if (!known) app.colFiles.push_back(colPath);
+    rb.ends.erase(r.id);
+    itRefill();
+}
+
+bool imDoImport(HWND w) {
+    ImportPlan p = imRecheck(true);  // the game's files as they are now
+    if (!p.problems.empty()) return false;
+    const ImportRequest r = imRequest();
+    std::vector<std::string> written;
+    std::string err;
+    if (!applyImport(r, p, app.img, written, err)) {
+        imp.lastError = err;
+        if (!imp.quiet) MessageBoxA(w, ("The import stopped: " + err + "\n\nmodels/med-imports.txt and the backups say how to undo what was written.").c_str(), "Import Model", MB_ICONERROR);
+        return false;
+    }
+    imLoadImported(r, p);
+    imp.imported = true;
+    imp.importedId = r.id;
+    if (!imp.quiet)
+        MessageBoxA(w, (r.name + " is imported (ID " + std::to_string(r.id) + ") and is in the Item tab, ready to place in region " + r.region +
+                        ".\n\nFiles changed in the game folder:\n" + [&] {
+                            std::string s;
+                            for (std::string f : written) {
+                                std::replace(f.begin(), f.end(), '\\', '/');
+                                std::string root = app.root;
+                                std::replace(root.begin(), root.end(), '\\', '/');
+                                if (toLower(f).rfind(toLower(root) + "/", 0) == 0) f = f.substr(root.size() + 1);
+                                s += "  " + f + "\n";
+                            }
+                            return s;
+                        }() + "\nHow to undo it is written in models/med-imports.txt.")
+                           .c_str(),
+                    "Import Model", MB_ICONINFORMATION);
+    return true;
+}
+
+LRESULT CALLBACK importProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_COMMAND: {
+            const int id = LOWORD(wp), code = HIWORD(wp);
+            if (id == ID_IM_DFF_BROWSE) {
+                const std::string f = imPickFile(w, "Models (*.dff)\0*.dff\0", "Import a model: pick its .dff");
+                if (!f.empty()) imSetModel(f);
+            } else if (id == ID_IM_TXD_BROWSE) {
+                const std::string f = imPickFile(w, "Texture dictionaries (*.txd)\0*.txd\0", "The model's texture dictionary");
+                if (!f.empty()) SetWindowTextA(imp.txd, f.c_str());
+            } else if (id == ID_IM_COL_BROWSE) {
+                const std::string f = imPickFile(w, "Collision (*.col)\0*.col\0", "The model's collision");
+                if (!f.empty()) SetWindowTextA(imp.col, f.c_str());
+            } else if (id == ID_IM_COL_CLEAR) {
+                SetWindowTextA(imp.col, "");
+            } else if (id == ID_IM_DFF_VIEW || id == ID_IM_TXD_VIEW || id == ID_IM_COL_VIEW) {
+                const std::string f = imText(id == ID_IM_DFF_VIEW ? imp.dff : id == ID_IM_TXD_VIEW ? imp.txd : imp.col);
+                if (!f.empty()) openLooseFile(w, f);
+            } else if (id == ID_IM_SUGGEST) {
+                imRecheck(true);
+                SetWindowTextA(imp.id, std::to_string(proposeModelId(imp.ids)).c_str());
+            } else if (id == ID_IM_NEWREGION) {
+                const std::vector<std::string> before = userRegionNames();
+                createRegionUi(w);
+                const std::vector<std::string> after = userRegionNames();
+                imFillRegions(after.size() > before.size() ? after.back() : "");
+            } else if (id == ID_IM_IMPORT) {
+                if (imDoImport(w)) imp.done = true;
+            } else if (id == ID_IM_CANCEL) {
+                imp.done = true;
+            }
+            if (code == EN_CHANGE || code == CBN_SELCHANGE || code == BN_CLICKED) {
+                if (!imp.done) imRecheck();
+            }
+            return 0;
+        }
+        case WM_CLOSE:
+            imp.done = true;
+            return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// File > Import Model... (`dffPath` given: start with that model, for tests and drag and drop).
+void importModelUi(HWND owner, const std::string& dffPath) {
+    std::string dff = dffPath;
+    if (dff.empty()) {
+        dff = imPickFile(owner, "Models (*.dff)\0*.dff\0", "Import a model: pick its .dff (its .txd and .col beside it come along)");
+        if (dff.empty()) return;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = importProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdImport";
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    const bool quiet = imp.quiet;
+    imp = ImportUi();
+    imp.quiet = quiet;
+    RECT r;
+    GetWindowRect(owner, &r);
+    imp.wnd = CreateWindowExA(WS_EX_DLGMODALFRAME, "MEdImport", "Import Model", WS_POPUP | WS_CAPTION | WS_SYSMENU, r.left + 100, r.top + 80, 720, 620, owner, nullptr,
+                              GetModuleHandle(nullptr), nullptr);
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    auto make = [&](const char* cls, const char* text, DWORD style, DWORD ex, int id, int x, int y, int w, int h) {
+        HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h, imp.wnd, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+        SendMessageA(c, WM_SETFONT, (WPARAM)font, TRUE);
+        return c;
+    };
+    int y = 12;
+    auto fileRow = [&](const char* label, int editId, int browseId, int viewId, HWND& edit) {
+        make("STATIC", label, SS_LEFT, 0, ID_IM_LABEL, 12, y + 4, 110, 16);
+        edit = make("EDIT", "", ES_AUTOHSCROLL | ES_READONLY, WS_EX_CLIENTEDGE, editId, 124, y, 400, 22);
+        make("BUTTON", "Browse...", BS_PUSHBUTTON, 0, browseId, 530, y, 80, 22);
+        make("BUTTON", "View", BS_PUSHBUTTON, 0, viewId, 616, y, 80, 22);
+        y += 28;
+    };
+    fileRow("Model (.dff):", ID_IM_DFF, ID_IM_DFF_BROWSE, ID_IM_DFF_VIEW, imp.dff);
+    fileRow("Textures (.txd):", ID_IM_TXD, ID_IM_TXD_BROWSE, ID_IM_TXD_VIEW, imp.txd);
+    fileRow("Collision (.col):", ID_IM_COL, ID_IM_COL_BROWSE, ID_IM_COL_VIEW, imp.col);
+    make("BUTTON", "No collision file", BS_PUSHBUTTON, 0, ID_IM_COL_CLEAR, 530, y, 166, 22);
+    make("STATIC", "Without a collision file it starts as:", SS_LEFT, 0, ID_IM_LABEL, 12, y + 4, 300, 16);
+    y += 26;
+    imp.startEmpty = make("BUTTON", "Empty (a clean slate: nothing solid until you build it)", BS_AUTORADIOBUTTON | WS_GROUP, 0, ID_IM_EMPTY, 24, y, 660, 20);
+    y += 22;
+    imp.startBox = make("BUTTON", "One box around the model (solid at once; good for simple props)", BS_AUTORADIOBUTTON, 0, ID_IM_BOX, 24, y, 660, 20);
+    y += 22;
+    imp.startMesh = make("BUTTON", "Copy the model's triangles (solid in its exact shape; good for roads and buildings)", BS_AUTORADIOBUTTON, 0, ID_IM_MESH, 24, y, 660, 20);
+    SendMessageA(imp.startEmpty, BM_SETCHECK, BST_CHECKED, 0);
+    y += 32;
+    make("STATIC", "Name:", SS_LEFT, 0, ID_IM_LABEL, 12, y + 4, 60, 16);
+    imp.name = make("EDIT", "", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_IM_NAME, 74, y, 170, 22);
+    make("STATIC", "Model ID:", SS_LEFT, 0, ID_IM_LABEL, 258, y + 4, 60, 16);
+    imp.id = make("EDIT", "", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_IM_ID, 320, y, 70, 22);
+    make("BUTTON", "Suggest", BS_PUSHBUTTON, 0, ID_IM_SUGGEST, 394, y, 70, 22);
+    make("STATIC", "Draw distance:", SS_LEFT, 0, ID_IM_LABEL, 476, y + 4, 80, 16);
+    imp.draw = make("EDIT", "200", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_IM_DRAW, 556, y, 50, 22);
+    make("STATIC", "Flags:", SS_LEFT, 0, ID_IM_LABEL, 616, y + 4, 34, 16);
+    imp.flags = make("EDIT", "0", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_IM_FLAGS, 652, y, 44, 22);
+    y += 32;
+    make("STATIC", "Region:", SS_LEFT, 0, ID_IM_LABEL, 12, y + 4, 60, 16);
+    imp.region = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_IM_REGION, 74, y, 300, 200);
+    make("BUTTON", "New region...", BS_PUSHBUTTON, 0, ID_IM_NEWREGION, 380, y, 100, 22);
+    make("STATIC", "Your own regions only", SS_LEFT, 0, ID_IM_LABEL, 488, y + 4, 208, 16);
+    y += 34;
+    imp.checks = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_IM_CHECKS, 12, y, 684, 560 - y - 30);
+    imp.importBtn = make("BUTTON", "Import", BS_DEFPUSHBUTTON, 0, ID_IM_IMPORT, 520, 560 - 18, 84, 26);
+    make("BUTTON", "Cancel", BS_PUSHBUTTON, 0, ID_IM_CANCEL, 612, 560 - 18, 84, 26);
+    gameIdsAndNames(app.root, imp.ids, imp.names);  // once; every check while typing uses this
+    imp.scanned = true;
+    SetWindowTextA(imp.id, std::to_string(proposeModelId(imp.ids)).c_str());
+    imFillRegions();
+    imSetModel(dff);
+    imRecheck();
+    if (imp.quiet) return;  // tests drive the window themselves and close it
+    EnableWindow(owner, FALSE);
+    ShowWindow(imp.wnd, SW_SHOW);
+    MSG m;
+    while (!imp.done && GetMessageA(&m, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageA(imp.wnd, &m)) {
+            TranslateMessage(&m);
+            DispatchMessageA(&m);
+        }
+    }
+    EnableWindow(owner, TRUE);
+    DestroyWindow(imp.wnd);
+    imp.wnd = nullptr;
+    SetForegroundWindow(owner);
+}
+
 // The tabs at the top of the left column: Scene (which regions are shown), Placements and Item.
 void showLeftTab(int tab) {
     if (app.leftTabs) TabCtrl_SetCurSel(app.leftTabs, tab);
@@ -7362,6 +7720,352 @@ void runLooseFileSelfTest(SelfTest& t) {
     ST_CHECK(t, stMapState() == before, "viewing loose files changes nothing in the map");
 }
 
+// ---- self-test of Import Model (runs inside --selftest) ---------------------------------------------------------------
+// Drives the Import Model window with the messages typing and clicking produce, imports for real into the game copy the
+// self-test runs on (after giving that copy its own gta3.img when it shares one through a hard link), checks every file
+// and the editor's state, then puts every file back as it was.
+namespace stimp {
+void setText(HWND h, const std::string& s) { SetWindowTextA(h, s.c_str()); }  // an edit control sends EN_CHANGE
+void radio(HWND pick) {
+    for (HWND h : {imp.startEmpty, imp.startBox, imp.startMesh}) SendMessageA(h, BM_SETCHECK, h == pick ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(imp.wnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(pick), BN_CLICKED), (LPARAM)pick);
+}
+void region(int row) {
+    SendMessageA(imp.region, CB_SETCURSEL, WPARAM(row), 0);
+    SendMessageA(imp.wnd, WM_COMMAND, MAKEWPARAM(ID_IM_REGION, CBN_SELCHANGE), (LPARAM)imp.region);
+}
+void button(int id) { SendMessageA(imp.wnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)GetDlgItem(imp.wnd, id)); }
+std::string checks() {
+    char b[8192] = "";
+    GetWindowTextA(imp.checks, b, sizeof b);
+    return b;
+}
+int regionRow(const std::string& name) {
+    const int n = int(SendMessageA(imp.region, CB_GETCOUNT, 0, 0));
+    for (int i = 0; i < n; ++i) {
+        char b[256] = "";
+        SendMessageA(imp.region, CB_GETLBTEXT, WPARAM(i), (LPARAM)b);
+        if (toLower(b) == toLower(name)) return i;
+    }
+    return -1;
+}
+void open(const std::string& dff) {
+    imp.quiet = true;
+    importModelUi(app.hwnd, dff);
+}
+void close() {
+    if (imp.wnd) DestroyWindow(imp.wnd);
+    imp = ImportUi();
+}
+std::vector<unsigned char> bytesOf(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::vector<unsigned char>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+}  // namespace stimp
+
+// What the window shows must agree with the fields: the Import button and the "Ready" text go together, the collision
+// choice is only open without a collision file, and a few simple rules checked here independently are never let through.
+void stImportInvariants(SelfTest& t, const std::string& what) {
+    const bool enabled = IsWindowEnabled(imp.importBtn) != 0;
+    const std::string text = stimp::checks();
+    ST_CHECK(t, enabled == (text.rfind("Ready to import", 0) == 0), what + ": the Import button is on exactly when the window says Ready");
+    ST_CHECK(t, enabled != (text.rfind("Not ready yet:", 0) == 0), what + ": otherwise it lists why");
+    const bool noCol = imText(imp.col).empty();
+    for (HWND h : {imp.startEmpty, imp.startBox, imp.startMesh}) ST_CHECK(t, (IsWindowEnabled(h) != 0) == noCol, what + ": the collision choice is open only without a .col");
+    if (!enabled) return;
+    const std::string name = imText(imp.name), idText = imText(imp.id), drawText = imText(imp.draw);
+    bool nameOk = !name.empty() && name.size() <= 19 && std::all_of(name.begin(), name.end(), [](char c) { return std::isalnum((unsigned char)c) || c == '_' || c == '-'; });
+    for (const auto& kv : app.defs) nameOk = nameOk && kv.second.model != toLower(name);
+    ST_CHECK(t, nameOk, what + ": Import is never on with a bad or taken name (" + name + ")");
+    const bool idDigits = !idText.empty() && std::all_of(idText.begin(), idText.end(), [](char c) { return c >= '0' && c <= '9'; });
+    const int id = idDigits && idText.size() < 9 ? std::atoi(idText.c_str()) : -1;
+    ST_CHECK(t, id >= 0 && id < 5500 && !app.defs.count(id), what + ": Import is never on with a bad or taken id (" + idText + ")");
+    char* end = nullptr;
+    const double dd = std::strtod(drawText.c_str(), &end);
+    ST_CHECK(t, !drawText.empty() && end && *end == 0 && dd > 0 && dd <= 3000, what + ": Import is never on with a bad draw distance (" + drawText + ")");
+    ST_CHECK(t, SendMessageA(imp.region, CB_GETCURSEL, 0, 0) >= 0, what + ": Import is never on without a region");
+    ST_CHECK(t, !imText(imp.txd).empty(), what + ": Import is never on without textures");
+}
+
+void runImportSelfTest(SelfTest& t) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string mapBefore = stMapState();
+    const std::string pid = std::to_string(GetCurrentProcessId() % 100000);
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string out = std::string(tmp) + "med_selftest_import_" + pid;
+    fs::remove_all(out, ec);
+    // source files: two of the game's own models, written out and renamed
+    int bin = -1, cone = -1;
+    for (const auto& kv : app.defs) {
+        if (kv.second.model == "dumpster01") bin = kv.first;
+        if (kv.second.model == "trafficcone") cone = kv.first;
+    }
+    ST_CHECK(t, bin >= 0 && cone >= 0, "the test models are in the game");
+    if (bin < 0 || cone < 0) return;
+    extractModelsTo(out + "/x", {bin, cone});
+    const ModelDef binDef = app.defs[bin], coneDef = app.defs[cone];
+    const std::string a = "sta" + pid, b = "stb" + pid, c = "stc" + pid;  // with a .col / without / sharing a's textures
+    fs::create_directories(out + "/a", ec);
+    fs::create_directories(out + "/b", ec);
+    fs::create_directories(out + "/c", ec);
+    fs::copy_file(out + "/x/" + binDef.name + "/" + binDef.name + ".dff", out + "/a/" + a + ".dff", ec);
+    fs::copy_file(out + "/x/" + binDef.name + "/" + binDef.txd + ".txd", out + "/a/" + a + ".txd", ec);
+    fs::copy_file(out + "/x/" + binDef.name + "/" + binDef.name + ".col", out + "/a/" + a + ".col", ec);
+    fs::copy_file(out + "/x/" + coneDef.name + "/" + coneDef.name + ".dff", out + "/b/" + b + ".dff", ec);
+    fs::copy_file(out + "/x/" + coneDef.name + "/" + coneDef.txd + ".txd", out + "/b/" + b + ".txd", ec);
+    fs::copy_file(out + "/x/" + coneDef.name + "/" + coneDef.name + ".dff", out + "/c/" + c + ".dff", ec);
+    ST_CHECK(t, fs::exists(out + "/a/" + a + ".col") && fs::exists(out + "/b/" + b + ".txd") && fs::exists(out + "/c/" + c + ".dff"), "the source files are written");
+    std::ofstream(out + "/broken.dff", std::ios::binary) << "not a model";
+    std::ofstream(out + "/broken.txd", std::ios::binary) << "nope";
+    std::ofstream(out + "/broken.col", std::ios::binary) << "COLL" << std::string(3, '\0');
+    {  // a texture dictionary named like one in the game but with other contents
+        std::vector<unsigned char> d = stimp::bytesOf(out + "/b/" + b + ".txd");
+        std::ofstream(out + "/" + binDef.txd + ".txd", std::ios::binary).write((const char*)d.data(), std::streamsize(d.size()));
+    }
+
+    // what is on disk before, to put back at the end
+    const std::string imgPath = app.img.path(), dirPath = imgPath.substr(0, imgPath.size() - 4) + ".dir", datPath = app.root + "/data/gta3.dat";
+    // 1. a gta3.img shared through a hard link with another folder is refused: the import would change that folder too
+    if (fs::hard_link_count(imgPath, ec) > 1 || fs::hard_link_count(dirPath, ec) > 1) {
+        std::string rel, err;
+        ST_CHECK(t, createRegionNamed("stlink" + pid, rel, err), "a region for the test");
+        stimp::open(out + "/a/" + a + ".dff");
+        stimp::region(stimp::regionRow("stlink" + pid));
+        const uintmax_t size = fs::file_size(imgPath, ec);
+        ST_CHECK(t, !IsWindowEnabled(imp.importBtn) && stimp::checks().find("hard link") != std::string::npos, "a hard-linked gta3.img is refused, and the window says why");
+        stimp::button(ID_IM_IMPORT);
+        ST_CHECK(t, !imp.imported && fs::file_size(imgPath, ec) == size, "pressing Import anyway writes nothing");
+        stimp::close();
+        // give this game copy its own archive (the linked original is not touched: only this folder's name is removed)
+        for (const std::string& f : {imgPath, dirPath}) {
+            fs::copy_file(f, f + ".own", ec);
+            fs::remove(f, ec);
+            fs::rename(f + ".own", f, ec);
+        }
+        ST_CHECK(t, fs::hard_link_count(imgPath, ec) == 1 && fs::hard_link_count(dirPath, ec) == 1, "the test's game copy has its own gta3.img now");
+        std::string err2;
+        ImgArchive::open(imgPath, app.img, err2);
+    }
+    const uintmax_t imgSize = fs::file_size(imgPath, ec);
+    const std::vector<unsigned char> dirBytes = stimp::bytesOf(dirPath), datBytes = stimp::bytesOf(datPath);
+    const size_t entries = app.img.entries().size(), defs = app.defs.size(), cols = app.cols.size(), colFiles = app.colFiles.size();
+    const bool hadDatBackup = fs::exists(datPath + ".med-backup", ec);
+    const bool hadNote = fs::exists(fs::path(imgPath).parent_path() / "med-imports.txt", ec);
+    std::string rel, err;
+    const std::string region = "stimp" + pid;
+    ST_CHECK(t, createRegionNamed(region, rel, err), "the destination region is made");
+    const std::vector<unsigned char> datWithRegion = stimp::bytesOf(datPath);
+    const std::string ideFile = app.root + "/data/maps/" + region + "/" + region + ".ide", colFile = app.root + "/data/maps/" + region + "/" + region + ".col";
+
+    // 2. the window fills itself in from the .dff
+    stimp::open(out + "/a/" + a + ".dff");
+    ST_CHECK(t, imp.wnd && fs::equivalent(imText(imp.txd), out + "/a/" + a + ".txd", ec) && fs::equivalent(imText(imp.col), out + "/a/" + a + ".col", ec),
+             "picking the .dff fills in the .txd and .col beside it");
+    ST_CHECK(t, imText(imp.name) == a, "the name is the file's name");
+    std::set<int> ids;
+    std::set<std::string> names;
+    gameIdsAndNames(app.root, ids, names);
+    ST_CHECK(t, imText(imp.id) == std::to_string(proposeModelId(ids)), "the suggested id is the first free one");
+    ST_CHECK(t, stimp::regionRow(region) >= 0 && stimp::regionRow("industse") < 0 && stimp::regionRow("props") < 0, "the region list has the user's regions and not Rockstar's");
+    stImportInvariants(t, "opened");
+    if (SendMessageA(imp.region, CB_GETCOUNT, 0, 0) > 1) {
+        stimp::region(-1);
+        ST_CHECK(t, !IsWindowEnabled(imp.importBtn) && stimp::checks().find("Pick the region") != std::string::npos, "no region: not ready, and it says so");
+    }
+    stimp::region(stimp::regionRow(region));
+    ST_CHECK(t, IsWindowEnabled(imp.importBtn) && stimp::checks().find("renamed " + a) != std::string::npos, "ready, and it says the collision record is renamed");
+    stImportInvariants(t, "region picked");
+
+    // 3. every refusal through the fields, each one put right again
+    const std::string goodId = imText(imp.id);
+    int takenId = -1;
+    for (const auto& kv : app.defs) if (takenId < 0) takenId = kv.first;
+    struct Bad { HWND* field; std::string value, says; };
+    const std::vector<Bad> bads = {
+        {&imp.name, "", "Model name"}, {&imp.name, "two words", "Model name"}, {&imp.name, "trafficcone", "already exists"},
+        {&imp.name, "TRAFFICCONE", "already exists"}, {&imp.name, std::string(20, 'q'), "Model name"}, {&imp.name, "a<b", "Model name"},
+        {&imp.id, "abc", "whole number"}, {&imp.id, "", "between 0 and"}, {&imp.id, "-5", "between 0 and"}, {&imp.id, "5500", "between 0 and"},
+        {&imp.id, std::to_string(takenId), "already used"}, {&imp.id, "12x", "whole number"},
+        {&imp.draw, "0", "draw distance"}, {&imp.draw, "3001", "draw distance"}, {&imp.draw, "x", "draw distance"}, {&imp.draw, "", "draw distance"},
+        {&imp.flags, "q", "flags"}, {&imp.dff, out + "/broken.dff", "not a model"}, {&imp.dff, out + "/missing.dff", "Cannot read"},
+        {&imp.txd, out + "/broken.txd", "not a texture dictionary"}, {&imp.txd, "", "is required"}, {&imp.txd, out + "/" + binDef.txd + ".txd", "different"},
+        {&imp.col, out + "/broken.col", "not a collision file"}, {&imp.col, out + "/missing.col", "Cannot read"},
+    };
+    for (const Bad& x : bads) {
+        const std::string keep = imText(*x.field);
+        stimp::setText(*x.field, x.value);
+        const std::string text = stimp::checks();
+        ST_CHECK(t, !IsWindowEnabled(imp.importBtn) && text.find(x.says) != std::string::npos, "'" + x.value + "' is refused and the window says '" + x.says + "'");
+        stImportInvariants(t, "refused " + x.value);
+        const uintmax_t size = fs::file_size(imgPath, ec);
+        stimp::button(ID_IM_IMPORT);
+        ST_CHECK(t, !imp.imported && fs::file_size(imgPath, ec) == size && !fs::exists(ideFile, ec), "Import pressed while refused writes nothing");
+        stimp::setText(*x.field, keep);
+        ST_CHECK(t, IsWindowEnabled(imp.importBtn), "put right again: ready");
+    }
+    // the three ways to start without a collision file
+    stimp::button(ID_IM_COL_CLEAR);
+    ST_CHECK(t, imText(imp.col).empty() && IsWindowEnabled(imp.startBox), "No collision file opens the choice");
+    stimp::radio(imp.startEmpty);
+    ST_CHECK(t, stimp::checks().find("empty (a clean slate)") != std::string::npos, "Empty is a clean slate");
+    stimp::radio(imp.startBox);
+    ST_CHECK(t, stimp::checks().find("one box around the model") != std::string::npos, "Box is one box");
+    stimp::radio(imp.startMesh);
+    ST_CHECK(t, stimp::checks().find("the model's own triangles") != std::string::npos, "Mesh is the model's triangles");
+    stImportInvariants(t, "starting choices");
+    stimp::setText(imp.col, out + "/a/" + a + ".col");
+    stimp::button(ID_IM_SUGGEST);
+    ST_CHECK(t, imText(imp.id) == goodId, "Suggest gives the first free id");
+
+    // 4. the import: with its own collision file
+    const int idA = std::atoi(goodId.c_str());
+    stimp::button(ID_IM_IMPORT);
+    ST_CHECK(t, imp.imported && imp.importedId == idA && imp.done, "Import imports and closes the window");
+    stimp::close();
+    auto checkImported = [&](const std::string& name, int id, const std::string& txd, bool txdAdded, size_t boxes, size_t faces, const std::string& w) {
+        auto d = app.defs.find(id);
+        ST_CHECK(t, d != app.defs.end() && d->second.model == name && d->second.txd == txd && d->second.ide == region + ".ide" && d->second.pool == Pool::Building,
+                 w + ": the editor knows the model at once");
+        ST_CHECK(t, app.img.find(name + ".dff") >= 0 && (app.img.find(txd + ".txd") >= 0), w + ": model and textures are in gta3.img");
+        ImgArchive again;
+        std::string e;
+        ST_CHECK(t, ImgArchive::open(imgPath, again, e) && again.entries().size() == app.img.entries().size() && again.find(name + ".dff") >= 0, w + ": gta3.img reads back from disk");
+        std::vector<unsigned char> dff;
+        DffModel m;
+        ST_CHECK(t, again.extract(name + ".dff", dff, e) && parseDff(dff, m, e) && !m.geometries.empty(), w + ": the model in the archive reads back");
+        bool ok = false;
+        const std::string ide = slurp(ideFile, ok);
+        ST_CHECK(t, ok && ide.find(std::to_string(id) + ", " + name + ", " + txd + ", 1, 200, 0") != std::string::npos, w + ": the IDE line is written");
+        std::vector<ColModel> cm;
+        const std::vector<unsigned char> colBytes = stimp::bytesOf(colFile);
+        const ColModel* rec = nullptr;
+        if (parseCol(colBytes, cm, e))
+            for (const ColModel& x : cm) if (x.name == name) rec = &x;
+        ST_CHECK(t, rec && rec->modelId == id && rec->boxes.size() == boxes && rec->faces.size() == faces, w + ": the collision record is in the region's COL file");
+        auto col = app.cols.find(name);
+        ST_CHECK(t, col != app.cols.end() && col->second.boxes.size() == boxes && col->second.faces.size() == faces, w + ": the editor has its collision");
+        const std::string dat = slurp(datPath, ok);
+        ST_CHECK(t, toLower(dat).find(toLower("IDE DATA\\MAPS\\" + region + "\\" + region + ".IDE")) != std::string::npos &&
+                        toLower(dat).find(toLower("COLFILE 0 DATA\\MAPS\\" + region + "\\" + region + ".COL")) != std::string::npos,
+                 w + ": gta3.dat lists the region's IDE and COL");
+        ST_CHECK(t, fs::exists(dirPath + ".before-" + name + ".med-backup", ec), w + ": gta3.dir was backed up");
+        SendMessageA(it.show, CB_SETCURSEL, 0, 0);  // Show: all models (an earlier section may have left placed / not placed)
+        SetWindowTextA(it.search, name.c_str());
+        ST_CHECK(t, it.rows.size() == 1 && it.rows[0] == id, w + ": the Item tab lists it");
+        (void)txdAdded;
+    };
+    std::vector<ColModel> source;
+    std::string e;
+    parseCol(stimp::bytesOf(out + "/a/" + a + ".col"), source, e);
+    ST_CHECK(t, source.size() == 1, "the source .col holds one model");
+    if (source.size() == 1) checkImported(a, idA, a, true, source[0].boxes.size(), source[0].faces.size(), a);
+    ST_CHECK(t, app.img.entries().size() == entries + 2, "two entries were added to gta3.img (model and textures)");
+    ST_CHECK(t, std::count(app.colFiles.begin(), app.colFiles.end(), colFile) == 1, "the region's COL file is known once");
+    {  // it can be placed and drawn
+        const size_t n = app.instances.size();
+        ST_CHECK(t, addNewObject(idA, regions.back().file, app.cam.x, app.cam.y + 30, app.cam.z - app.cam.h) >= 0 && app.instances.size() == n + 1, "the imported model can be placed");
+        render();
+        ST_CHECK(t, getModel(a, a).triangles > 0, "its model loads from gta3.img with its triangles");
+        TxdFile tf;
+        std::string src, terr;
+        ST_CHECK(t, readTxd(a, tf, src, terr) && !tf.textures.empty(), "its textures load from gta3.img");
+        undoAction();
+        ST_CHECK(t, app.instances.size() == n, "undo takes the placement away again");
+    }
+    // the same name or id again is refused now
+    stimp::open(out + "/a/" + a + ".dff");
+    stimp::region(stimp::regionRow(region));
+    ST_CHECK(t, !IsWindowEnabled(imp.importBtn) && stimp::checks().find("already exists") != std::string::npos, "the same name cannot be imported twice");
+    ST_CHECK(t, imText(imp.id) == std::to_string(idA + 1), "the suggested id moved on");
+    stimp::close();
+
+    // 5. without a collision file, starting as one box; 6. sharing a's textures, starting as the mesh
+    stimp::open(out + "/b/" + b + ".dff");
+    ST_CHECK(t, imText(imp.col).empty() && IsWindowEnabled(imp.startBox), "no .col beside it: the choice is open");
+    stimp::region(stimp::regionRow(region));
+    stimp::radio(imp.startBox);
+    const int idB = std::atoi(imText(imp.id).c_str());
+    stimp::button(ID_IM_IMPORT);
+    ST_CHECK(t, imp.imported, b + " is imported");
+    stimp::close();
+    checkImported(b, idB, b, true, 1, 0, b);
+    stimp::open(out + "/c/" + c + ".dff");
+    ST_CHECK(t, imText(imp.txd).empty() && !IsWindowEnabled(imp.importBtn), "no .txd beside it: not ready");
+    stimp::setText(imp.txd, out + "/a/" + a + ".txd");
+    stimp::region(stimp::regionRow(region));
+    stimp::radio(imp.startMesh);
+    ST_CHECK(t, stimp::checks().find("already in the game (the same file)") != std::string::npos, "the same dictionary is shared, and it says so");
+    const int idC = std::atoi(imText(imp.id).c_str());
+    const size_t before = app.img.entries().size();
+    stimp::button(ID_IM_IMPORT);
+    ST_CHECK(t, imp.imported && app.img.entries().size() == before + 1, c + " adds only its model to gta3.img");
+    stimp::close();
+    {
+        std::vector<float> v;
+        std::vector<uint32_t> tri;
+        DffModel m;
+        parseDff(stimp::bytesOf(out + "/c/" + c + ".dff"), m, e);
+        dffMesh(m, v, tri);
+        checkImported(c, idC, a, false, 0, tri.size() / 3, c);
+    }
+
+    // 7. random field changes: the window must never let a bad import through, and a refused Import writes nothing
+    unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;
+    auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return n <= 0 ? 0 : int((seed >> 8) % unsigned(n)); };
+    stimp::open(out + "/a/" + a + ".dff");
+    const std::vector<std::string> nameVals = {"stz" + pid, "", "x y", a, b, "TRAFFICCONE", std::string(19, 'k'), std::string(20, 'k'), "ok-name_1", "$"};
+    const std::vector<std::string> idVals = {std::to_string(idC + 1), "", "abc", "-1", "5499", "5500", std::to_string(idA), std::to_string(takenId), " 7", "99999999999"};
+    const std::vector<std::string> drawVals = {"200", "0", "3000", "3001", "x", "1e3", "-4", "0.5", ""};
+    const std::vector<std::string> fileVals = {out + "/a/" + a + ".dff", out + "/b/" + b + ".dff", out + "/broken.dff", out + "/missing.dff"};
+    const std::vector<std::string> txdVals = {out + "/a/" + a + ".txd", out + "/b/" + b + ".txd", out + "/broken.txd", "", out + "/" + binDef.txd + ".txd"};
+    const std::vector<std::string> colVals = {"", out + "/a/" + a + ".col", out + "/broken.col", out + "/x/" + binDef.name + "/" + binDef.name + ".col"};
+    const int steps = std::max(200, (std::getenv("MED_SELFTEST_STEPS") ? std::atoi(std::getenv("MED_SELFTEST_STEPS")) : 1500) / 3);
+    for (int step = 0; step < steps; ++step) {
+        const int op = rnd(9);
+        std::string what;
+        switch (op) {
+            case 0: what = "name"; stimp::setText(imp.name, nameVals[size_t(rnd(int(nameVals.size())))]); break;
+            case 1: what = "id"; stimp::setText(imp.id, idVals[size_t(rnd(int(idVals.size())))]); break;
+            case 2: what = "draw"; stimp::setText(imp.draw, drawVals[size_t(rnd(int(drawVals.size())))]); break;
+            case 3: what = "flags"; stimp::setText(imp.flags, rnd(3) == 0 ? "q" : std::to_string(rnd(4))); break;
+            case 4: what = "dff"; stimp::setText(imp.dff, fileVals[size_t(rnd(int(fileVals.size())))]); break;
+            case 5: what = "txd"; stimp::setText(imp.txd, txdVals[size_t(rnd(int(txdVals.size())))]); break;
+            case 6: what = "col"; stimp::setText(imp.col, colVals[size_t(rnd(int(colVals.size())))]); break;
+            case 7: what = "start"; if (imText(imp.col).empty()) stimp::radio(rnd(3) == 0 ? imp.startEmpty : rnd(2) ? imp.startBox : imp.startMesh); break;
+            case 8: what = "region"; stimp::region(rnd(3) == 0 ? -1 : stimp::regionRow(region)); break;
+        }
+        stImportInvariants(t, "random step " + std::to_string(step) + " (" + what + ")");
+        if (!IsWindowEnabled(imp.importBtn) && rnd(4) == 0) {
+            const uintmax_t size = fs::file_size(imgPath, ec);
+            stimp::button(ID_IM_IMPORT);
+            ST_CHECK(t, !imp.imported && fs::file_size(imgPath, ec) == size, "random step " + std::to_string(step) + ": a refused Import writes nothing");
+        }
+    }
+    stimp::close();
+
+    // 8. put everything back: the archive, gta3.dat, the region's files; the editor forgets the imported models
+    fs::resize_file(imgPath, imgSize, ec);
+    std::ofstream(dirPath, std::ios::binary | std::ios::trunc).write((const char*)dirBytes.data(), std::streamsize(dirBytes.size()));
+    std::ofstream(datPath, std::ios::binary | std::ios::trunc).write((const char*)datWithRegion.data(), std::streamsize(datWithRegion.size()));
+    for (const std::string& n : {a, b, c}) fs::remove(dirPath + ".before-" + n + ".med-backup", ec);
+    fs::remove(ideFile, ec);
+    fs::remove(colFile, ec);
+    if (!hadNote) fs::remove(fs::path(imgPath).parent_path() / "med-imports.txt", ec);
+    for (int id : {idA, idB, idC}) app.defs.erase(id);
+    for (const std::string& n : {a, b, c}) { app.cols.erase(n); app.models.erase(n); }
+    app.colFiles.erase(std::remove(app.colFiles.begin(), app.colFiles.end(), colFile), app.colFiles.end());
+    ImgArchive::open(imgPath, app.img, err);
+    SetWindowTextA(it.search, "");
+    ST_CHECK(t, fs::file_size(imgPath, ec) == imgSize && stimp::bytesOf(dirPath) == dirBytes && app.img.entries().size() == entries, "gta3.img and gta3.dir are back as they were");
+    ST_CHECK(t, app.defs.size() == defs && app.cols.size() == cols && app.colFiles.size() == colFiles, "the editor is back to the game's models");
+    ST_CHECK(t, hadDatBackup || fs::exists(datPath + ".med-backup", ec), "gta3.dat keeps its backup");
+    (void)datBytes;
+    fs::remove_all(out, ec);
+    ST_CHECK(t, stMapState() == mapBefore, "importing changes no placement (the test placement was undone)");
+}
+
 void runBookmarksSelfTest(SelfTest& t) {
     const std::string realFile = app.bookmarkFile;
     const std::vector<Bookmark> realList = app.bookmarks;
@@ -7488,6 +8192,12 @@ void runBookmarksSelfTest(SelfTest& t) {
 int runPlacementsSelfTest() {
     SelfTest t;
     std::printf("Placements tab self-test on %s (%zu placements, %zu regions)\n", app.root.c_str(), app.instances.size(), regions.size());
+    if (const char* only = std::getenv("MED_SELFTEST_ONLY"); only && std::string(only) == "import") {  // just one section, for quick runs
+        runImportSelfTest(t);
+        std::printf("self-test: %d checks, %d failures\n", t.checks, t.failures);
+        std::fflush(stdout);
+        return t.failures == 0 ? 0 : 1;
+    }
     showLeftTab(1);
     ST_CHECK(t, !app.showEmptyRegions, "View > Show hidden regions is off at start");
     setShowEmptyRegions(true);  // the sections below use the empty CULL.IPL
@@ -7733,6 +8443,8 @@ int runPlacementsSelfTest() {
     runColTxdViewerSelfTest(t);
     // loose .dff / .txd / .col files from disk
     runLooseFileSelfTest(t);
+    // Import Model (real imports into the test's game copy, put back afterwards)
+    runImportSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -7820,7 +8532,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_COMMAND:
             if (std::getenv("MED_DEBUG")) { std::printf("WM_COMMAND id %d code %d from %p\n", int(LOWORD(w)), int(HIWORD(w)), (void*)l); std::fflush(stdout); }
-            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_VIEWFILE) doCommand(h, LOWORD(w));
+            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_IMPORT) doCommand(h, LOWORD(w));
             return 0;
         case WM_KEYDOWN:
             if (w < 256) app.keys[w] = true;
@@ -8088,6 +8800,7 @@ int main(int argc, char** argv) {
     bool listRoadEnds = false;          // --road-ends: print the selected road piece's ends
     bool selfTest = false;
     std::string newRegionName, moveToRegion, newObjectModel, pasteRegion;
+    std::string importDff, importRegion, importName, importId, importStart;  // --import dff region [--import-name n] [--import-id n] [--import-start empty|box|mesh]
     std::vector<std::pair<std::string, std::string>> extracts;  // --extract model folder (repeatable)
     double pastePos[3] = {0, 0, 0};
     double newObjectPos[3] = {0, 0, 0};
@@ -8127,6 +8840,7 @@ int main(int argc, char** argv) {
         else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
         else if (a == "--open-txd" && i + 1 < argc) openTxdAtStart = argv[++i];
         else if (a == "--open-file" && i + 1 < argc) openFilesAtStart.push_back(argv[++i]);
+        else if (a == "--import-window" && i + 1 < argc) importAtStart = argv[++i];
         else if (a == "--pick-test" && i + 1 < argc) pickTestModel = argv[++i];
         else if (a == "--only" && i + 1 < argc) onlyRegions = argv[++i];
         else if (a == "--lod-near") app.lodNear = float(num(1)), ++i;
@@ -8139,6 +8853,10 @@ int main(int argc, char** argv) {
         else if (a == "--sink") sinkAfter = true;
         else if (a == "--duplicate") duplicateAfter = true;
         else if (a == "--new-region" && i + 1 < argc) newRegionName = argv[++i];
+        else if (a == "--import" && i + 2 < argc) { importDff = argv[++i]; importRegion = argv[++i]; }
+        else if (a == "--import-name" && i + 1 < argc) importName = argv[++i];
+        else if (a == "--import-id" && i + 1 < argc) importId = argv[++i];
+        else if (a == "--import-start" && i + 1 < argc) importStart = argv[++i];
         else if (a == "--extract" && i + 2 < argc) { extracts.emplace_back(argv[i + 1], argv[i + 2]); i += 2; }
         else if (a == "--copy-paste" && i + 4 < argc) { pasteRegion = argv[i + 1]; pastePos[0] = std::atof(argv[i + 2]); pastePos[1] = std::atof(argv[i + 3]); pastePos[2] = std::atof(argv[i + 4]); i += 4; }
         else if (a == "--new-object" && i + 4 < argc) { newObjectModel = argv[i + 1]; newObjectPos[0] = std::atof(argv[i + 2]); newObjectPos[1] = std::atof(argv[i + 3]); newObjectPos[2] = std::atof(argv[i + 4]); i += 4; }
@@ -8315,6 +9033,25 @@ int main(int argc, char** argv) {
             if (addIplRegion(app.root, newRegionName, rel, err)) { app.iplPaths.push_back(rel); initRegions(); std::printf("created region %s (%zu regions listed)\n", rel.c_str(), regions.size()); }
             else std::printf("new region failed: %s\n", err.c_str());
         }
+        if (!importDff.empty()) {  // test helper: the Import Model window, filled in and Import pressed by the program
+            imp.quiet = true;
+            importModelUi(app.hwnd, importDff);
+            imFillRegions(importRegion);
+            if (!importName.empty()) SetWindowTextA(imp.name, importName.c_str());
+            if (!importId.empty()) SetWindowTextA(imp.id, importId.c_str());
+            if (!importStart.empty()) {
+                for (HWND h : {imp.startEmpty, imp.startBox, imp.startMesh}) SendMessageA(h, BM_SETCHECK, BST_UNCHECKED, 0);
+                SendMessageA(importStart == "box" ? imp.startBox : importStart == "mesh" ? imp.startMesh : imp.startEmpty, BM_SETCHECK, BST_CHECKED, 0);
+            }
+            imRecheck();
+            char text[8192] = "";
+            GetWindowTextA(imp.checks, text, sizeof text);
+            std::printf("import check:\n%s\n", text);
+            if (imDoImport(app.hwnd)) std::printf("imported id %d, Item tab rows %zu\n", imp.importedId, it.rows.size());
+            else std::printf("import not done%s%s\n", imp.lastError.empty() ? "" : ": ", imp.lastError.c_str());
+            DestroyWindow(imp.wnd);
+            imp = ImportUi();
+        }
         for (const auto& [extractModel, extractFolder] : extracts) {  // test helper: Extract Object without the dialogs
             int id = -1;
             for (const auto& kv : app.defs) if (kv.second.model == toLower(extractModel)) id = kv.first;
@@ -8471,6 +9208,7 @@ int main(int argc, char** argv) {
     }
     if (!openTxdAtStart.empty()) openTxdViewer(app.hwnd, openTxdAtStart);  // tests: open TXD Properties for this dictionary
     for (const std::string& f : openFilesAtStart) openLooseFile(app.hwnd, f);
+    if (!importAtStart.empty()) PostMessageA(app.hwnd, WM_COMMAND, ID_TB_IMPORT, 0);  // opened from the message loop (the window is modal)
     if (!openColAtStart.empty())  // tests: open Collision Object Properties for this model
         for (const auto& kv : app.defs)
             if (kv.second.model == toLower(openColAtStart)) { openColViewer(app.hwnd, kv.first); break; }

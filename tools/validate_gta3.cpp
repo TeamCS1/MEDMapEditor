@@ -14,6 +14,9 @@
 #include "../src/core/ipl.h"
 #include "../src/core/mapcheck.h"
 #include "../src/core/original.h"
+#include "../src/core/importer.h"
+#include <cstring>
+#include <set>
 #include "../src/core/textutil.h"
 #include "../src/core/txd.h"
 
@@ -217,7 +220,20 @@ int main(int argc, char** argv) {
     std::vector<IplInstance> allInsts;
     int saveIdentical = 0, saveDiffers = 0, saveRefused = 0;
     int colFiles = 0, colBad = 0;
-    size_t colModels = 0, colSpheres = 0, colBoxes = 0, colFaces = 0;
+    size_t colModels = 0, colSpheres = 0, colBoxes = 0, colFaces = 0, colRewriteSame = 0, colRewriteBad = 0;
+    std::set<int> modelIds;  // every id of every IDE section (the importer must not reuse one)
+    {  // default.dat's IDE files (default.ide: vehicles, peds, weapons) count too; the rest of this check reads gta3.dat
+        bool dok;
+        std::istringstream din(slurp(root / "data/default.dat", dok));
+        std::string dl;
+        while (std::getline(din, dl)) {
+            dl = trim(dl);
+            if (toLower(dl).rfind("ide ", 0) != 0) continue;
+            bool iok;
+            const std::string t = slurp(root / fixSlashes(trim(dl.substr(4))), iok);
+            if (iok) collectIdeIds(t, modelIds);
+        }
+    }
     int ideFiles = 0, iplFiles = 0, objs = 0, tobj = 0, insts = 0, warnings = 0, missing = 0, roundTripBad = 0;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -241,6 +257,15 @@ int main(int argc, char** argv) {
             }
             ++colFiles;
             colModels += models.size();
+            // the importer's COL writer must give Rockstar's records back byte for byte
+            for (const ColModel& m : models) {
+                const std::vector<unsigned char> again = writeColl(m);
+                if (again.size() != m.fileSize || std::memcmp(again.data(), bytes.data() + m.fileOffset, m.fileSize) != 0) {
+                    if (++colRewriteBad <= 5) std::printf("  COL rewrite differs: %s in %s\n", m.name.c_str(), colPath.c_str());
+                } else {
+                    ++colRewriteSame;
+                }
+            }
             for (const ColModel& m : models) { colSpheres += m.spheres.size(); colBoxes += m.boxes.size(); colFaces += m.faces.size(); }
             continue;
         }
@@ -248,6 +273,7 @@ int main(int argc, char** argv) {
         std::string text = slurp(root / path, ok);
         if (!ok) { std::printf("missing: %s\n", path.c_str()); ++missing; continue; }
         if (kind == "ide") {
+            collectIdeIds(text, modelIds);
             IdeFile f = parseIde(text, GameVersion::GTA3);
             ++ideFiles;
             for (const IdeObject& o : f.objects) (o.timed ? tobj : objs)++;
@@ -292,6 +318,10 @@ int main(int argc, char** argv) {
     }
     std::printf("COL: %d files, %zu models (%zu spheres, %zu boxes, %zu faces), %d failed\n", colFiles, colModels, colSpheres, colBoxes, colFaces, colBad);
     problems += colBad;
+    std::printf("COL rewrite: %zu records written back byte for byte, %zu differ\n", colRewriteSame, colRewriteBad);
+    problems += int(colRewriteBad);
+    std::printf("model ids: %zu used (every IDE section), highest %d, first free from %d: %d\n", modelIds.size(), modelIds.empty() ? -1 : *modelIds.rbegin(),
+                kGta3FirstFreeId, proposeModelId(modelIds));
     std::printf("IDE: %d files, %d objs, %d tobj\n", ideFiles, objs, tobj);
     std::printf("IPL: %d files, %d inst\n", iplFiles, insts);
     {
