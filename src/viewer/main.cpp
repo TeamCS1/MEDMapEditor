@@ -218,7 +218,7 @@ struct ModelViewer;
 ModelViewer* openDffViewer(HWND owner, int id);
 ModelViewer* openColViewer(HWND owner, int id);
 struct TxdViewer;
-TxdViewer* openTxdViewer(HWND owner, const std::string& txdName);
+TxdViewer* openTxdViewer(HWND owner, const std::string& txdName, const std::string& file = "");
 void updateTxdViewers();
 void updateViewers();
 const std::vector<RoadEnd>& roadEndsOf(int id);
@@ -468,14 +468,8 @@ void drawModel(const GlModel& m) {
     }
 }
 
-GlModel& getModel(const std::string& name, const std::string& txdName) {
-    auto it = app.models.find(name);
-    if (it != app.models.end()) return it->second;
-    GlModel& gm = app.models[name];
-    std::vector<unsigned char> data;
-    std::string err;
-    DffModel dff;
-    if (!app.img.extract(name + ".dff", data, err) || !parseDff(data, dff, err)) return gm;
+// A GL model from a parsed DFF; its textures come from the dictionary `txdName` (a game TXD, or a loose file's key).
+void buildGlModel(GlModel& gm, const DffModel& dff, const std::string& txdName) {
     float radius = 0;
     for (const DffAtomic& a : dff.atomics) {
         if (a.geometry < 0 || a.geometry >= static_cast<int>(dff.geometries.size())) continue;
@@ -494,6 +488,17 @@ GlModel& getModel(const std::string& name, const std::string& txdName) {
     }
     gm.radius = std::max(radius, 1.0f);
     gm.valid = true;
+}
+
+GlModel& getModel(const std::string& name, const std::string& txdName) {
+    auto it = app.models.find(name);
+    if (it != app.models.end()) return it->second;
+    GlModel& gm = app.models[name];
+    std::vector<unsigned char> data;
+    std::string err;
+    DffModel dff;
+    if (!app.img.extract(name + ".dff", data, err) || !parseDff(data, dff, err)) return gm;
+    buildGlModel(gm, dff, txdName);
     return gm;
 }
 
@@ -1659,7 +1664,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1888,6 +1893,8 @@ void openGameFolder(HWND owner) {
 }
 
 void roadAttachFirstOpen(HWND owner);
+void viewFileUi(HWND owner);
+bool openLooseFile(HWND owner, const std::string& path);
 
 void doCommand(HWND h, int id) {
     switch (id) {
@@ -1895,6 +1902,7 @@ void doCommand(HWND h, int id) {
         case ID_TB_BOOKMARKS: showBookmarksWindow(h); return;  // the window keeps the focus
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
         case ID_TB_ROADATTACH: roadAttachFirstOpen(h); return;
+        case ID_TB_VIEWFILE: viewFileUi(h); return;
         case ID_TB_NEWOBJ: newObjectAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
         case ID_TB_COPY: copySelected(); break;
         case ID_TB_PASTE: pasteAt(h, app.viewX + app.width / 2, app.toolbarH + app.height / 2); return;
@@ -1919,6 +1927,8 @@ void showToolbarMenu(HWND owner, int buttonId) {
         AppendMenuA(menu, MF_STRING, ID_TB_OPEN, "Open...");
         AppendMenuA(menu, MF_STRING | (app.dirty.empty() ? MF_GRAYED : MF_ENABLED), ID_TB_SAVE, "Save All" "\tCtrl+S");
         AppendMenuA(menu, MF_STRING, ID_TB_SAVEMOD, "Save as Mod...");
+        AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(menu, MF_STRING, ID_TB_VIEWFILE, "View a DFF / TXD / COL file...");
     } else if (buttonId == ID_TB_VIEWMENU) {
         AppendMenuA(menu, MF_STRING | (app.showEmptyRegions ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWEMPTY, "Show hidden regions");
     } else {
@@ -4485,6 +4495,9 @@ struct ModelViewer {
     bool closed = false;
     float centre[3] = {0, 0, 0};  // the middle of the model's mesh: the view turns about it
     int kind = 0;                 // 0 DFF Properties, 1 Collision Object Properties
+    std::string file;             // a loose file from disk ("" = a model of the game)
+    std::string modelKey;         // a loose model's entry in app.models
+    std::vector<ColModel> colModels;  // every collision model of a loose .col (Model in file picks one)
     ColModel col;                 // the collision model (kind 1), its record as stored in the COL file
     std::string colSource;        // the COL file it came from
     bool showBoxes = true, showSpheres = true, showMesh = true;
@@ -4521,7 +4534,9 @@ std::string dffInfoText(const ModelViewer& v) {
     auto yn = [](bool b) { return std::string(b ? "Yes" : "No"); };
     char ver[32];
     std::snprintf(ver, sizeof ver, "%X", m.version);
-    std::string t = "Model: " + v.dff + ".dff\r\nTextures: " + v.txd + ".txd\r\nRenderWare version: " + ver + "\r\n\r\n";
+    std::string t = v.file.empty() ? "Model: " + v.dff + ".dff\r\nTextures: " + v.txd + ".txd\r\n"
+                                   : "File: " + v.file + "\r\nTextures: " + v.txd + "\r\n";
+    t += "RenderWare version: " + std::string(ver) + "\r\n\r\n";
     t += "Number of Objects: " + std::to_string(m.atomics.size()) + "\r\n";
     t += "Number of Vertices: " + std::to_string(verts) + "\r\n";
     t += "Number of Faces: " + std::to_string(faces) + "\r\n";
@@ -4690,6 +4705,16 @@ void drawColModel(ModelViewer& v) {
     glPolygonMode(GL_FRONT_AND_BACK, v.wireframe ? GL_LINE : GL_FILL);
 }
 
+// The GL model a viewer shows: a loose file's own, or the game model's.
+GlModel* viewerGl(ModelViewer& v) {
+    if (!v.modelKey.empty()) {
+        auto m = app.models.find(v.modelKey);
+        return m == app.models.end() ? nullptr : &m->second;
+    }
+    auto d = app.defs.find(v.id);
+    return d == app.defs.end() ? nullptr : &getModel(d->second.model, d->second.txd);
+}
+
 void drawViewer(ModelViewer& v) {
     if (!v.gl || !v.rc) return;
     RECT r;
@@ -4734,10 +4759,9 @@ void drawViewer(ModelViewer& v) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(-v.centre[0], -v.centre[1], -v.centre[2]);  // MEd turns about the model's origin, often a corner of a building
-    auto d = app.defs.find(v.id);
     if (v.kind == 1) drawColModel(v);
-    else if (d != app.defs.end()) {
-        GlModel& gm = getModel(d->second.model, d->second.txd);
+    else if (GlModel* gmp = viewerGl(v)) {
+        GlModel& gm = *gmp;
         if (v.object <= 0) drawModel(gm);
         else if (v.object <= int(gm.geoms.size())) {
             GlModel one;
@@ -4849,6 +4873,27 @@ void viewerLayout(ModelViewer& v) {
     MoveWindow(GetDlgItem(v.wnd, ID_MV_CLOSE), px, ch - 32, pw, 26, TRUE);
 }
 
+// Point the view at the middle of a collision model, far enough away to see all of it.
+void viewerFitCol(ModelViewer& v) {
+    double half = 1;
+    for (int k = 0; k < 3; ++k) {
+        v.centre[k] = (v.col.boundMin[k] + v.col.boundMax[k]) / 2;
+        half = std::max(half, double(v.col.boundMax[k] - v.col.boundMin[k]) / 2);
+    }
+    v.home = GlViewState();
+    v.home.tz = -float(std::max(3.0, half * 4.0));
+    v.view = v.home;
+}
+
+void viewerPickColModel(ModelViewer& v, int k) {
+    if (k < 0 || k >= int(v.colModels.size())) return;
+    v.col = v.colModels[size_t(k)];
+    v.dff = v.col.name;
+    viewerFitCol(v);
+    SetWindowTextA(v.info, colInfoText(v).c_str());
+    SetWindowTextA(v.wnd, ("Collision Object Properties - " + v.col.name + " (" + v.file.substr(v.file.find_last_of("/" + std::string(1, char(92))) + 1) + ")").c_str());
+}
+
 LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     ModelViewer* v = viewerOf(w);
     switch (msg) {
@@ -4871,7 +4916,11 @@ LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else if (id == ID_MV_BOXES) v->showBoxes = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
             else if (id == ID_MV_SPHERES) v->showSpheres = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
             else if (id == ID_MV_MESH) v->showMesh = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
-            else if (id == ID_MV_OBJECT && code == CBN_SELCHANGE) v->object = int(SendMessageA(v->objectBox, CB_GETCURSEL, 0, 0));
+            else if (id == ID_MV_OBJECT && code == CBN_SELCHANGE) {
+                const int k = int(SendMessageA(v->objectBox, CB_GETCURSEL, 0, 0));
+                if (v->kind == 1) viewerPickColModel(*v, k);  // a loose .col: Model in file
+                else v->object = k;
+            }
             else if (id == ID_MV_CLOSE) DestroyWindow(w);
             return 0;
         }
@@ -4890,23 +4939,87 @@ LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 
 // Open MEd's "DFF Properties" (kind 0) or "Collision Object Properties" (kind 1) for a model definition. Several can
 // be open at once; opening one that is already open brings it to the front.
-ModelViewer* openModelViewer(HWND owner, int id, int kind) {
+ModelViewer* openModelViewer(HWND owner, int id, int kind, const std::string& file) {
     auto d = app.defs.find(id);
-    if (d == app.defs.end()) return nullptr;
+    if (file.empty() && d == app.defs.end()) return nullptr;
     for (auto& v : viewers)
-        if (v->id == id && v->kind == kind && !v->closed) {
+        if (v->kind == kind && !v->closed && (file.empty() ? v->id == id : toLower(v->file) == toLower(file))) {
             ShowWindow(v->wnd, SW_RESTORE);
             SetForegroundWindow(v->wnd);
             return v.get();
         }
     auto v = std::make_unique<ModelViewer>();
-    v->id = id;
+    v->id = file.empty() ? id : -1;
     v->kind = kind;
-    v->dff = d->second.name;
-    v->txd = d->second.txd;
+    v->file = file;
     std::vector<unsigned char> data;
     std::string err;
-    if (kind == 1) {  // the model's own collision record, from the COL files of gta3.dat (the first that has it)
+    const std::string title0 = "View " + std::string(kind == 1 ? "Collision" : "DFF");
+    if (!file.empty()) {  // a loose file from disk
+        bool ok;
+        const std::string bytes = slurp(file, ok);
+        if (!ok) {
+            inspWarn(owner, "Could not open " + file + ".", title0.c_str());
+            return nullptr;
+        }
+        data.assign(bytes.begin(), bytes.end());
+        const size_t slash = file.find_last_of("/" + std::string(1, char(92)));
+        const std::string folder = slash == std::string::npos ? "." : file.substr(0, slash);
+        std::string stem = file.substr(slash == std::string::npos ? 0 : slash + 1);
+        if (stem.size() > 4) stem = stem.substr(0, stem.size() - 4);
+        if (kind == 1) {
+            if (!parseCol(data, v->colModels, err) && v->colModels.empty()) {
+                inspWarn(owner, file + " is not a collision file this editor can read" + (err.empty() ? "." : ": " + err), title0.c_str());
+                return nullptr;
+            }
+            if (v->colModels.empty()) {
+                inspWarn(owner, file + " holds no collision models.", title0.c_str());
+                return nullptr;
+            }
+            v->col = v->colModels[0];
+            v->dff = v->col.name;
+            v->colSource = file;
+        } else {
+            if (!parseDff(data, v->model, err)) {
+                inspWarn(owner, file + " is not a model this editor can read" + (err.empty() ? "." : ": " + err), title0.c_str());
+                return nullptr;
+            }
+            v->dff = stem;
+            // its textures: <name>.txd beside it, else the only .txd in that folder
+            std::string txdPath;
+            std::error_code ec;
+            if (std::filesystem::exists(folder + "/" + stem + ".txd", ec)) txdPath = folder + "/" + stem + ".txd";
+            else {
+                std::vector<std::string> found;
+                for (const auto& e : std::filesystem::directory_iterator(folder, ec))
+                    if (toLower(e.path().extension().string()) == ".txd") found.push_back(e.path().string());
+                if (found.size() == 1) txdPath = found[0];
+            }
+            const std::string txdKey = "file:" + toLower(txdPath);
+            if (!txdPath.empty()) {
+                const std::string tb = slurp(txdPath, ok);
+                TxdFile tf;
+                std::string terr;
+                if (ok && parseTxd(std::vector<unsigned char>(tb.begin(), tb.end()), tf, terr)) {
+                    auto old = app.textures.find(txdKey);  // a re-opened file is read again (it may have changed)
+                    if (old != app.textures.end()) {
+                        for (auto& kv : old->second) glDeleteTextures(1, &kv.second);
+                        app.textures.erase(old);
+                    }
+                    uploadTxd(txdKey, tf);
+                    app.loadedTxds.insert(txdKey);
+                    v->txd = txdPath.substr(txdPath.find_last_of("/" + std::string(1, char(92))) + 1);
+                } else {
+                    v->txd = "(could not read " + txdPath + ")";
+                }
+            } else {
+                v->txd = "(none found: put " + stem + ".txd next to the model)";
+            }
+            v->modelKey = "file:" + toLower(file);
+            app.models.erase(v->modelKey);
+            buildGlModel(app.models[v->modelKey], v->model, txdPath.empty() ? std::string("file:none") : txdKey);
+        }
+    } else if (kind == 1) {  // the model's own collision record, from the COL files of gta3.dat (the first that has it)
         std::vector<unsigned char> record;
         std::vector<ColModel> models;
         if (!findCollisionRecord(app.colFiles, d->second.model, record, v->colSource) || !parseCol(record, models, err) || models.empty()) {
@@ -4914,13 +5027,18 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
             return nullptr;
         }
         v->col = models[0];
+        v->dff = d->second.name;
         const std::string root = app.root + "/";
         if (v->colSource.rfind(root, 0) == 0) v->colSource = v->colSource.substr(root.size());
     } else if (!app.img.extract(d->second.model + ".dff", data, err) || !parseDff(data, v->model, err)) {
         inspWarn(owner, "Could not read " + d->second.name + ".dff from " + app.img.path() + (err.empty() ? "." : ": " + err), "DFF Properties");
         return nullptr;
     }
-    getModel(d->second.model, d->second.txd);  // load it (and its textures) under the map's context, which the viewer shares
+    if (file.empty()) {
+        v->dff = d->second.name;
+        v->txd = d->second.txd;
+        getModel(d->second.model, d->second.txd);  // load it (and its textures) under the map's context, which the viewer shares
+    }
     static bool registered = false;
     if (!registered) {
         WNDCLASSA wc = {};
@@ -4942,7 +5060,9 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
     RECT r;
     GetWindowRect(owner, &r);
     const int n = int(viewers.size());
-    const std::string title = kind == 1 ? "Collision Object Properties - " + d->second.name : "DFF Properties - " + d->second.name + ".dff";
+    const std::string fileName = file.empty() ? std::string() : file.substr(file.find_last_of("/" + std::string(1, char(92))) + 1);
+    const std::string title = kind == 1 ? "Collision Object Properties - " + v->dff + (file.empty() ? "" : " (" + fileName + ")")
+                                        : "DFF Properties - " + (file.empty() ? v->dff + ".dff" : file);
     v->wnd = CreateWindowExA(0, "MEdModelViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 120 + 30 * n, r.top + 100 + 30 * n, 900, 600, owner,
                              nullptr, GetModuleHandle(nullptr), nullptr);
     v->gl = CreateWindowExA(0, "MEdModelViewerGL", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, v->wnd, nullptr, GetModuleHandle(nullptr), nullptr);
@@ -4964,6 +5084,12 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
         }
         HWND shadow = make("BUTTON", "Show Shadow Mesh (COL3 only)", BS_AUTOCHECKBOX, 0, ID_MV_SHADOW);
         EnableWindow(shadow, FALSE);  // GTA III and Vice City collision has no shadow mesh
+        if (v->colModels.size() > 1) {  // a loose .col with several models: pick one
+            make("STATIC", "Model in file:", SS_LEFT, 0, ID_MV_LBL_OBJECT);
+            v->objectBox = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_MV_OBJECT);
+            for (const ColModel& c : v->colModels) SendMessageA(v->objectBox, CB_ADDSTRING, 0, (LPARAM)c.name.c_str());
+            SendMessageA(v->objectBox, CB_SETCURSEL, 0, 0);
+        }
         v->info = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_MV_INFO);
         make("BUTTON", "Close", BS_PUSHBUTTON, 0, ID_MV_CLOSE);
         SetWindowTextA(v->info, colInfoText(*v).c_str());
@@ -4999,14 +5125,9 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
     wglMakeCurrent(app.dc, app.rc);
     // turn about the middle of the mesh and start far enough away to see all of it (MEd: the origin and always 52)
     if (kind == 1) {  // the collision bounds
-        double half = 1;
-        for (int k = 0; k < 3; ++k) {
-            v->centre[k] = (v->col.boundMin[k] + v->col.boundMax[k]) / 2;
-            half = std::max(half, double(v->col.boundMax[k] - v->col.boundMin[k]) / 2);
-        }
-        v->home.tz = -float(std::max(3.0, half * 3.4));
+        viewerFitCol(*v);
     } else {
-        GlModel& gm = getModel(d->second.model, d->second.txd);
+        GlModel& gm = *viewerGl(*v);
         float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
         for (const GlGeometry& g : gm.geoms)
             for (size_t i = 0; i + 2 < g.pos.size(); i += 3)
@@ -5021,7 +5142,7 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
                 v->centre[k] = (lo[k] + hi[k]) / 2;
                 half = std::max(half, double(hi[k] - lo[k]) / 2);
             }
-        v->home.tz = -float(std::max(3.0, half * 3.4));  // the whole model fills the view, a cone as well as a building
+        v->home.tz = -float(std::max(3.0, half * 4.0));  // the whole model fills the view, a cone as well as a building
     }
     v->view = v->home;
     v->lastTick = GetTickCount();
@@ -5032,8 +5153,8 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind) {
     return raw;
 }
 
-ModelViewer* openDffViewer(HWND owner, int id) { return openModelViewer(owner, id, 0); }
-ModelViewer* openColViewer(HWND owner, int id) { return openModelViewer(owner, id, 1); }
+ModelViewer* openDffViewer(HWND owner, int id) { return openModelViewer(owner, id, 0, ""); }
+ModelViewer* openColViewer(HWND owner, int id) { return openModelViewer(owner, id, 1, ""); }
 
 // ---- MEd's "TXD Properties" (CTexView, "TextureView", constructor 0x00465270): a texture dictionary's textures ------------
 // MEd: a list of the texture names (itemSelectionChanged shows the picked one), the picture, and a table with the
@@ -5267,9 +5388,9 @@ bool readTxd(const std::string& name, TxdFile& out, std::string& source, std::st
     return parseTxd(data, out, err);
 }
 
-TxdViewer* openTxdViewer(HWND owner, const std::string& txdName) {
+TxdViewer* openTxdViewer(HWND owner, const std::string& txdName, const std::string& file) {
     for (auto& v : txdViewers)
-        if (toLower(v->txd) == toLower(txdName) && !v->closed) {
+        if (!v->closed && (file.empty() ? toLower(v->txd) == toLower(txdName) && v->source.find(':') == std::string::npos : toLower(v->source) == toLower(file))) {
             ShowWindow(v->wnd, SW_RESTORE);
             SetForegroundWindow(v->wnd);
             return v.get();
@@ -5277,7 +5398,15 @@ TxdViewer* openTxdViewer(HWND owner, const std::string& txdName) {
     auto v = std::make_unique<TxdViewer>();
     v->txd = txdName;
     std::string err;
-    if (!readTxd(txdName, v->file, v->source, err)) {
+    if (!file.empty()) {  // a loose .txd from disk
+        bool ok;
+        const std::string bytes = slurp(file, ok);
+        if (!ok || !parseTxd(std::vector<unsigned char>(bytes.begin(), bytes.end()), v->file, err)) {
+            inspWarn(owner, ok ? file + " is not a texture dictionary this editor can read" + (err.empty() ? "." : ": " + err) : "Could not open " + file + ".", "View TXD");
+            return nullptr;
+        }
+        v->source = file;
+    } else if (!readTxd(txdName, v->file, v->source, err)) {
         inspWarn(owner, "Could not read " + txdName + ".txd" + (err.empty() ? " (it is not in gta3.img)." : ": " + err), "TXD Properties");
         return nullptr;
     }
@@ -5301,7 +5430,7 @@ TxdViewer* openTxdViewer(HWND owner, const std::string& txdName) {
     RECT r;
     GetWindowRect(owner, &r);
     const int n = int(txdViewers.size());
-    const std::string title = "TXD Properties - " + txdName + ".txd";
+    const std::string title = "TXD Properties - " + (file.empty() ? txdName + ".txd" : file);
     v->wnd = CreateWindowExA(0, "MEdTxdViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 140 + 30 * n, r.top + 110 + 30 * n, 860, 620, owner,
                              nullptr, GetModuleHandle(nullptr), nullptr);
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -5347,6 +5476,49 @@ TxdViewer* openTxdViewer(HWND owner, const std::string& txdName) {
     }
     ShowWindow(raw->wnd, SW_SHOW);
     return raw;
+}
+
+// View a loose .dff, .txd or .col from disk (File > View a DFF / TXD / COL file..., or dropped on the window).
+bool openLooseFile(HWND owner, const std::string& path) {
+    std::string ext = toLower(path.size() > 4 ? path.substr(path.size() - 4) : path);
+    if (ext == ".dff") return openModelViewer(owner, -1, 0, path) != nullptr;
+    if (ext == ".col") return openModelViewer(owner, -1, 1, path) != nullptr;
+    if (ext == ".txd") {
+        const size_t slash = path.find_last_of("/" + std::string(1, char(92)));
+        std::string stem = path.substr(slash == std::string::npos ? 0 : slash + 1);
+        return openTxdViewer(owner, stem.substr(0, stem.size() - 4), path) != nullptr;
+    }
+    inspWarn(owner, path + " is not a .dff, .txd or .col file.", "View a file");
+    return false;
+}
+
+// File > View a DFF / TXD / COL file...: a file picker that remembers its folder (med_viewer.ini, [Viewer] folder).
+void viewFileUi(HWND owner) {
+    char last[MAX_PATH] = "";
+    GetPrivateProfileStringA("Viewer", "folder", "", last, sizeof last, modIniPath().c_str());
+    char name[MAX_PATH * 8] = "";
+    OPENFILENAMEA o = {};
+    o.lStructSize = sizeof o;
+    o.hwndOwner = owner;
+    o.lpstrFilter = "Models, textures and collision (*.dff;*.txd;*.col)\0*.dff;*.txd;*.col\0Models (*.dff)\0*.dff\0Texture dictionaries (*.txd)\0*.txd\0Collision (*.col)\0*.col\0";
+    o.lpstrFile = name;
+    o.nMaxFile = sizeof name;
+    o.lpstrInitialDir = last[0] ? last : nullptr;
+    o.lpstrTitle = "View a model, texture dictionary or collision file";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameA(&o)) return;
+    // one file: the full path; several: the folder, then each name, separated by zeros
+    std::string first = name;
+    std::vector<std::string> files;
+    const char* p = name + first.size() + 1;
+    if (!*p) files.push_back(first);
+    while (*p) {
+        files.push_back(first + "\\" + p);
+        p += std::strlen(p) + 1;
+    }
+    const std::string folder = files.size() == 1 ? first.substr(0, first.find_last_of("\\/")) : first;
+    WritePrivateProfileStringA("Viewer", "folder", folder.c_str(), modIniPath().c_str());
+    for (const std::string& f : files) openLooseFile(owner, f);
 }
 
 // Once a frame: drop closed texture viewers.
@@ -7092,6 +7264,104 @@ void runColTxdViewerSelfTest(SelfTest& t) {
     ST_CHECK(t, stMapState() == before, "viewing collision and textures changes nothing in the map");
 }
 
+// Loose files in the viewers: extracted copies of real models open from disk and show the same as the game's own;
+// a .col with many models picks one; reopening reuses the window; missing, damaged and wrong files are refused.
+void runLooseFileSelfTest(SelfTest& t) {
+    namespace fs = std::filesystem;
+    insp.quiet = true;
+    const std::string before = stMapState();
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string out = std::string(tmp) + "med_selftest_loose_" + std::to_string(GetCurrentProcessId());
+    std::error_code ec;
+    fs::remove_all(out, ec);
+    std::vector<int> ids;
+    int n = 0;
+    for (const auto& kv : app.defs) if (n++ % 120 == 0) ids.push_back(kv.first);
+    for (const ExtractResult& r : extractModelsTo(out, ids)) (void)r;
+    int checked = 0;
+    for (int id : ids) {
+        const ModelDef& def = app.defs[id];
+        const std::string dir = out + "/" + def.name;
+        // the model, with its dictionary found beside it
+        if (fs::exists(dir + "/" + def.name + ".dff", ec)) {
+            ST_CHECK(t, openLooseFile(app.hwnd, dir + "/" + def.name + ".dff"), def.name + ".dff opens from disk");
+            ModelViewer* v = viewers.empty() ? nullptr : viewers.back().get();
+            if (v) {
+                ++checked;
+                ModelViewer* g = openDffViewer(app.hwnd, id);
+                ST_CHECK(t, g && g != v, def.name + ": the game's model is a separate window from the loose file's");
+                if (g) {
+                    char a[8192], b[8192];
+                    GetWindowTextA(v->info, a, sizeof a);
+                    GetWindowTextA(g->info, b, sizeof b);
+                    const std::string sa = a, sb = b;
+                    ST_CHECK(t, sa.substr(sa.find("Number of Objects")) == sb.substr(sb.find("Number of Objects")), def.name + ": the loose copy reads the same as the game's model");
+                }
+                ST_CHECK(t, fs::exists(dir + "/" + def.txd + ".txd", ec) == (v->txd == def.txd + ".txd"), def.name + ": its dictionary is found beside it");
+                const size_t open = viewers.size();
+                bool same = openLooseFile(app.hwnd, dir + "/" + def.name + ".dff") && viewers.size() == open;
+                same = same && std::any_of(viewers.begin(), viewers.end(), [&](const std::unique_ptr<ModelViewer>& x) { return x.get() == v; });
+                ST_CHECK(t, same, "opening the file again reuses its window");
+                drawViewer(*v);
+            }
+        }
+        // its collision and textures
+        if (fs::exists(dir + "/" + def.name + ".col", ec)) {
+            ST_CHECK(t, openLooseFile(app.hwnd, dir + "/" + def.name + ".col"), def.name + ".col opens from disk");
+            ModelViewer* c = viewers.empty() ? nullptr : viewers.back().get();
+            ST_CHECK(t, c && c->kind == 1 && toLower(c->col.name) == def.model && c->colModels.size() == 1 && !c->objectBox, def.name + ".col: one model, no picker");
+            if (c) drawViewer(*c);
+        }
+        if (fs::exists(dir + "/" + def.txd + ".txd", ec)) {
+            ST_CHECK(t, openLooseFile(app.hwnd, dir + "/" + def.txd + ".txd"), def.txd + ".txd opens from disk");
+            TxdFile f;
+            std::string src, err;
+            ST_CHECK(t, !txdViewers.empty() && readTxd(def.txd, f, src, err) && ListView_GetItemCount(txdViewers.back()->list) == int(f.textures.size()),
+                     def.txd + ".txd: the loose copy lists the same textures as the game's");
+        }
+        for (auto& v : viewers) SendMessageA(v->wnd, WM_COMMAND, ID_MV_CLOSE, 0);
+        for (auto& v : txdViewers) SendMessageA(v->wnd, WM_COMMAND, ID_TV_CLOSE, 0);
+        updateViewers();
+        updateTxdViewers();
+        ST_CHECK(t, viewers.empty() && txdViewers.empty(), "all closed");
+    }
+    ST_CHECK(t, checked >= 10, "loose models checked: " + std::to_string(checked));
+    // a COL file with many models: pick through them
+    if (!app.colFiles.empty()) {
+        std::string many;
+        for (const std::string& f : app.colFiles) if (toLower(f).find("generic") != std::string::npos) many = f;
+        if (many.empty()) many = app.colFiles[0];
+        ST_CHECK(t, openLooseFile(app.hwnd, many), "a whole COL file opens");
+        ModelViewer* c = viewers.empty() ? nullptr : viewers.back().get();
+        ST_CHECK(t, c && c->colModels.size() > 1 && c->objectBox && SendMessageA(c->objectBox, CB_GETCOUNT, 0, 0) == LRESULT(c->colModels.size()), "Model in file lists every model");
+        if (c)
+            for (int k : {1, int(c->colModels.size()) / 2, int(c->colModels.size()) - 1}) {
+                SendMessageA(c->objectBox, CB_SETCURSEL, WPARAM(k), 0);
+                SendMessageA(c->wnd, WM_COMMAND, MAKEWPARAM(ID_MV_OBJECT, CBN_SELCHANGE), LPARAM(c->objectBox));
+                char text[8192];
+                GetWindowTextA(c->info, text, sizeof text);
+                ST_CHECK(t, c->col.name == c->colModels[size_t(k)].name && std::string(text).find("Model: " + c->col.name + "\r\n") == 0 &&
+                                std::memcmp(&c->view, &c->home, sizeof c->home) == 0,
+                         "picking model " + std::to_string(k) + " shows it, its table and a fresh view");
+                drawViewer(*c);
+            }
+        if (c) SendMessageA(c->wnd, WM_COMMAND, ID_MV_CLOSE, 0);
+        updateViewers();
+    }
+    // refused: missing, wrong extension, damaged files of each kind; nothing opens
+    std::ofstream(out + "/broken.dff", std::ios::binary) << "this is not a model";
+    std::ofstream(out + "/broken.col", std::ios::binary) << "COLL" << std::string(3, '\0');
+    std::ofstream(out + "/broken.txd", std::ios::binary) << "nope";
+    std::ofstream(out + "/notes.txt", std::ios::binary) << "hello";
+    for (const char* bad : {"/missing.dff", "/broken.dff", "/broken.col", "/broken.txd", "/notes.txt", "/missing.col", "/missing.txd"}) {
+        ST_CHECK(t, !openLooseFile(app.hwnd, out + bad), std::string(bad + 1) + " is refused with a message");
+        ST_CHECK(t, viewers.empty() && txdViewers.empty(), std::string(bad + 1) + ": no viewer is left open");
+    }
+    fs::remove_all(out, ec);
+    ST_CHECK(t, stMapState() == before, "viewing loose files changes nothing in the map");
+}
+
 void runBookmarksSelfTest(SelfTest& t) {
     const std::string realFile = app.bookmarkFile;
     const std::vector<Bookmark> realList = app.bookmarks;
@@ -7461,6 +7731,8 @@ int runPlacementsSelfTest() {
     runDffViewerSelfTest(t);
     // Collision Object Properties and TXD Properties
     runColTxdViewerSelfTest(t);
+    // loose .dff / .txd / .col files from disk
+    runLooseFileSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -7548,7 +7820,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_COMMAND:
             if (std::getenv("MED_DEBUG")) { std::printf("WM_COMMAND id %d code %d from %p\n", int(LOWORD(w)), int(HIWORD(w)), (void*)l); std::fflush(stdout); }
-            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_ROADATTACH) doCommand(h, LOWORD(w));
+            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_VIEWFILE) doCommand(h, LOWORD(w));
             return 0;
         case WM_KEYDOWN:
             if (w < 256) app.keys[w] = true;
@@ -7620,6 +7892,18 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         case WM_MOUSEWHEEL:
             cameraWheel(app.cam, GET_WHEEL_DELTA_WPARAM(w), (GetKeyState(VK_SHIFT) & 0x8000) != 0);
             return 0;
+        case WM_DROPFILES: {  // .dff / .txd / .col files dropped on the window open in the viewers
+            HDROP drop = reinterpret_cast<HDROP>(w);
+            const UINT n = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
+            std::vector<std::string> files;
+            for (UINT i = 0; i < n; ++i) {
+                char path[MAX_PATH];
+                if (DragQueryFileA(drop, i, path, MAX_PATH)) files.push_back(path);
+            }
+            DragFinish(drop);
+            for (const std::string& f : files) openLooseFile(h, f);
+            return 0;
+        }
         case WM_RBUTTONDOWN:
             SetFocus(h);
             showObjectMenu(h, int(short(LOWORD(l))), int(short(HIWORD(l))));  // client coordinates, converted inside
@@ -7691,6 +7975,7 @@ bool createWindow(bool visible) {
     if (!app.hwnd) return false;
     if (visible) {
         createToolbar(app.hwnd);
+        DragAcceptFiles(app.hwnd, TRUE);  // drop .dff / .txd / .col files to view them
         createInspector(app.hwnd);
         createScenePanel(app.hwnd);
         createPlacementsPanel(app.hwnd);
@@ -7810,6 +8095,7 @@ int main(int argc, char** argv) {
     std::string onlyRegions;
     int benchmark = 0;
     std::string selectModel, pickTestModel, openDffAtStart, openColAtStart, openTxdAtStart;
+    std::vector<std::string> openFilesAtStart;  // --open-file path (repeatable): loose files in the viewers
     bool addedOnly = false;
     double moveBy[3] = {0, 0, 0};
     // MEd's bookmarks live in MEdv032/ of this project; look next to the game folder first, then up from the program
@@ -7840,6 +8126,7 @@ int main(int argc, char** argv) {
         else if (a == "--open-dff" && i + 1 < argc) openDffAtStart = argv[++i];
         else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
         else if (a == "--open-txd" && i + 1 < argc) openTxdAtStart = argv[++i];
+        else if (a == "--open-file" && i + 1 < argc) openFilesAtStart.push_back(argv[++i]);
         else if (a == "--pick-test" && i + 1 < argc) pickTestModel = argv[++i];
         else if (a == "--only" && i + 1 < argc) onlyRegions = argv[++i];
         else if (a == "--lod-near") app.lodNear = float(num(1)), ++i;
@@ -8183,6 +8470,7 @@ int main(int argc, char** argv) {
         if (best >= 0) app.selected.assign(1, best);
     }
     if (!openTxdAtStart.empty()) openTxdViewer(app.hwnd, openTxdAtStart);  // tests: open TXD Properties for this dictionary
+    for (const std::string& f : openFilesAtStart) openLooseFile(app.hwnd, f);
     if (!openColAtStart.empty())  // tests: open Collision Object Properties for this model
         for (const auto& kv : app.defs)
             if (kv.second.model == toLower(openColAtStart)) { openColViewer(app.hwnd, kv.first); break; }

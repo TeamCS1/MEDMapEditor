@@ -189,6 +189,8 @@ As in MEd, each object definition has three viewers. Open them from the **Item**
 - **TXD Properties** (the textures): every texture of the dictionary with its size; click one to see it. It is drawn over a grey checkerboard so transparent parts show (**Show alpha**), fitted to the window or at its real size (**Fit to window**). Below: texture name, alpha name, size, pixel format (for example "8-bit palette of 888"), mipmaps, alpha, platform, and which object definitions use the dictionary.
 - **Collision Object Properties** (what the game treats as solid): the collision boxes, spheres and triangle mesh, each coloured by its surface type with MEd's colours (grey for concrete and default, green grass and hedges, blue water and glass, sandy sand, brown wood), inside the red bounds box with the green / red / blue axes and the bounding circle. **Show Boxes**, **Show Spheres**, **Show Collision Mesh**, **Wireframe**; the table gives the counts, the bounds, the surface types used and the COL file it came from. (Show Shadow Mesh is a San Andreas feature.)
 
+**Files from disk** (to check a model before it goes into the game): **File > View a DFF / TXD / COL file...** (several at once are fine), or drag .dff, .txd and .col files from Explorer onto the editor window. A model finds its textures in a .txd with the same name next to it, or in the only .txd in that folder; the table says which (or that none was found). A .col file with several collision models gets a **Model in file** list to pick one. Opening the same file again reads it again, so you can check a change made in another program. Nothing is copied into the game.
+
 Differences from MEd, on purpose: the view turns about the middle of the model and starts at a distance that fits it (MEd: about the model's origin, always 52 units away, so a cone was a dot), and the picture keeps its true shape (MEd stretched it to a square).
 
 ### Extract Object (copy an object's files out of the game)
@@ -357,4 +359,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-Opening loose .dff / .txd / .col files in the viewers, importing new models, editing collision (planned in that order), editing IDE files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+Importing new models, editing collision (planned in that order), editing IDE files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
