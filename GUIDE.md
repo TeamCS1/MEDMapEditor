@@ -181,6 +181,16 @@ Which pieces are offered: 55 of the 64 kit pieces (all straights, slopes, lane s
 
 Tip from the user's first road: when you remove a tunnel or bridge, check the ground there. Terrain is part of the map too, and a road built where a tunnel was runs inside the hill.
 
+### Looking at a model, its textures and its collision (the three viewers)
+
+As in MEd, each object definition has three viewers. Open them from the **Item** tab (pick an item, then **DFF Properties**, **View TXD** or **View Collision**) or by right-clicking an object on the map (**DFF Properties...**, **View TXD...**, **Collision Properties...**). Each opens in its own window, several can be open at once, and none of them changes anything.
+
+- **DFF Properties** (the 3D model): the model on its own. **Right mouse button** drag turns it, **left mouse button** drag moves it, the **wheel** zooms (Shift: faster); **Zoom In**, **Zoom Out**, **Reset View**, **Automatically Rotate**, **Show Wireframe**, **Show Object Number** (for models made of several parts). The table lists objects, vertices, faces, colours, UV mapping, normals, materials, textured materials, triangle splits and their format, night vertex colours and 2DFX (both Vice City / San Andreas features, "No" for GTA III), and every texture the model uses.
+- **TXD Properties** (the textures): every texture of the dictionary with its size; click one to see it. It is drawn over a grey checkerboard so transparent parts show (**Show alpha**), fitted to the window or at its real size (**Fit to window**). Below: texture name, alpha name, size, pixel format (for example "8-bit palette of 888"), mipmaps, alpha, platform, and which object definitions use the dictionary.
+- **Collision Object Properties** (what the game treats as solid): the collision boxes, spheres and triangle mesh, each coloured by its surface type with MEd's colours (grey for concrete and default, green grass and hedges, blue water and glass, sandy sand, brown wood), inside the red bounds box with the green / red / blue axes and the bounding circle. **Show Boxes**, **Show Spheres**, **Show Collision Mesh**, **Wireframe**; the table gives the counts, the bounds, the surface types used and the COL file it came from. (Show Shadow Mesh is a San Andreas feature.)
+
+Differences from MEd, on purpose: the view turns about the middle of the model and starts at a distance that fits it (MEd: about the model's origin, always 52 units away, so a cone was a dot), and the picture keeps its true shape (MEd stretched it to a square).
+
 ### Extract Object (copy an object's files out of the game)
 
 Right-click an object > **Extract Object...** (or **Extract Objects...** with several selected), or pick an item in the Item tab and press **Extract...**. Choose a folder; the editor remembers it for next time.
@@ -347,4 +357,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-Editing IDE or COL files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+Opening loose .dff / .txd / .col files in the viewers, importing new models, editing collision (planned in that order), editing IDE files, importing models (putting an extracted or new model back into the game), the IMG tool, the DFF / TXD / COL viewers, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.

@@ -42,6 +42,8 @@ struct DffGeometry {
     std::vector<DffMaterial> materials;
     std::vector<DffSplit> splits;  // empty when the model has no BinMesh plugin
     bool triangleStrips = false;   // BinMesh indices are strips rather than lists
+    bool nightColors = false;      // has the night vertex colour plugin (not read, only noted; MEd's DFF Properties shows it)
+    bool has2dfx = false;          // has the 2DFX plugin (not read, only noted)
 
     size_t vertexCount() const { return positions.size() / 3; }
 };

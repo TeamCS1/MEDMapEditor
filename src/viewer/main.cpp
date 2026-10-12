@@ -45,6 +45,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <string>
@@ -213,6 +214,13 @@ struct App {
 // ---- loading -----------------------------------------------------------------------------
 
 std::vector<bool> originalFlags();
+struct ModelViewer;
+ModelViewer* openDffViewer(HWND owner, int id);
+ModelViewer* openColViewer(HWND owner, int id);
+struct TxdViewer;
+TxdViewer* openTxdViewer(HWND owner, const std::string& txdName);
+void updateTxdViewers();
+void updateViewers();
 const std::vector<RoadEnd>& roadEndsOf(int id);
 bool isRoadPiece(int idx);
 bool roadEndJoined(int idx, const RoadEnd& w);
@@ -1122,6 +1130,12 @@ void showObjectMenu(HWND hwnd, int mx, int my) {
         case kCmdCopy: copySelected(); break;
         case kCmdReplace: replaceSelectedUi(hwnd); break;
         case kCmdExtract: extractObjectsUi(hwnd, modelIdsOf(app.selected)); break;
+        case kCmdDffView: if (!app.selected.empty()) openDffViewer(hwnd, app.instances[size_t(app.selected[0])].id); break;
+        case kCmdColView: if (!app.selected.empty()) openColViewer(hwnd, app.instances[size_t(app.selected[0])].id); break;
+        case kCmdTxdView:
+            if (!app.selected.empty() && app.defs.count(app.instances[size_t(app.selected[0])].id))
+                openTxdViewer(hwnd, app.defs[app.instances[size_t(app.selected[0])].id].txd);
+            break;
         case kCmdDeleteRelocate: sinkSelected(); break;
         case kCmdDeleteHard: deleteSelected(); break;
         default: break;
@@ -3472,7 +3486,7 @@ void closeRoadStrip();
 // (as New Object, without the chooser); "Show where it is placed" (also double-click / Enter) opens the Placements tab
 // filtered to that model in all regions. Selecting an object in 3D highlights its definition here.
 
-enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW, ID_IT_EXTRACT };
+enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW, ID_IT_EXTRACT, ID_IT_DFF, ID_IT_TXD, ID_IT_COL };
 
 struct ItemUi {
     HWND panel = nullptr, search = nullptr, show = nullptr, list = nullptr, count = nullptr, tips = nullptr;
@@ -3669,6 +3683,12 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             HWND add = make("BUTTON", "Add to map", BS_PUSHBUTTON, 0, ID_IT_ADD);
             HWND where = make("BUTTON", "Show placements", BS_PUSHBUTTON, 0, ID_IT_WHERE);
             HWND extract = make("BUTTON", "Extract...", BS_PUSHBUTTON, 0, ID_IT_EXTRACT);
+            HWND dffb = make("BUTTON", "DFF Properties", BS_PUSHBUTTON, 0, ID_IT_DFF);
+            HWND txdb = make("BUTTON", "View TXD", BS_PUSHBUTTON, 0, ID_IT_TXD);
+            HWND colb = make("BUTTON", "View Collision", BS_PUSHBUTTON, 0, ID_IT_COL);
+            itAddTip(dffb, "View Information about the 3D Model: the model on its own (right button turns, left button moves, wheel zooms) and its details");
+            itAddTip(txdb, "View Texture Dictionary: every texture of this item's .txd with its size and format");
+            itAddTip(colb, "View this model's collision file: its boxes, spheres and mesh, coloured by surface");
             itAddTip(it.search, "Type part of a name (tree), a texture dictionary (dyncones) or a model ID (1360). Enter: to the list. Esc: clear.");
             itAddTip(it.show, "All definitions, only those placed somewhere on the map, or only the ones not used yet");
             itAddTip(it.list, "Click a column header to sort. Placed: how many placements use it. Pool: the game pool its placements take "
@@ -3685,7 +3705,7 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(it.search, m, y, iw, 22, TRUE); y += 28;
             MoveWindow(GetDlgItem(w, ID_IT_LBL_SHOW), m, y + 4, 36, 16, TRUE);
             MoveWindow(it.show, m + 38, y, iw - 38, 200, TRUE); y += 30;
-            const int bottom = ch - m - 26 - 6 - 30;
+            const int bottom = ch - m - 26 - 6 - 30 - 30;
             MoveWindow(it.list, m, y, iw, std::max(60, bottom - y), TRUE);
             y = std::max(y + 60, bottom) + 4;
             MoveWindow(it.count, m, y, iw, 30, TRUE); y += 32;
@@ -3693,6 +3713,10 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(GetDlgItem(w, ID_IT_ADD), m, y, third, 26, TRUE);
             MoveWindow(GetDlgItem(w, ID_IT_WHERE), m + third + 4, y, third, 26, TRUE);
             MoveWindow(GetDlgItem(w, ID_IT_EXTRACT), m + 2 * (third + 4), y, third, 26, TRUE);
+            y += 30;
+            MoveWindow(GetDlgItem(w, ID_IT_DFF), m, y, third, 26, TRUE);
+            MoveWindow(GetDlgItem(w, ID_IT_TXD), m + third + 4, y, third, 26, TRUE);
+            MoveWindow(GetDlgItem(w, ID_IT_COL), m + 2 * (third + 4), y, third, 26, TRUE);
             return 0;
         }
         case WM_COMMAND: {
@@ -3700,7 +3724,16 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (id == ID_IT_SEARCH && code == EN_CHANGE) itRefill();
             else if (id == ID_IT_SHOW && code == CBN_SELCHANGE) itRefill();
             else if (id == ID_IT_ADD && code == BN_CLICKED) itAddToMap(GetParent(w));
-            else if (id == ID_IT_EXTRACT && code == BN_CLICKED) extractObjectsUi(GetParent(w), itSelectedId() >= 0 ? std::vector<int>{itSelectedId()} : std::vector<int>());
+            else if (id == ID_IT_DFF && code == BN_CLICKED) {
+                if (itSelectedId() >= 0) openDffViewer(GetParent(w), itSelectedId());
+                else inspWarn(GetParent(w), "Pick an item in the list first.", "DFF Properties");
+            } else if (id == ID_IT_TXD && code == BN_CLICKED) {
+                if (itSelectedId() >= 0) openTxdViewer(GetParent(w), app.defs[itSelectedId()].txd);
+                else inspWarn(GetParent(w), "Pick an item in the list first.", "TXD Properties");
+            } else if (id == ID_IT_COL && code == BN_CLICKED) {
+                if (itSelectedId() >= 0) openColViewer(GetParent(w), itSelectedId());
+                else inspWarn(GetParent(w), "Pick an item in the list first.", "Collision Object Properties");
+            } else if (id == ID_IT_EXTRACT && code == BN_CLICKED) extractObjectsUi(GetParent(w), itSelectedId() >= 0 ? std::vector<int>{itSelectedId()} : std::vector<int>());
             else if (id == ID_IT_WHERE && code == BN_CLICKED) {
                 if (itSelectedId() < 0) inspWarn(GetParent(w), "Click an item in the list first.", "Show where it is placed");
                 else itShowPlacements(itSelectedId());
@@ -4410,6 +4443,915 @@ void roadSync() {
     if (!roadStripOpen()) return;
     const bool targetOk = isRoadPiece(rb.target) && std::find(app.selected.begin(), app.selected.end(), rb.target) != app.selected.end() && app.selected.size() == 1;
     if (!targetOk) closeRoadStrip();
+}
+
+// ---- Model viewers: MEd's "DFF Properties" (CDFFView) around its 3D widget CGLView -----------------------------------
+// CGLView (constructor 0x004144e0, initializeGL 0x00414160, paintGL 0x00414900, slots via 0x004662a0): its own
+// window and GL context; view state rotation X -45, Z 0, Y 0 degrees and translation (0, 0, -52) (reset 0x004140b0);
+// projection gluPerspective(45, aspect, 1, 5000), then glTranslatef(x, y, z), glRotatef(X, 1,0,0), glRotatef(Z, 0,0,1),
+// glRotatef(Y, 0,1,0) and the light at (0, 0, 200, 0) set on the projection matrix; the model is drawn under an
+// identity modelview. Lighting is off for models (drawn with their material colours and textures). Right button drags
+// turn (1 degree per pixel: Z by x, X by y), left button drags move (0.25 per pixel), the wheel moves in by 1 (Shift: 10),
+// Zoom In / Zoom Out by 3 (0x004143c0 / 0x004143e0), "Automatically Rotate" adds Z 1, X 0.5, Y 0.4 every 40 ms (QTimer
+// 40, slot 0x004140e0; an angle past 360 restarts at 1), Wireframe draws GL_LINE. The dialog (0x00415610) has Show
+// Wireframe, Show 2DFX Lighting, Show Night Vertex Colours, "Show Object Number" and an information table.
+// MEd's "Collision Object Properties" (CColView, 0x00407d80) uses the same widget in its second mode (CGLView 0x00414460 /
+// 0x00414730): lighting on with the light at (0, -1, -0.5, 0), then (0x004054e0) the boxes as solid boxes, the spheres
+// as 5 x 5 GLU spheres and the mesh as lit triangles, each coloured by its surface material (0x004040b0), then the
+// selection axes, circle and red bounds box (0x00404ff0). Check boxes: Show Boxes, Show Spheres, Show Collision Mesh,
+// Show Shadow Mesh (COL3 only) and Wireframe; table: file format, boxes, spheres, mesh vertices and faces.
+// Deliberate differences: MEd's projection uses an aspect of 1 whatever the window's shape (models stretch); here the
+// true ratio. The view turns about the middle of the mesh (MEd: the model's origin, often a building's corner) and starts
+// at a distance fitted to the model's size (MEd: always 52, so a cone is a dot and a building does not fit).
+
+constexpr int kViewerPanelW = 270;
+
+struct GlViewState {  // CGLView's view fields (+0x24 .. +0x3c)
+    float rotX = -45, rotZ = 0, rotY = 0, tx = 0, ty = 0, tz = -52;
+};
+
+struct ModelViewer {
+    HWND wnd = nullptr, gl = nullptr, info = nullptr, objectBox = nullptr;
+    HDC dc = nullptr;
+    HGLRC rc = nullptr;
+    int id = -1;               // model id
+    std::string dff, txd;      // model and texture dictionary
+    DffModel model;            // as read from the archive (for the information table)
+    GlViewState view, home;    // current and Reset View
+    bool autoRotate = false, wireframe = false, night = false, fx = false;
+    int object = 0;            // Show Object Number: 0 = all, else 1-based
+    POINT last = {0, 0};
+    DWORD lastTick = 0;
+    bool closed = false;
+    float centre[3] = {0, 0, 0};  // the middle of the model's mesh: the view turns about it
+    int kind = 0;                 // 0 DFF Properties, 1 Collision Object Properties
+    ColModel col;                 // the collision model (kind 1), its record as stored in the COL file
+    std::string colSource;        // the COL file it came from
+    bool showBoxes = true, showSpheres = true, showMesh = true;
+};
+std::vector<std::unique_ptr<ModelViewer>> viewers;
+
+enum { ID_MV_ZOOMIN = 9001, ID_MV_ZOOMOUT, ID_MV_RESET, ID_MV_ROTATE, ID_MV_WIRE, ID_MV_2DFX, ID_MV_NIGHT, ID_MV_OBJECT, ID_MV_INFO, ID_MV_CLOSE,
+       ID_MV_LBL_OBJECT, ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH, ID_MV_SHADOW };
+
+ModelViewer* viewerOf(HWND w) {
+    for (auto& v : viewers)
+        if (v->wnd == w || v->gl == w) return v.get();
+    return nullptr;
+}
+
+// The information table of MEd's DFF Properties (its rows, in plain text).
+std::string dffInfoText(const ModelViewer& v) {
+    const DffModel& m = v.model;
+    size_t verts = 0, faces = 0, mats = 0, texMats = 0, splits = 0;
+    bool colours = false, uv = false, normals = false, strips = false, night = false, fx = false;
+    for (const DffGeometry& g : m.geometries) {
+        verts += g.vertexCount();
+        faces += g.triangles.size() / 3;
+        mats += g.materials.size();
+        for (const DffMaterial& mt : g.materials) texMats += mt.textured;
+        splits += g.splits.size();
+        colours = colours || !g.colors.empty();
+        uv = uv || !g.uvs.empty();
+        normals = normals || !g.normals.empty();
+        strips = strips || g.triangleStrips;
+        night = night || g.nightColors;
+        fx = fx || g.has2dfx;
+    }
+    auto yn = [](bool b) { return std::string(b ? "Yes" : "No"); };
+    char ver[32];
+    std::snprintf(ver, sizeof ver, "%X", m.version);
+    std::string t = "Model: " + v.dff + ".dff\r\nTextures: " + v.txd + ".txd\r\nRenderWare version: " + ver + "\r\n\r\n";
+    t += "Number of Objects: " + std::to_string(m.atomics.size()) + "\r\n";
+    t += "Number of Vertices: " + std::to_string(verts) + "\r\n";
+    t += "Number of Faces: " + std::to_string(faces) + "\r\n";
+    t += "Colours: " + yn(colours) + "\r\n";
+    t += "UV Mapping: " + yn(uv) + "\r\n";
+    t += "Normals: " + yn(normals) + "\r\n";
+    t += "Number of Materials: " + std::to_string(mats) + "\r\n";
+    t += "Number of Textured Materials: " + std::to_string(texMats) + "\r\n";
+    t += "Number of Triangle Splits: " + std::to_string(splits) + "\r\n";
+    t += std::string("Split Format: ") + (splits == 0 ? "none" : strips ? "Triangle Strips" : "Triangle Lists") + "\r\n";
+    t += "Night Vertex Colours: " + yn(night) + "\r\n";
+    t += "Contains 2DFX: " + yn(fx) + "\r\n";
+    if (!m.geometries.empty()) {
+        t += "\r\nTextures used:\r\n";
+        std::set<std::string> seen;
+        for (const DffGeometry& g : m.geometries)
+            for (const DffMaterial& mt : g.materials)
+                if (mt.textured && seen.insert(toLower(mt.texture)).second) t += "  " + mt.texture + "\r\n";
+    }
+    return t;
+}
+
+// MEd's colour for a surface material (0x004040b0): grey for most, green grass and hedges, blue water and glass, sandy
+// sand, brown wood.
+void colMaterialColour(int material, unsigned char rgb[3]) {
+    unsigned int c;
+    switch (material) {
+        case 0: c = 0x646464; break;
+        case 1: c = 0x969696; break;
+        case 2: case 0x22: c = 0x00ff00; break;
+        case 3: case 0x10: c = 0x408080; break;
+        case 4: c = 0x1b3636; break;
+        case 5: c = 0x403636; break;
+        case 6: case 8: case 10: case 11: case 12: case 13: case 14: case 15: c = 0x808080; break;
+        case 7: c = 0xff8080; break;
+        case 9: c = 0x000080; break;
+        case 0x12: case 0x21: c = 0x9dceff; break;
+        case 0x13: c = 0xff0000; break;
+        case 0x14: case 0x15: case 0x16: c = 0x0039b0; break;
+        case 0x17: case 0x18: case 0x1b: case 0x1c: case 0x1e: c = 0xc0c0c0; break;
+        case 0x19: c = 0x36d700; break;
+        case 0x1a: c = 0x337533; break;
+        case 0x20: c = 0x0000ff; break;
+        default: c = 0x646464; break;
+    }
+    rgb[0] = (unsigned char)(c & 0xff);  // red is the low byte (grass 0x00ff00 green, water 0xff0000 blue)
+    rgb[1] = (unsigned char)((c >> 8) & 0xff);
+    rgb[2] = (unsigned char)((c >> 16) & 0xff);
+}
+
+// The table of MEd's Collision Object Properties.
+std::string colInfoText(const ModelViewer& v) {
+    const ColModel& c = v.col;
+    std::string t = "Model: " + v.dff + "\r\nCollision file: " + v.colSource + "\r\n\r\n";
+    t += "File Format: COLL (version " + std::to_string(c.version) + ", GTA III / Vice City)\r\n";
+    t += "Number of Boxes: " + std::to_string(c.boxes.size()) + "\r\n";
+    t += "Number of Spheres: " + std::to_string(c.spheres.size()) + "\r\n";
+    t += "Collision Mesh Vertices: " + std::to_string(c.vertices.size() / 3) + "\r\n";
+    t += "Collision Mesh Face Count: " + std::to_string(c.faces.size()) + "\r\n";
+    t += "Shadow Mesh: only in COL3 (San Andreas)\r\n";
+    char b[160];
+    std::snprintf(b, sizeof b, "\r\nBounding sphere: radius %.2f at %.2f, %.2f, %.2f\r\nBounding box: %.2f, %.2f, %.2f to %.2f, %.2f, %.2f\r\n", c.boundRadius,
+                  c.boundCenter[0], c.boundCenter[1], c.boundCenter[2], c.boundMin[0], c.boundMin[1], c.boundMin[2], c.boundMax[0], c.boundMax[1], c.boundMax[2]);
+    t += b;
+    std::map<int, int> used;
+    for (const ColBox& x : c.boxes) ++used[x.surface.material];
+    for (const ColSphere& x : c.spheres) ++used[x.surface.material];
+    for (const ColFace& x : c.faces) ++used[x.material];
+    if (!used.empty()) {
+        t += "\r\nSurface materials (shapes):\r\n";
+        for (const auto& kv : used) t += "  " + std::to_string(kv.first) + ": " + std::to_string(kv.second) + "\r\n";
+    }
+    return t;
+}
+
+// A solid box (MEd draws them through 0x00404280 with the polygon mode filled).
+void drawSolidBox(const float* mn, const float* mx) {
+    const float x0 = mn[0], y0 = mn[1], z0 = mn[2], x1 = mx[0], y1 = mx[1], z1 = mx[2];
+    glBegin(GL_QUADS);
+    glNormal3f(0, 0, 1);  glVertex3f(x0, y0, z1); glVertex3f(x1, y0, z1); glVertex3f(x1, y1, z1); glVertex3f(x0, y1, z1);
+    glNormal3f(0, 0, -1); glVertex3f(x0, y0, z0); glVertex3f(x0, y1, z0); glVertex3f(x1, y1, z0); glVertex3f(x1, y0, z0);
+    glNormal3f(1, 0, 0);  glVertex3f(x1, y0, z0); glVertex3f(x1, y1, z0); glVertex3f(x1, y1, z1); glVertex3f(x1, y0, z1);
+    glNormal3f(-1, 0, 0); glVertex3f(x0, y0, z0); glVertex3f(x0, y0, z1); glVertex3f(x0, y1, z1); glVertex3f(x0, y1, z0);
+    glNormal3f(0, 1, 0);  glVertex3f(x0, y1, z0); glVertex3f(x0, y1, z1); glVertex3f(x1, y1, z1); glVertex3f(x1, y1, z0);
+    glNormal3f(0, -1, 0); glVertex3f(x0, y0, z0); glVertex3f(x1, y0, z0); glVertex3f(x1, y0, z1); glVertex3f(x0, y0, z1);
+    glEnd();
+}
+
+// The collision model as MEd draws it (0x004054e0, then the bounds 0x00404ff0).
+void drawColModel(ModelViewer& v) {
+    const ColModel& c = v.col;
+    glEnable(GL_LIGHTING);
+    glEnable(GL_LIGHT0);
+    const GLfloat ambient[4] = {0.4f, 0.4f, 0.4f, 1}, diffuse[4] = {0.7f, 0.7f, 0.7f, 1};
+    glLightfv(GL_LIGHT0, GL_AMBIENT, ambient);
+    glLightfv(GL_LIGHT0, GL_DIFFUSE, diffuse);
+    glLightfv(GL_LIGHT0, GL_SPECULAR, diffuse);
+    glEnable(GL_COLOR_MATERIAL);
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    glEnable(GL_NORMALIZE);
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D);
+    unsigned char rgb[3];
+    if (v.showBoxes)
+        for (const ColBox& x : c.boxes) {
+            colMaterialColour(x.surface.material, rgb);
+            glColor3ub(rgb[0], rgb[1], rgb[2]);
+            drawSolidBox(x.min, x.max);
+        }
+    if (v.showSpheres) {
+        static GLUquadric* q = nullptr;
+        if (!q) q = gluNewQuadric();
+        gluQuadricDrawStyle(q, GLU_FILL);
+        gluQuadricNormals(q, GLU_SMOOTH);
+        for (const ColSphere& x : c.spheres) {
+            colMaterialColour(x.surface.material, rgb);
+            glColor3ub(rgb[0], rgb[1], rgb[2]);
+            glPushMatrix();
+            glTranslatef(x.center[0], x.center[1], x.center[2]);
+            gluSphere(q, x.radius, 5, 5);  // MEd: 5 slices, 5 stacks
+            glPopMatrix();
+        }
+    }
+    if (v.showMesh) {
+        glBegin(GL_TRIANGLES);
+        const size_t nv = c.vertices.size() / 3;
+        for (const ColFace& f : c.faces) {
+            if (f.a >= nv || f.b >= nv || f.c >= nv) continue;
+            const float* a = &c.vertices[f.a * 3];
+            const float* b = &c.vertices[f.b * 3];
+            const float* d = &c.vertices[f.c * 3];
+            const float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], wx = d[0] - a[0], wy = d[1] - a[1], wz = d[2] - a[2];
+            colMaterialColour(f.material, rgb);
+            glColor3ub(rgb[0], rgb[1], rgb[2]);
+            glNormal3f(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+            glVertex3fv(a);
+            glVertex3fv(b);
+            glVertex3fv(d);
+        }
+        glEnd();
+    }
+    // the bounds: green Y, red X and blue Z axes (+-200, a tick every 10), the bounding circle, the red bounds box
+    glDisable(GL_LIGHTING);
+    glEnable(GL_BLEND);
+    glEnable(GL_LINE_SMOOTH);
+    glPushMatrix();
+    glTranslatef(c.boundCenter[0], c.boundCenter[1], c.boundCenter[2]);
+    glBegin(GL_LINES);
+    glColor3f(0, 1, 0);
+    glVertex3f(0, -200, 0); glVertex3f(0, 200, 0);
+    for (int k = -200; k < 200; k += 10) { glVertex3f(-2, float(k), 0); glVertex3f(2, float(k), 0); }
+    glColor3f(1, 0, 0);
+    glVertex3f(-200, 0, 0); glVertex3f(200, 0, 0);
+    for (int k = -200; k < 200; k += 10) { glVertex3f(float(k), -2, 0); glVertex3f(float(k), 2, 0); }
+    glColor3f(0, 0, 1);
+    glVertex3f(0, 0, -200); glVertex3f(0, 0, 200);
+    for (int k = -200; k < 200; k += 10) { glVertex3f(0, -2, float(k)); glVertex3f(0, 2, float(k)); }
+    glEnd();
+    glBegin(GL_LINES);
+    for (int a = 0; a < 360; ++a) glVertex3f(float(std::cos(a * 0.0174532925) * c.boundRadius), float(std::sin(a * 0.0174532925) * c.boundRadius), 0);
+    glEnd();
+    glPopMatrix();
+    glColor3f(1, 0, 0);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    drawSolidBox(c.boundMin, c.boundMax);
+    glPolygonMode(GL_FRONT_AND_BACK, v.wireframe ? GL_LINE : GL_FILL);
+}
+
+void drawViewer(ModelViewer& v) {
+    if (!v.gl || !v.rc) return;
+    RECT r;
+    GetClientRect(v.gl, &r);
+    const int w = std::max<int>(r.right, 1), h = std::max<int>(r.bottom, 1);
+    wglMakeCurrent(v.dc, v.rc);
+    // CGLView::initializeGL: black, depth, alpha test > 0, blending, textures, smooth lines, nicest hints
+    glViewport(0, 0, w, h);
+    glClearColor(0, 0, 0, 0);
+    glClearDepth(1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    glShadeModel(GL_SMOOTH);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_LINE_SMOOTH);
+    glHint(GL_PERSPECTIVE_CORRECTION_HINT, GL_NICEST);
+    glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+    glDisable(GL_CULL_FACE);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_LIGHTING);  // CGLView::setModel: models are drawn unlit
+    glPolygonMode(GL_FRONT_AND_BACK, v.wireframe ? GL_LINE : GL_FILL);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(45.0, double(w) / h, 1.0, 5000.0);  // MEd: aspect 1 (models stretched); the true ratio here
+    if (v.kind == 1) {  // 0x00414730: the collision light, set before the view's turn
+        const GLfloat colLight[4] = {0, -1, -0.5f, 0};
+        glLightfv(GL_LIGHT0, GL_POSITION, colLight);
+    }
+    glTranslatef(v.view.tx, v.view.ty, v.view.tz);
+    glRotatef(v.view.rotX, 1, 0, 0);
+    glRotatef(v.view.rotZ, 0, 0, 1);
+    glRotatef(v.view.rotY, 0, 1, 0);
+    if (v.kind == 0) {
+        const GLfloat lightPos[4] = {0, 0, 200, 0};
+        glLightfv(GL_LIGHT0, GL_POSITION, lightPos);
+    }
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glTranslatef(-v.centre[0], -v.centre[1], -v.centre[2]);  // MEd turns about the model's origin, often a corner of a building
+    auto d = app.defs.find(v.id);
+    if (v.kind == 1) drawColModel(v);
+    else if (d != app.defs.end()) {
+        GlModel& gm = getModel(d->second.model, d->second.txd);
+        if (v.object <= 0) drawModel(gm);
+        else if (v.object <= int(gm.geoms.size())) {
+            GlModel one;
+            one.geoms.push_back(gm.geoms[size_t(v.object - 1)]);
+            drawModel(one);
+        }
+    }
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    SwapBuffers(v.dc);
+    wglMakeCurrent(app.dc, app.rc);
+}
+
+// Once a frame from the main loop: auto-rotation (CGLView's 40 ms timer) and drawing of every open viewer.
+void updateViewers() {
+    for (size_t i = 0; i < viewers.size();) {
+        ModelViewer& v = *viewers[i];
+        if (v.closed) {
+            if (v.rc) { wglMakeCurrent(nullptr, nullptr); wglDeleteContext(v.rc); wglMakeCurrent(app.dc, app.rc); }
+            viewers.erase(viewers.begin() + std::ptrdiff_t(i));
+            continue;
+        }
+        const DWORD now = GetTickCount();
+        if (v.autoRotate)
+            while (now - v.lastTick >= 40) {  // 0x004140e0: Z +1, X +0.5, Y +0.4; past 360 restarts at 1
+                v.lastTick += 40;
+                v.view.rotZ += 1.0f;
+                v.view.rotX += 0.5f;
+                v.view.rotY += 0.4f;
+                if (v.view.rotZ > 360) v.view.rotZ = 1;
+                if (v.view.rotX > 360) v.view.rotX = 1;
+                if (v.view.rotY > 360) v.view.rotY = 1;
+            }
+        else v.lastTick = now;
+        if (IsWindowVisible(v.wnd) && !IsIconic(v.wnd)) drawViewer(v);
+        ++i;
+    }
+}
+
+LRESULT CALLBACK viewerGlProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    ModelViewer* v = viewerOf(w);
+    if (!v) return DefWindowProcA(w, msg, wp, lp);
+    switch (msg) {
+        case WM_LBUTTONDOWN:
+        case WM_RBUTTONDOWN:
+            SetFocus(w);
+            SetCapture(w);
+            v->last = {int(short(LOWORD(lp))), int(short(HIWORD(lp)))};
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP:
+            if (!(wp & (MK_LBUTTON | MK_RBUTTON))) ReleaseCapture();
+            return 0;
+        case WM_MOUSEMOVE: {  // 0x00414680: right button turns, left button moves
+            const int x = int(short(LOWORD(lp))), y = int(short(HIWORD(lp)));
+            const double dx = x - v->last.x, dy = y - v->last.y;
+            if (wp & MK_RBUTTON) {
+                v->view.rotZ += float(dx);
+                v->view.rotX += float(dy);
+            }
+            if (wp & MK_LBUTTON) {
+                v->view.tx += float(dx * 0.25);
+                v->view.ty -= float(dy * 0.25);
+            }
+            v->last = {x, y};
+            return 0;
+        }
+        case WM_MOUSEWHEEL: {  // 0x00414610: 1 per notch, 10 with Shift
+            const float step = (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) ? 10.0f : 1.0f;
+            v->view.tz += GET_WHEEL_DELTA_WPARAM(wp) > 0 ? step : -step;
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            BeginPaint(w, &ps);
+            EndPaint(w, &ps);
+            return 0;
+        }
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+void viewerLayout(ModelViewer& v) {
+    RECT r;
+    GetClientRect(v.wnd, &r);
+    const int cw = r.right, ch = r.bottom, m = 6, px = cw - kViewerPanelW + m, pw = kViewerPanelW - 2 * m;
+    MoveWindow(v.gl, 0, 0, std::max(cw - kViewerPanelW, 50), ch, TRUE);
+    int y = m;
+    const int third = (pw - 8) / 3;
+    MoveWindow(GetDlgItem(v.wnd, ID_MV_ZOOMIN), px, y, third, 24, TRUE);
+    MoveWindow(GetDlgItem(v.wnd, ID_MV_ZOOMOUT), px + third + 4, y, third, 24, TRUE);
+    MoveWindow(GetDlgItem(v.wnd, ID_MV_RESET), px + 2 * (third + 4), y, third, 24, TRUE);
+    y += 30;
+    for (int id : {ID_MV_ROTATE, ID_MV_WIRE, ID_MV_2DFX, ID_MV_NIGHT, ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH, ID_MV_SHADOW}) {
+        HWND c = GetDlgItem(v.wnd, id);
+        if (!c) continue;  // each kind of viewer has its own set
+        MoveWindow(c, px, y, pw, 20, TRUE);
+        y += 22;
+    }
+    if (v.objectBox) {
+        MoveWindow(GetDlgItem(v.wnd, ID_MV_LBL_OBJECT), px, y + 4, 120, 16, TRUE);
+        MoveWindow(v.objectBox, px + 122, y, pw - 122, 200, TRUE);
+        y += 30;
+    } else {
+        y += 6;
+    }
+    MoveWindow(v.info, px, y, pw, std::max(60, ch - y - 40), TRUE);
+    MoveWindow(GetDlgItem(v.wnd, ID_MV_CLOSE), px, ch - 32, pw, 26, TRUE);
+}
+
+LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    ModelViewer* v = viewerOf(w);
+    switch (msg) {
+        case WM_SIZE:
+            if (v) viewerLayout(*v);
+            return 0;
+        case WM_GETMINMAXINFO:
+            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {kViewerPanelW + 260, 420};
+            return 0;
+        case WM_COMMAND: {
+            if (!v) return 0;
+            const int id = LOWORD(wp), code = HIWORD(wp);
+            if (id == ID_MV_ZOOMIN) v->view.tz += 3;   // 0x004143c0
+            else if (id == ID_MV_ZOOMOUT) v->view.tz -= 3;  // 0x004143e0
+            else if (id == ID_MV_RESET) v->view = v->home;
+            else if (id == ID_MV_ROTATE) v->autoRotate = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_WIRE) v->wireframe = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_2DFX) v->fx = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_NIGHT) v->night = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_BOXES) v->showBoxes = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_SPHERES) v->showSpheres = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_MESH) v->showMesh = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
+            else if (id == ID_MV_OBJECT && code == CBN_SELCHANGE) v->object = int(SendMessageA(v->objectBox, CB_GETCURSEL, 0, 0));
+            else if (id == ID_MV_CLOSE) DestroyWindow(w);
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) DestroyWindow(w);
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(w);
+            return 0;
+        case WM_DESTROY:
+            if (v) v->closed = true;
+            return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// Open MEd's "DFF Properties" (kind 0) or "Collision Object Properties" (kind 1) for a model definition. Several can
+// be open at once; opening one that is already open brings it to the front.
+ModelViewer* openModelViewer(HWND owner, int id, int kind) {
+    auto d = app.defs.find(id);
+    if (d == app.defs.end()) return nullptr;
+    for (auto& v : viewers)
+        if (v->id == id && v->kind == kind && !v->closed) {
+            ShowWindow(v->wnd, SW_RESTORE);
+            SetForegroundWindow(v->wnd);
+            return v.get();
+        }
+    auto v = std::make_unique<ModelViewer>();
+    v->id = id;
+    v->kind = kind;
+    v->dff = d->second.name;
+    v->txd = d->second.txd;
+    std::vector<unsigned char> data;
+    std::string err;
+    if (kind == 1) {  // the model's own collision record, from the COL files of gta3.dat (the first that has it)
+        std::vector<unsigned char> record;
+        std::vector<ColModel> models;
+        if (!findCollisionRecord(app.colFiles, d->second.model, record, v->colSource) || !parseCol(record, models, err) || models.empty()) {
+            inspWarn(owner, "No collision model named " + d->second.name + " was found in the game's COL files.", "Collision Object Properties");
+            return nullptr;
+        }
+        v->col = models[0];
+        const std::string root = app.root + "/";
+        if (v->colSource.rfind(root, 0) == 0) v->colSource = v->colSource.substr(root.size());
+    } else if (!app.img.extract(d->second.model + ".dff", data, err) || !parseDff(data, v->model, err)) {
+        inspWarn(owner, "Could not read " + d->second.name + ".dff from " + app.img.path() + (err.empty() ? "." : ": " + err), "DFF Properties");
+        return nullptr;
+    }
+    getModel(d->second.model, d->second.txd);  // load it (and its textures) under the map's context, which the viewer shares
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = viewerProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdModelViewer";
+        RegisterClassA(&wc);
+        WNDCLASSA gc = {};
+        gc.style = CS_OWNDC;
+        gc.lpfnWndProc = viewerGlProc;
+        gc.hInstance = GetModuleHandle(nullptr);
+        gc.hCursor = LoadCursor(nullptr, IDC_SIZEALL);
+        gc.lpszClassName = "MEdModelViewerGL";
+        RegisterClassA(&gc);
+        registered = true;
+    }
+    RECT r;
+    GetWindowRect(owner, &r);
+    const int n = int(viewers.size());
+    const std::string title = kind == 1 ? "Collision Object Properties - " + d->second.name : "DFF Properties - " + d->second.name + ".dff";
+    v->wnd = CreateWindowExA(0, "MEdModelViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 120 + 30 * n, r.top + 100 + 30 * n, 900, 600, owner,
+                             nullptr, GetModuleHandle(nullptr), nullptr);
+    v->gl = CreateWindowExA(0, "MEdModelViewerGL", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, v->wnd, nullptr, GetModuleHandle(nullptr), nullptr);
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    auto make = [&](const char* cls, const char* text, DWORD style, DWORD ex, int cid) {
+        HWND h = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, v->wnd, (HMENU)(INT_PTR)cid, GetModuleHandle(nullptr), nullptr);
+        SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
+        return h;
+    };
+    make("BUTTON", "Zoom In", BS_PUSHBUTTON, 0, ID_MV_ZOOMIN);
+    make("BUTTON", "Zoom Out", BS_PUSHBUTTON, 0, ID_MV_ZOOMOUT);
+    make("BUTTON", "Reset View", BS_PUSHBUTTON, 0, ID_MV_RESET);
+    make("BUTTON", "Automatically Rotate", BS_AUTOCHECKBOX, 0, ID_MV_ROTATE);
+    make("BUTTON", kind == 1 ? "Wireframe" : "Show Wireframe", BS_AUTOCHECKBOX, 0, ID_MV_WIRE);
+    if (kind == 1) {
+        for (int cid : {ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH}) {
+            HWND c = make("BUTTON", cid == ID_MV_BOXES ? "Show Boxes" : cid == ID_MV_SPHERES ? "Show Spheres" : "Show Collision Mesh", BS_AUTOCHECKBOX, 0, cid);
+            SendMessageA(c, BM_SETCHECK, BST_CHECKED, 0);
+        }
+        HWND shadow = make("BUTTON", "Show Shadow Mesh (COL3 only)", BS_AUTOCHECKBOX, 0, ID_MV_SHADOW);
+        EnableWindow(shadow, FALSE);  // GTA III and Vice City collision has no shadow mesh
+        v->info = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_MV_INFO);
+        make("BUTTON", "Close", BS_PUSHBUTTON, 0, ID_MV_CLOSE);
+        SetWindowTextA(v->info, colInfoText(*v).c_str());
+    } else {
+        HWND fx = make("BUTTON", "Show 2DFX Lighting", BS_AUTOCHECKBOX, 0, ID_MV_2DFX);
+        HWND night = make("BUTTON", "Show Night Vertex Colours", BS_AUTOCHECKBOX, 0, ID_MV_NIGHT);
+        make("STATIC", "Show Object Number:", SS_LEFT, 0, ID_MV_LBL_OBJECT);
+        v->objectBox = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_MV_OBJECT);
+        v->info = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_MV_INFO);
+        make("BUTTON", "Close", BS_PUSHBUTTON, 0, ID_MV_CLOSE);
+        SendMessageA(v->objectBox, CB_ADDSTRING, 0, (LPARAM) "All objects");
+        for (size_t k = 0; k < v->model.atomics.size(); ++k) SendMessageA(v->objectBox, CB_ADDSTRING, 0, (LPARAM)std::to_string(k + 1).c_str());
+        SendMessageA(v->objectBox, CB_SETCURSEL, 0, 0);
+        bool hasNight = false, hasFx = false;
+        for (const DffGeometry& g : v->model.geometries) { hasNight = hasNight || g.nightColors; hasFx = hasFx || g.has2dfx; }
+        EnableWindow(fx, hasFx);        // the GTA III models have neither; the check boxes are for Vice City and San Andreas
+        EnableWindow(night, hasNight);
+        SetWindowTextA(v->info, dffInfoText(*v).c_str());
+    }
+    // the GL context of the 3D view, sharing textures with the map's
+    v->dc = GetDC(v->gl);
+    PIXELFORMATDESCRIPTOR pfd = {};
+    pfd.nSize = sizeof pfd;
+    pfd.nVersion = 1;
+    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+    pfd.iPixelType = PFD_TYPE_RGBA;
+    pfd.cColorBits = 24;
+    pfd.cDepthBits = 24;
+    const int fmt = ChoosePixelFormat(v->dc, &pfd);
+    if (fmt) SetPixelFormat(v->dc, fmt, &pfd);
+    v->rc = wglCreateContext(v->dc);
+    if (v->rc) wglShareLists(app.rc, v->rc);
+    wglMakeCurrent(app.dc, app.rc);
+    // turn about the middle of the mesh and start far enough away to see all of it (MEd: the origin and always 52)
+    if (kind == 1) {  // the collision bounds
+        double half = 1;
+        for (int k = 0; k < 3; ++k) {
+            v->centre[k] = (v->col.boundMin[k] + v->col.boundMax[k]) / 2;
+            half = std::max(half, double(v->col.boundMax[k] - v->col.boundMin[k]) / 2);
+        }
+        v->home.tz = -float(std::max(3.0, half * 3.4));
+    } else {
+        GlModel& gm = getModel(d->second.model, d->second.txd);
+        float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+        for (const GlGeometry& g : gm.geoms)
+            for (size_t i = 0; i + 2 < g.pos.size(); i += 3)
+                for (int k = 0; k < 3; ++k) {
+                    const float c = g.matrix[k] * g.pos[i] + g.matrix[4 + k] * g.pos[i + 1] + g.matrix[8 + k] * g.pos[i + 2] + g.matrix[12 + k];
+                    lo[k] = std::min(lo[k], c);
+                    hi[k] = std::max(hi[k], c);
+                }
+        double half = 1;
+        for (int k = 0; k < 3; ++k)
+            if (hi[k] >= lo[k]) {
+                v->centre[k] = (lo[k] + hi[k]) / 2;
+                half = std::max(half, double(hi[k] - lo[k]) / 2);
+            }
+        v->home.tz = -float(std::max(3.0, half * 3.4));  // the whole model fills the view, a cone as well as a building
+    }
+    v->view = v->home;
+    v->lastTick = GetTickCount();
+    ModelViewer* raw = v.get();
+    viewers.push_back(std::move(v));
+    viewerLayout(*raw);
+    ShowWindow(raw->wnd, SW_SHOW);
+    return raw;
+}
+
+ModelViewer* openDffViewer(HWND owner, int id) { return openModelViewer(owner, id, 0); }
+ModelViewer* openColViewer(HWND owner, int id) { return openModelViewer(owner, id, 1); }
+
+// ---- MEd's "TXD Properties" (CTexView, "TextureView", constructor 0x00465270): a texture dictionary's textures ------------
+// MEd: a list of the texture names (itemSelectionChanged shows the picked one), the picture, and a table with the
+// dictionary, Texture Name, Alpha Name, MipMaps and AlphaFlags; Close ("Close TXD Properties Window"). Here also the size,
+// the pixel format, the platform and which object definitions use the dictionary; the picture is drawn over a
+// checkerboard so transparent parts show ("Show alpha"), at its own size or fitted to the window.
+
+struct TxdViewer {
+    HWND wnd = nullptr, list = nullptr, preview = nullptr, info = nullptr;
+    std::string txd;           // dictionary name (without .txd)
+    std::string source;        // where it was read from
+    TxdFile file;
+    int sel = -1;              // the texture shown
+    bool fit = true, alpha = true;
+    std::vector<uint8_t> bgra; // the shown texture, ready for StretchDIBits
+    bool closed = false;
+};
+std::vector<std::unique_ptr<TxdViewer>> txdViewers;
+
+enum { ID_TV_LIST = 9101, ID_TV_PREVIEW, ID_TV_INFO, ID_TV_FIT, ID_TV_ALPHA, ID_TV_CLOSE };
+
+TxdViewer* txdViewerOf(HWND w) {
+    for (auto& v : txdViewers)
+        if (v->wnd == w || v->preview == w) return v.get();
+    return nullptr;
+}
+
+// RenderWare raster format in words: the pixel layout (bits 8..11) and palette / mipmap flags.
+std::string rasterFormatText(const TxdTexture& t) {
+    std::string s;
+    switch (t.rasterFormat & 0xF00) {
+        case 0x100: s = "1555 (16-bit, 1-bit alpha)"; break;
+        case 0x200: s = "565 (16-bit)"; break;
+        case 0x300: s = "4444 (16-bit, 4-bit alpha)"; break;
+        case 0x400: s = "LUM8 (8-bit grey)"; break;
+        case 0x500: s = "8888 (32-bit with alpha)"; break;
+        case 0x600: s = "888 (24-bit)"; break;
+        case 0xA00: s = "555 (16-bit)"; break;
+        default: s = "unknown"; break;
+    }
+    if (t.rasterFormat & 0x2000) s = "8-bit palette of " + s;
+    if (t.rasterFormat & 0x4000) s = "4-bit palette of " + s;
+    if (t.compressed) s += ", DXT compressed";
+    return s;
+}
+
+std::string txdInfoText(const TxdViewer& v) {
+    std::string t = "Texture Dictionary: " + v.txd + ".txd\r\nFrom: " + v.source + "\r\nTextures: " + std::to_string(v.file.textures.size()) + "\r\n";
+    std::vector<std::string> users;
+    for (const auto& kv : app.defs)
+        if (kv.second.txd == toLower(v.txd)) users.push_back(kv.second.name);
+    t += "Used by " + std::to_string(users.size()) + " object definition(s)";
+    for (size_t i = 0; i < users.size() && i < 8; ++i) t += (i ? ", " : ": ") + users[i];
+    if (users.size() > 8) t += ", ...";
+    t += "\r\n";
+    if (v.sel >= 0 && v.sel < int(v.file.textures.size())) {
+        const TxdTexture& x = v.file.textures[size_t(v.sel)];
+        t += "\r\nTexture Name: " + x.name + "\r\n";
+        t += "Alpha Name: " + (x.mask.empty() ? std::string("(none)") : x.mask) + "\r\n";
+        t += "Size: " + std::to_string(x.width) + " x " + std::to_string(x.height) + "\r\n";
+        t += "Format: " + rasterFormatText(x) + ", " + std::to_string(x.depth) + " bits stored\r\n";
+        t += "MipMaps: " + std::to_string(x.mipLevels) + "\r\n";
+        t += std::string("AlphaFlags: ") + (x.hasAlpha ? "has alpha" : "no alpha") + "\r\n";
+        t += std::string("Platform: ") + (x.platform == 8 ? "Direct3D 8 (GTA III / Vice City PC)" : x.platform == 9 ? "Direct3D 9 (San Andreas PC)" : std::to_string(x.platform)) + "\r\n";
+    }
+    return t;
+}
+
+void txdShow(TxdViewer& v, int index) {
+    v.sel = index;
+    v.bgra.clear();
+    if (index >= 0 && index < int(v.file.textures.size())) {
+        const TxdTexture& x = v.file.textures[size_t(index)];
+        v.bgra.resize(x.rgba.size());
+        for (size_t i = 0; i + 3 < x.rgba.size(); i += 4) {
+            v.bgra[i] = x.rgba[i + 2];
+            v.bgra[i + 1] = x.rgba[i + 1];
+            v.bgra[i + 2] = x.rgba[i];
+            v.bgra[i + 3] = x.rgba[i + 3];
+        }
+    }
+    SetWindowTextA(v.info, txdInfoText(v).c_str());
+    InvalidateRect(v.preview, nullptr, FALSE);
+}
+
+// The picture: over a grey checkerboard, alpha blended (Show alpha) or opaque, at its size or fitted (keeping its shape).
+void txdPaintPreview(TxdViewer& v, HDC dc, const RECT& r) {
+    HDC mem = CreateCompatibleDC(dc);
+    HBITMAP back = CreateCompatibleBitmap(dc, r.right, r.bottom);
+    HGDIOBJ old = SelectObject(mem, back);
+    HBRUSH light = CreateSolidBrush(RGB(204, 204, 204)), dark = CreateSolidBrush(RGB(153, 153, 153));
+    for (int y = 0; y < r.bottom; y += 12)
+        for (int x = 0; x < r.right; x += 12) {
+            RECT c = {x, y, x + 12, y + 12};
+            FillRect(mem, &c, ((x / 12 + y / 12) % 2) ? dark : light);
+        }
+    DeleteObject(light);
+    DeleteObject(dark);
+    if (v.sel >= 0 && v.sel < int(v.file.textures.size()) && !v.bgra.empty()) {
+        const TxdTexture& x = v.file.textures[size_t(v.sel)];
+        int w = x.width, h = x.height;
+        if (v.fit) {
+            const double s = std::min(double(r.right - 16) / w, double(r.bottom - 16) / h);
+            w = std::max(1, int(w * s));
+            h = std::max(1, int(h * s));
+        }
+        const int ox = std::max(0, int(r.right - w) / 2), oy = std::max(0, int(r.bottom - h) / 2);
+        // premultiplied copy for AlphaBlend (Show alpha), or the colours alone
+        std::vector<uint8_t> px = v.bgra;
+        for (size_t i = 0; i + 3 < px.size(); i += 4) {
+            if (v.alpha) {
+                const unsigned a = px[i + 3];
+                px[i] = uint8_t(px[i] * a / 255);
+                px[i + 1] = uint8_t(px[i + 1] * a / 255);
+                px[i + 2] = uint8_t(px[i + 2] * a / 255);
+            } else {
+                px[i + 3] = 255;
+            }
+        }
+        BITMAPINFO bi = {};
+        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+        bi.bmiHeader.biWidth = x.width;
+        bi.bmiHeader.biHeight = -int(x.height);  // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        HBITMAP tex = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (tex && bits) {
+            std::memcpy(bits, px.data(), px.size());
+            HDC tdc = CreateCompatibleDC(dc);
+            HGDIOBJ o = SelectObject(tdc, tex);
+            SetStretchBltMode(mem, COLORONCOLOR);  // nearest pixel: texels stay sharp when enlarged
+            BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            AlphaBlend(mem, ox, oy, w, h, tdc, 0, 0, x.width, x.height, bf);
+            SelectObject(tdc, o);
+            DeleteDC(tdc);
+        }
+        if (tex) DeleteObject(tex);
+    }
+    BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(back);
+    DeleteDC(mem);
+}
+
+LRESULT CALLBACK txdPreviewProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    TxdViewer* v = txdViewerOf(w);
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT && v) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        RECT r;
+        GetClientRect(w, &r);
+        txdPaintPreview(*v, dc, r);
+        EndPaint(w, &ps);
+        return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+void txdLayout(TxdViewer& v) {
+    RECT r;
+    GetClientRect(v.wnd, &r);
+    const int m = 6, listW = 220, infoH = 150;
+    MoveWindow(v.list, m, m, listW, r.bottom - 2 * m, TRUE);
+    const int x = m + listW + m, w = std::max(60, int(r.right) - x - m);
+    MoveWindow(v.preview, x, m, w, std::max(60, int(r.bottom) - 3 * m - infoH - 28), TRUE);
+    const int y = r.bottom - m - infoH - 28;
+    MoveWindow(GetDlgItem(v.wnd, ID_TV_FIT), x, y, 120, 22, TRUE);
+    MoveWindow(GetDlgItem(v.wnd, ID_TV_ALPHA), x + 126, y, 120, 22, TRUE);
+    MoveWindow(GetDlgItem(v.wnd, ID_TV_CLOSE), x + w - 90, y, 90, 24, TRUE);
+    MoveWindow(v.info, x, y + 28, w, infoH, TRUE);
+}
+
+LRESULT CALLBACK txdViewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    TxdViewer* v = txdViewerOf(w);
+    switch (msg) {
+        case WM_SIZE:
+            if (v) txdLayout(*v);
+            return 0;
+        case WM_GETMINMAXINFO:
+            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {560, 420};
+            return 0;
+        case WM_NOTIFY: {
+            const NMHDR* h = reinterpret_cast<const NMHDR*>(lp);
+            if (v && h->hwndFrom == v->list && h->code == LVN_ITEMCHANGED) {
+                const NMLISTVIEW* n = reinterpret_cast<const NMLISTVIEW*>(lp);
+                if ((n->uNewState & LVIS_SELECTED) && n->iItem != v->sel) txdShow(*v, n->iItem);
+            }
+            return 0;
+        }
+        case WM_COMMAND:
+            if (!v) return 0;
+            if (LOWORD(wp) == ID_TV_FIT) { v->fit = SendMessageA(GetDlgItem(w, ID_TV_FIT), BM_GETCHECK, 0, 0) == BST_CHECKED; InvalidateRect(v->preview, nullptr, FALSE); }
+            else if (LOWORD(wp) == ID_TV_ALPHA) { v->alpha = SendMessageA(GetDlgItem(w, ID_TV_ALPHA), BM_GETCHECK, 0, 0) == BST_CHECKED; InvalidateRect(v->preview, nullptr, FALSE); }
+            else if (LOWORD(wp) == ID_TV_CLOSE) DestroyWindow(w);
+            return 0;
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) DestroyWindow(w);
+            return 0;
+        case WM_CLOSE:
+            DestroyWindow(w);
+            return 0;
+        case WM_DESTROY:
+            if (v) v->closed = true;
+            return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// Read a texture dictionary the way the game finds it: an entry of gta3.img, or models/generic.txd for "generic".
+bool readTxd(const std::string& name, TxdFile& out, std::string& source, std::string& err) {
+    std::vector<unsigned char> data;
+    if (app.img.extract(name + ".txd", data, err)) {
+        source = app.img.path();
+        std::replace(source.begin(), source.end(), '\\', '/');
+        std::string root = app.root + "/";
+        std::replace(root.begin(), root.end(), '\\', '/');
+        if (toLower(source).rfind(toLower(root), 0) == 0) source = source.substr(root.size());  // models/gta3.img
+    }
+    else if (toLower(name) == "generic") {
+        bool ok;
+        const std::string path = app.root + "/models/generic.txd";
+        const std::string bytes = slurp(path, ok);
+        if (!ok) return false;
+        data.assign(bytes.begin(), bytes.end());
+        source = "models/generic.txd";
+    } else {
+        return false;
+    }
+    return parseTxd(data, out, err);
+}
+
+TxdViewer* openTxdViewer(HWND owner, const std::string& txdName) {
+    for (auto& v : txdViewers)
+        if (toLower(v->txd) == toLower(txdName) && !v->closed) {
+            ShowWindow(v->wnd, SW_RESTORE);
+            SetForegroundWindow(v->wnd);
+            return v.get();
+        }
+    auto v = std::make_unique<TxdViewer>();
+    v->txd = txdName;
+    std::string err;
+    if (!readTxd(txdName, v->file, v->source, err)) {
+        inspWarn(owner, "Could not read " + txdName + ".txd" + (err.empty() ? " (it is not in gta3.img)." : ": " + err), "TXD Properties");
+        return nullptr;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = txdViewerProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdTxdViewer";
+        RegisterClassA(&wc);
+        WNDCLASSA pc = {};
+        pc.lpfnWndProc = txdPreviewProc;
+        pc.hInstance = GetModuleHandle(nullptr);
+        pc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        pc.lpszClassName = "MEdTxdPreview";
+        RegisterClassA(&pc);
+        registered = true;
+    }
+    RECT r;
+    GetWindowRect(owner, &r);
+    const int n = int(txdViewers.size());
+    const std::string title = "TXD Properties - " + txdName + ".txd";
+    v->wnd = CreateWindowExA(0, "MEdTxdViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 140 + 30 * n, r.top + 110 + 30 * n, 860, 620, owner,
+                             nullptr, GetModuleHandle(nullptr), nullptr);
+    HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    auto make = [&](const char* cls, const char* text, DWORD style, DWORD ex, int cid) {
+        HWND h = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, v->wnd, (HMENU)(INT_PTR)cid, GetModuleHandle(nullptr), nullptr);
+        SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
+        return h;
+    };
+    v->list = make(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS, WS_EX_CLIENTEDGE, ID_TV_LIST);
+    ListView_SetExtendedListViewStyle(v->list, LVS_EX_FULLROWSELECT);
+    const char* cols[2] = {"Texture Name", "Size"};
+    for (int i = 0; i < 2; ++i) {
+        LVCOLUMNA c = {};
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = const_cast<char*>(cols[i]);
+        c.cx = i == 0 ? 130 : 66;
+        ListView_InsertColumn(v->list, i, &c);
+    }
+    for (size_t i = 0; i < v->file.textures.size(); ++i) {
+        const TxdTexture& x = v->file.textures[i];
+        LVITEMA it = {};
+        it.mask = LVIF_TEXT;
+        it.iItem = int(i);
+        it.pszText = const_cast<char*>(x.name.c_str());
+        ListView_InsertItem(v->list, &it);
+        const std::string size = std::to_string(x.width) + "x" + std::to_string(x.height);
+        ListView_SetItemText(v->list, int(i), 1, const_cast<char*>(size.c_str()));
+    }
+    v->preview = CreateWindowExA(WS_EX_CLIENTEDGE, "MEdTxdPreview", "", WS_CHILD | WS_VISIBLE, 0, 0, 10, 10, v->wnd, (HMENU)ID_TV_PREVIEW, GetModuleHandle(nullptr), nullptr);
+    HWND fit = make("BUTTON", "Fit to window", BS_AUTOCHECKBOX, 0, ID_TV_FIT);
+    HWND alpha = make("BUTTON", "Show alpha", BS_AUTOCHECKBOX, 0, ID_TV_ALPHA);
+    SendMessageA(fit, BM_SETCHECK, BST_CHECKED, 0);
+    SendMessageA(alpha, BM_SETCHECK, BST_CHECKED, 0);
+    make("BUTTON", "Close", BS_PUSHBUTTON, 0, ID_TV_CLOSE);
+    v->info = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_TV_INFO);
+    TxdViewer* raw = v.get();
+    txdViewers.push_back(std::move(v));
+    txdLayout(*raw);
+    if (!raw->file.textures.empty()) {
+        ListView_SetItemState(raw->list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);  // shows the first
+    } else {
+        txdShow(*raw, -1);
+    }
+    ShowWindow(raw->wnd, SW_SHOW);
+    return raw;
+}
+
+// Once a frame: drop closed texture viewers.
+void updateTxdViewers() {
+    txdViewers.erase(std::remove_if(txdViewers.begin(), txdViewers.end(), [](const std::unique_ptr<TxdViewer>& v) { return v->closed; }), txdViewers.end());
 }
 
 // The tabs at the top of the left column: Scene (which regions are shown), Placements and Item.
@@ -5933,6 +6875,223 @@ void runRoadSelfTest(SelfTest& t) {
     stInvariants(t, "road test done");
 }
 
+// DFF Properties: the information table against an independent count, every control (buttons, check boxes, mouse,
+// wheel, auto-rotate and its wrap), reopening, closing, and the map left alone.
+void runDffViewerSelfTest(SelfTest& t) {
+    insp.quiet = true;
+    const std::string before = stMapState();
+    ST_CHECK(t, openDffViewer(app.hwnd, -12345) == nullptr && viewers.empty(), "an unknown model opens nothing");
+    int n = 0, opened = 0;
+    for (const auto& kv : app.defs) {
+        if (n++ % 50 != 0) continue;
+        ModelViewer* v = openDffViewer(app.hwnd, kv.first);
+        std::vector<unsigned char> data;
+        std::string err;
+        DffModel m;
+        const bool readable = app.img.extract(kv.second.model + ".dff", data, err) && parseDff(data, m, err);
+        if (!readable) {
+            ST_CHECK(t, v == nullptr, kv.second.name + ": an unreadable model opens no viewer");
+            continue;
+        }
+        ++opened;
+        ST_CHECK(t, v && IsWindow(v->wnd) && v->rc, kv.second.name + ": DFF Properties opens with its own GL context");
+        if (!v) continue;
+        size_t verts = 0, faces = 0;
+        for (const DffGeometry& g : m.geometries) { verts += g.vertexCount(); faces += g.triangles.size() / 3; }
+        char text[8192];
+        GetWindowTextA(v->info, text, sizeof text);
+        const std::string info = text;
+        ST_CHECK(t, info.find("Number of Vertices: " + std::to_string(verts) + "\r\n") != std::string::npos &&
+                        info.find("Number of Faces: " + std::to_string(faces) + "\r\n") != std::string::npos &&
+                        info.find("Number of Objects: " + std::to_string(m.atomics.size()) + "\r\n") != std::string::npos,
+                 kv.second.name + ": the table counts vertices, faces and objects");
+        ST_CHECK(t, SendMessageA(v->objectBox, CB_GETCOUNT, 0, 0) == LRESULT(m.atomics.size() + 1), kv.second.name + ": one Show Object Number entry per object, plus All");
+        ST_CHECK(t, openDffViewer(app.hwnd, kv.first) == v && viewers.size() == 1, kv.second.name + ": opening it again brings the same window to the front");
+        // buttons
+        const GlViewState home = v->view;
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_ZOOMIN, 0);
+        ST_CHECK(t, v->view.tz == home.tz + 3, "Zoom In moves 3 closer");
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_ZOOMOUT, 0);
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_ZOOMOUT, 0);
+        ST_CHECK(t, v->view.tz == home.tz - 3, "Zoom Out moves 3 away");
+        // mouse: right button turns, left button moves, the wheel zooms
+        SendMessageA(v->gl, WM_RBUTTONDOWN, MK_RBUTTON, MAKELPARAM(100, 100));
+        SendMessageA(v->gl, WM_MOUSEMOVE, MK_RBUTTON, MAKELPARAM(110, 105));
+        SendMessageA(v->gl, WM_RBUTTONUP, 0, MAKELPARAM(110, 105));
+        ST_CHECK(t, v->view.rotZ == home.rotZ + 10 && v->view.rotX == home.rotX + 5, "right drag turns a degree per pixel");
+        SendMessageA(v->gl, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(50, 50));
+        SendMessageA(v->gl, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(58, 46));
+        SendMessageA(v->gl, WM_LBUTTONUP, 0, MAKELPARAM(58, 46));
+        ST_CHECK(t, v->view.tx == home.tx + 2 && v->view.ty == home.ty + 1, "left drag moves 0.25 per pixel");
+        const float z0 = v->view.tz;
+        SendMessageA(v->gl, WM_MOUSEWHEEL, MAKEWPARAM(0, 120), 0);
+        SendMessageA(v->gl, WM_MOUSEWHEEL, MAKEWPARAM(MK_SHIFT, WORD(-120)), 0);
+        ST_CHECK(t, v->view.tz == z0 + 1 - 10, "the wheel moves 1, with Shift 10");
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_RESET, 0);
+        ST_CHECK(t, std::memcmp(&v->view, &home, sizeof home) == 0, "Reset View goes back to the start view");
+        // check boxes
+        SendMessageA(GetDlgItem(v->wnd, ID_MV_WIRE), BM_CLICK, 0, 0);
+        ST_CHECK(t, v->wireframe, "Show Wireframe on");
+        SendMessageA(GetDlgItem(v->wnd, ID_MV_WIRE), BM_CLICK, 0, 0);
+        ST_CHECK(t, !v->wireframe, "and off");
+        SendMessageA(GetDlgItem(v->wnd, ID_MV_ROTATE), BM_CLICK, 0, 0);
+        ST_CHECK(t, v->autoRotate, "Automatically Rotate on");
+        v->lastTick = GetTickCount() - 400;  // ten 40 ms ticks (one more if the clock moves on before the update)
+        updateViewers();
+        const float turnedZ = v->view.rotZ - home.rotZ;
+        const bool tenOrEleven = std::fabs(turnedZ - 10) < 1e-3 || std::fabs(turnedZ - 11) < 1e-3;
+        const float ticks = std::round(turnedZ);
+        ST_CHECK(t, tenOrEleven && std::fabs(v->view.rotX - (home.rotX + 0.5f * ticks)) < 1e-3 && std::fabs(v->view.rotY - (home.rotY + 0.4f * ticks)) < 1e-3,
+                 "each 40 ms tick turns Z 1, X 0.5, Y 0.4 degrees");
+        v->view.rotZ = 359.5f;
+        v->lastTick = GetTickCount() - 40;
+        updateViewers();
+        ST_CHECK(t, v->view.rotZ == 1 || v->view.rotZ == 2, "an angle past 360 starts again at 1 (MEd)");
+        SendMessageA(GetDlgItem(v->wnd, ID_MV_ROTATE), BM_CLICK, 0, 0);
+        ST_CHECK(t, !v->autoRotate, "Automatically Rotate off");
+        // objects and the GTA III check boxes
+        SendMessageA(v->objectBox, CB_SETCURSEL, 1, 0);
+        SendMessageA(v->wnd, WM_COMMAND, MAKEWPARAM(ID_MV_OBJECT, CBN_SELCHANGE), LPARAM(v->objectBox));
+        ST_CHECK(t, v->object == 1, "Show Object Number picks one object");
+        bool night = false, fx = false;
+        for (const DffGeometry& g : m.geometries) { night = night || g.nightColors; fx = fx || g.has2dfx; }
+        ST_CHECK(t, (IsWindowEnabled(GetDlgItem(v->wnd, ID_MV_NIGHT)) != 0) == night && (IsWindowEnabled(GetDlgItem(v->wnd, ID_MV_2DFX)) != 0) == fx,
+                 "the night colour and 2DFX boxes are only enabled when the model has them");
+        drawViewer(*v);  // draws without trouble
+        render();
+        // close
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_CLOSE, 0);
+        updateViewers();
+        ST_CHECK(t, viewers.empty(), "Close removes the viewer");
+    }
+    ST_CHECK(t, opened > 40, "DFF Properties opened for " + std::to_string(opened) + " models");
+    // several at once, then Esc on each
+    std::vector<int> ids;
+    for (const auto& kv : app.defs) if (ids.size() < 4) ids.push_back(kv.first);
+    for (int id : ids) openDffViewer(app.hwnd, id);
+    ST_CHECK(t, viewers.size() <= ids.size() && !viewers.empty(), "several viewers can be open");
+    updateViewers();
+    std::vector<HWND> wnds;
+    for (auto& v : viewers) wnds.push_back(v->wnd);
+    for (HWND w : wnds) SendMessageA(w, WM_KEYDOWN, VK_ESCAPE, 0);
+    updateViewers();
+    ST_CHECK(t, viewers.empty(), "Esc closes each");
+    ST_CHECK(t, stMapState() == before, "viewing models changes nothing in the map");
+}
+
+// Collision Object Properties and TXD Properties: their tables against independent reads, their controls, and the map
+// left alone.
+void runColTxdViewerSelfTest(SelfTest& t) {
+    insp.quiet = true;
+    const std::string before = stMapState();
+    // collision: every 40th definition
+    int n = 0, opened = 0, missing = 0;
+    for (const auto& kv : app.defs) {
+        if (n++ % 40 != 0) continue;
+        std::vector<unsigned char> record;
+        std::string source, err;
+        std::vector<ColModel> models;
+        const bool has = findCollisionRecord(app.colFiles, kv.second.model, record, source) && parseCol(record, models, err) && !models.empty();
+        ModelViewer* v = openColViewer(app.hwnd, kv.first);
+        if (!has) {
+            ++missing;
+            ST_CHECK(t, v == nullptr, kv.second.name + ": no collision, no viewer (a message instead)");
+            continue;
+        }
+        ++opened;
+        ST_CHECK(t, v && v->kind == 1 && IsWindow(v->wnd), kv.second.name + ": Collision Object Properties opens");
+        if (!v) continue;
+        const ColModel& c = models[0];
+        char text[8192];
+        GetWindowTextA(v->info, text, sizeof text);
+        const std::string info = text;
+        ST_CHECK(t, info.find("Number of Boxes: " + std::to_string(c.boxes.size()) + "\r\n") != std::string::npos &&
+                        info.find("Number of Spheres: " + std::to_string(c.spheres.size()) + "\r\n") != std::string::npos &&
+                        info.find("Collision Mesh Face Count: " + std::to_string(c.faces.size()) + "\r\n") != std::string::npos &&
+                        info.find("Collision Mesh Vertices: " + std::to_string(c.vertices.size() / 3) + "\r\n") != std::string::npos,
+                 kv.second.name + ": the table counts boxes, spheres and the mesh");
+        ST_CHECK(t, openColViewer(app.hwnd, kv.first) == v, kv.second.name + ": opening it again brings the same window to the front");
+        ModelViewer* d = openDffViewer(app.hwnd, kv.first);
+        ST_CHECK(t, d && d != v && d->kind == 0, kv.second.name + ": its DFF Properties is a separate window");
+        for (int id : {ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH}) {
+            SendMessageA(GetDlgItem(v->wnd, id), BM_CLICK, 0, 0);
+            const bool off = id == ID_MV_BOXES ? !v->showBoxes : id == ID_MV_SPHERES ? !v->showSpheres : !v->showMesh;
+            ST_CHECK(t, off, "a Show check box switches its shapes off");
+            drawViewer(*v);
+            SendMessageA(GetDlgItem(v->wnd, id), BM_CLICK, 0, 0);
+        }
+        ST_CHECK(t, v->showBoxes && v->showSpheres && v->showMesh && !IsWindowEnabled(GetDlgItem(v->wnd, ID_MV_SHADOW)), "all on again; the shadow mesh box is for COL3 only");
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_ZOOMIN, 0);
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_RESET, 0);
+        ST_CHECK(t, std::memcmp(&v->view, &v->home, sizeof v->home) == 0, "Reset View");
+        drawViewer(*v);
+        SendMessageA(v->wnd, WM_COMMAND, ID_MV_CLOSE, 0);
+        if (d) SendMessageA(d->wnd, WM_COMMAND, ID_MV_CLOSE, 0);
+        updateViewers();
+        ST_CHECK(t, viewers.empty(), "both closed");
+    }
+    ST_CHECK(t, opened > 40, "Collision Object Properties opened for " + std::to_string(opened) + " models (" + std::to_string(missing) + " without collision)");
+    // every material colour is MEd's: a few fixed points of its table
+    unsigned char rgb[3];
+    colMaterialColour(2, rgb);
+    ST_CHECK(t, rgb[0] == 0 && rgb[1] == 255 && rgb[2] == 0, "grass is green");
+    colMaterialColour(0x13, rgb);
+    ST_CHECK(t, rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 255, "water is blue");
+    colMaterialColour(0x12, rgb);
+    ST_CHECK(t, rgb[0] == 255 && rgb[1] == 0xce && rgb[2] == 0x9d, "sand is sandy");
+    colMaterialColour(200, rgb);
+    ST_CHECK(t, rgb[0] == 100 && rgb[1] == 100 && rgb[2] == 100, "an unknown material is grey");
+
+    // textures: every 15th dictionary in use, every texture shown once
+    std::vector<std::string> txds;
+    {
+        std::set<std::string> seen;
+        for (const auto& kv : app.defs) seen.insert(kv.second.txd);
+        int k = 0;
+        for (const std::string& x : seen) if (k++ % 15 == 0) txds.push_back(x);
+        txds.push_back("generic");
+    }
+    int shownDicts = 0;
+    for (const std::string& name : txds) {
+        TxdFile f;
+        std::string src, err;
+        const bool readable = readTxd(name, f, src, err);
+        TxdViewer* v = openTxdViewer(app.hwnd, name);
+        if (!readable) {
+            ST_CHECK(t, v == nullptr, name + ": an unreadable dictionary opens no viewer");
+            continue;
+        }
+        ++shownDicts;
+        ST_CHECK(t, v && IsWindow(v->wnd), name + ".txd: TXD Properties opens");
+        if (!v) continue;
+        ST_CHECK(t, ListView_GetItemCount(v->list) == int(f.textures.size()), name + ".txd: one row per texture");
+        ST_CHECK(t, f.textures.empty() || v->sel == 0, name + ".txd: the first texture is shown");
+        ST_CHECK(t, openTxdViewer(app.hwnd, name) == v, name + ".txd: opening it again brings the same window to the front");
+        for (int i = 0; i < int(f.textures.size()); ++i) {
+            ListView_SetItemState(v->list, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            const TxdTexture& x = f.textures[size_t(i)];
+            char text[4096];
+            GetWindowTextA(v->info, text, sizeof text);
+            const std::string info = text;
+            ST_CHECK(t, v->sel == i && info.find("Texture Name: " + x.name + "\r\n") != std::string::npos &&
+                            info.find("Size: " + std::to_string(x.width) + " x " + std::to_string(x.height) + "\r\n") != std::string::npos &&
+                            v->bgra.size() == size_t(x.width) * x.height * 4,
+                     name + ".txd: picking " + x.name + " shows it and its details");
+            UpdateWindow(v->preview);
+        }
+        SendMessageA(GetDlgItem(v->wnd, ID_TV_FIT), BM_CLICK, 0, 0);
+        SendMessageA(GetDlgItem(v->wnd, ID_TV_ALPHA), BM_CLICK, 0, 0);
+        ST_CHECK(t, !v->fit && !v->alpha, "Fit to window and Show alpha switch off");
+        UpdateWindow(v->preview);
+        SendMessageA(v->wnd, WM_KEYDOWN, VK_ESCAPE, 0);
+        updateTxdViewers();
+        ST_CHECK(t, txdViewers.empty(), name + ".txd: Esc closes it");
+    }
+    ST_CHECK(t, shownDicts > 20, "TXD Properties opened for " + std::to_string(shownDicts) + " dictionaries");
+    ST_CHECK(t, openTxdViewer(app.hwnd, "no_such_dictionary") == nullptr && txdViewers.empty(), "an unknown dictionary opens nothing");
+    ST_CHECK(t, stMapState() == before, "viewing collision and textures changes nothing in the map");
+}
+
 void runBookmarksSelfTest(SelfTest& t) {
     const std::string realFile = app.bookmarkFile;
     const std::vector<Bookmark> realList = app.bookmarks;
@@ -6298,6 +7457,10 @@ int runPlacementsSelfTest() {
     runReplaceSelfTest(t);
     // the road builder (nodes, strip, preview, attach)
     runRoadSelfTest(t);
+    // DFF Properties (MEd's model viewer)
+    runDffViewerSelfTest(t);
+    // Collision Object Properties and TXD Properties
+    runColTxdViewerSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -6646,7 +7809,7 @@ int main(int argc, char** argv) {
     bool deleteAfter = false, duplicateAfter = false, sinkAfter = false, centreAfter = false, checkAfter = false;
     std::string onlyRegions;
     int benchmark = 0;
-    std::string selectModel, pickTestModel;
+    std::string selectModel, pickTestModel, openDffAtStart, openColAtStart, openTxdAtStart;
     bool addedOnly = false;
     double moveBy[3] = {0, 0, 0};
     // MEd's bookmarks live in MEdv032/ of this project; look next to the game folder first, then up from the program
@@ -6674,6 +7837,9 @@ int main(int argc, char** argv) {
         else if (a == "--delete") deleteAfter = true;
         else if (a == "--select-model" && i + 1 < argc) selectModel = argv[++i];
         else if (a == "--added-only") addedOnly = true;
+        else if (a == "--open-dff" && i + 1 < argc) openDffAtStart = argv[++i];
+        else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
+        else if (a == "--open-txd" && i + 1 < argc) openTxdAtStart = argv[++i];
         else if (a == "--pick-test" && i + 1 < argc) pickTestModel = argv[++i];
         else if (a == "--only" && i + 1 < argc) onlyRegions = argv[++i];
         else if (a == "--lod-near") app.lodNear = float(num(1)), ++i;
@@ -7016,6 +8182,13 @@ int main(int argc, char** argv) {
         }
         if (best >= 0) app.selected.assign(1, best);
     }
+    if (!openTxdAtStart.empty()) openTxdViewer(app.hwnd, openTxdAtStart);  // tests: open TXD Properties for this dictionary
+    if (!openColAtStart.empty())  // tests: open Collision Object Properties for this model
+        for (const auto& kv : app.defs)
+            if (kv.second.model == toLower(openColAtStart)) { openColViewer(app.hwnd, kv.first); break; }
+    if (!openDffAtStart.empty())  // tests: open DFF Properties for this model
+        for (const auto& kv : app.defs)
+            if (kv.second.model == toLower(openDffAtStart)) { openDffViewer(app.hwnd, kv.first); break; }
     MSG msg;
     app.lastTick = GetTickCount();
     bool running = true;
@@ -7036,6 +8209,8 @@ int main(int argc, char** argv) {
         renderRoadThumbnails();
         render();
         SwapBuffers(app.dc);
+        updateViewers();  // the open DFF Properties windows
+        updateTxdViewers();
         // the project (the opened game folder's name, for example ProjectUpstate) leads the title
         static const std::string folderLabel = [] {
             std::string r = app.root;

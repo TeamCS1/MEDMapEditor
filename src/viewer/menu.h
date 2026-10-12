@@ -23,6 +23,9 @@ enum MenuCommand {
     kCmdCentre = 1,
     kCmdProperties,
     kCmdExtract,
+    kCmdDffView,
+    kCmdColView,
+    kCmdTxdView,
     kCmdDuplicate,
     kCmdReplace,
     kCmdCopy,
@@ -54,6 +57,9 @@ inline std::vector<MenuItem> objectMenu(bool multiple) {
     }
     m.push_back({"Centre on Object", kCmdCentre, true, false});
     m.push_back({"Properties", kCmdProperties, false, false});
+    m.push_back({"DFF Properties...", kCmdDffView, true, false});
+    m.push_back({"View TXD...", kCmdTxdView, true, false});
+    m.push_back({"Collision Properties...", kCmdColView, true, false});
     m.push_back({"Extract Object...", kCmdExtract, true, false});
     m.push_back({"Duplicate Object", kCmdDuplicate, true, false});
     m.push_back({"Replace Object...", kCmdReplace, true, false});

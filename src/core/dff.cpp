@@ -190,6 +190,8 @@ bool parseGeometry(RwReader& r, const ChunkHeader& geo, DffGeometry& g, std::str
             while (r.pos() < c.dataEnd) {
                 if (!r.chunk(e, c.dataEnd)) return failWith(error, "truncated geometry extension");
                 if (e.type == rw::BinMesh && !parseBinMesh(r, e, g)) return failWith(error, "bad BinMesh plugin");
+                if (e.type == 0x253F2F9) g.nightColors = true;  // Rockstar's extra vertex colour plugin (Vice City, San Andreas)
+                if (e.type == 0x253F2F8) g.has2dfx = true;      // Rockstar's 2DFX plugin (lights, particles; San Andreas)
                 r.seek(e.dataEnd);
             }
             r.seek(c.dataEnd);

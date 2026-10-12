@@ -83,7 +83,7 @@ add_test(NAME renderware COMMAND test_renderware)
 # 3D map viewer (Win32 + fixed-function OpenGL, no extra dependencies).
 if(WIN32)
     add_executable(med_viewer src/viewer/main.cpp)
-    target_link_libraries(med_viewer PRIVATE med_core opengl32 glu32 gdi32 user32 comctl32 shell32 ole32)
+    target_link_libraries(med_viewer PRIVATE med_core opengl32 glu32 gdi32 user32 comctl32 shell32 ole32 msimg32)
 endif()
 
 # Read-only tools for checking the library against a real game install.
