@@ -54,7 +54,8 @@ bool findCollisionRecord(const std::vector<std::string>& colFiles, const std::st
         parseCol(data, models, err);  // models read before a damaged part still count
         for (const ColModel& m : models) {
             if (toLower(m.name) != want) continue;
-            if (++found == 1) {
+            ++found;  // the last one wins, as in the game (CFileLoader_LoadCollisionFile 0x00478b20 loads over an earlier one)
+            {
                 record.assign(data.begin() + std::ptrdiff_t(m.fileOffset), data.begin() + std::ptrdiff_t(m.fileOffset + m.fileSize));
                 source = path;
             }
@@ -101,7 +102,7 @@ ExtractResult extractObject(const ImgArchive& img, const std::string& folder, co
         if (findCollisionRecord(req.colFiles, req.model, record, r.colSource, &matches)) {
             save(dir / (req.model + ".col"), record, "the collision");
             if (matches > 1)
-                r.warnings.push_back(std::to_string(matches) + " COL files have a collision model named " + req.model + "; the first one (" + r.colSource + ") was copied.");
+                r.warnings.push_back(std::to_string(matches) + " COL files have a collision model named " + req.model + "; the last one (" + r.colSource + "), which the game uses, was copied.");
         } else {
             r.warnings.push_back("No collision model named " + req.model + " was found in the COL files.");
         }

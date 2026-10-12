@@ -63,6 +63,7 @@
 #include "original.h"
 #include "roadkit.h"
 #include "importer.h"
+#include "coledit.h"
 #include "bookmarks.h"
 #include "region.h"
 #include "rotation.h"
@@ -302,7 +303,7 @@ bool loadGameData() {
         std::vector<ColModel> models;
         std::string cerr;
         if (!parseCol(std::vector<unsigned char>(bytes.begin(), bytes.end()), models, cerr)) continue;
-        for (ColModel& m : models) app.cols.emplace(toLower(m.name), std::move(m));
+        for (ColModel& m : models) app.cols[toLower(m.name)] = std::move(m);  // a later file wins, as in the game (0x00478b20)
     }
     std::printf("loaded %zu collision models\n", app.cols.size());
     std::printf("loaded %zu object definitions, %zu placements, %zu archive entries\n", app.defs.size(),
@@ -4507,11 +4508,40 @@ struct ModelViewer {
     ColModel col;                 // the collision model (kind 1), its record as stored in the COL file
     std::string colSource;        // the COL file it came from
     bool showBoxes = true, showSpheres = true, showMesh = true;
+    // the Edit tab (collision only; ceXxx below)
+    HWND tabs = nullptr;                // View | Edit
+    bool editTab = false;
+    std::vector<HWND> viewCtrls;        // the View tab's own controls
+    std::map<int, HWND> ce;             // the Edit tab's controls by id
+    std::vector<HWND> ceLabels;         // its labels
+    ColModel loaded;                    // as opened or last saved (unsaved = different from this)
+    std::vector<ColModel> undo, redo;
+    bool dirty = false;
+    std::set<int> selBoxes, selSpheres;
+    std::set<size_t> selFaces;
+    int selBoxFace = -1;                // the side of the one selected box that push / pull moves
+    int newMaterial = 0;                // the material Add Box / Add Sphere give
+    bool showRef = true;                // the model's outline
+    bool dragging = false, dragMoved = false;
+    int dragMode = 0;                   // 1 click or pan, 2 push / pull, 3 selection rectangle
+    POINT down = {0, 0}, cur = {0, 0};
+    ColModel dragStart;
+    double dragP[3] = {0, 0, 0}, dragN[3] = {0, 0, 1};
+    float dragD = 0;
+    double proj[16] = {}, mv[16] = {};  // the 3D view's matrices as last drawn (for picking)
+    GLint vp[4] = {0, 0, 1, 1};
+    int rev = 0, openEdgesRev = -1;
+    std::vector<std::array<uint32_t, 2>> openEdgesCache;
+    std::string shownShapeKey, shownInfo, lastMessage;
 };
 std::vector<std::unique_ptr<ModelViewer>> viewers;
 
 enum { ID_MV_ZOOMIN = 9001, ID_MV_ZOOMOUT, ID_MV_RESET, ID_MV_ROTATE, ID_MV_WIRE, ID_MV_2DFX, ID_MV_NIGHT, ID_MV_OBJECT, ID_MV_INFO, ID_MV_CLOSE,
        ID_MV_LBL_OBJECT, ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH, ID_MV_SHADOW };
+enum { ID_CE_TABS = 9301, ID_CE_ADDBOX, ID_CE_ADDSPHERE, ID_CE_SELSIDE, ID_CE_SELALL, ID_CE_SELNONE, ID_CE_DELETE, ID_CE_DIST, ID_CE_OUT, ID_CE_IN,
+       ID_CE_MX, ID_CE_MY, ID_CE_MZ, ID_CE_MOVE, ID_CE_MAT, ID_CE_F0, ID_CE_F1, ID_CE_F2, ID_CE_F3, ID_CE_F4, ID_CE_F5, ID_CE_APPLY,
+       ID_CE_SHOWREF, ID_CE_UNDO, ID_CE_REDO, ID_CE_STATUS, ID_CE_REGION, ID_CE_NEWREGION, ID_CE_SAVE, ID_CE_LBL };
+constexpr int kColMaterialCount = 35;  // MEd's colour table (0x004040b0) knows materials 0 to 34
 
 ModelViewer* viewerOf(HWND w) {
     for (auto& v : viewers)
@@ -4631,6 +4661,8 @@ void drawSolidBox(const float* mn, const float* mx) {
     glEnd();
 }
 
+void drawColEditOverlay(ModelViewer& v);
+
 // The collision model as MEd draws it (0x004054e0, then the bounds 0x00404ff0).
 void drawColModel(ModelViewer& v) {
     const ColModel& c = v.col;
@@ -4709,6 +4741,1038 @@ void drawColModel(ModelViewer& v) {
     glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
     drawSolidBox(c.boundMin, c.boundMax);
     glPolygonMode(GL_FRONT_AND_BACK, v.wireframe ? GL_LINE : GL_FILL);
+    if (v.editTab) drawColEditOverlay(v);
+}
+
+// ---- the collision editor: the Edit tab of Collision Object Properties (core: coledit.h; not in MEd, whose COL
+// support was view-only) ------------------------------------------------------------------------------------------------
+// Click a shape to select it (Shift adds or removes), double-click a mesh face for its whole flat side, Ctrl+drag a
+// rectangle; drag a selected face, box side or sphere to push or pull it; Del deletes, Ctrl+Z / Ctrl+Y undo and redo.
+// Buttons do the same with typed numbers. Save writes the record into the user's own COL file (a loose file: back
+// into it), never into Rockstar's: an edited copy of a Rockstar model goes into <region>.col (level 0) or
+// <region>_lvl<N>.col of the user's region, listed in gta3.dat after Rockstar's file of the same level (coledit.h).
+
+bool ceQuiet = false;  // self-test: no message boxes; closing with unsaved edits discards them
+
+const char* kCeLabels[5] = {"Push / pull the selection by:", "Move the selection by X, Y, Z:", "Surface material:", "", "Save into region:"};
+
+void ceWarn(ModelViewer& v, const std::string& text) {
+    v.lastMessage = text;
+    if (!ceQuiet) MessageBoxA(v.wnd, text.c_str(), "Collision editor", MB_ICONWARNING);
+}
+
+bool ceHasSelection(const ModelViewer& v) { return !v.selBoxes.empty() || !v.selSpheres.empty() || !v.selFaces.empty(); }
+
+void ceClearSelection(ModelViewer& v) {
+    v.selBoxes.clear();
+    v.selSpheres.clear();
+    v.selFaces.clear();
+    v.selBoxFace = -1;
+}
+
+void ceFixSelection(ModelViewer& v) {  // drop what no longer exists
+    for (auto it = v.selBoxes.begin(); it != v.selBoxes.end();) it = *it >= int(v.col.boxes.size()) ? v.selBoxes.erase(it) : std::next(it);
+    for (auto it = v.selSpheres.begin(); it != v.selSpheres.end();) it = *it >= int(v.col.spheres.size()) ? v.selSpheres.erase(it) : std::next(it);
+    for (auto it = v.selFaces.begin(); it != v.selFaces.end();) it = *it >= v.col.faces.size() ? v.selFaces.erase(it) : std::next(it);
+    if (v.selBoxes.size() != 1) v.selBoxFace = -1;
+}
+
+void cePushUndo(ModelViewer& v) {
+    v.undo.push_back(v.col);
+    if (v.undo.size() > 50) v.undo.erase(v.undo.begin());
+    v.redo.clear();
+}
+
+std::string ceLowerSlashes(std::string s) {
+    for (char& c : s) {
+        if (c == char(92)) c = '/';
+        c = char(std::tolower((unsigned char)c));
+    }
+    return s;
+}
+
+std::vector<std::string> userRegionNames();
+
+// The user's region whose own COL file `rel` is (<region>.col or <region>_lvl<N>.col), else "".
+std::string ceOwnRegionOf(const std::string& rel) {
+    const std::string want = ceLowerSlashes(rel);
+    for (const std::string& r : userRegionNames())
+        for (int level = 0; level <= 9; ++level)
+            if (ceLowerSlashes(colSaveTarget(r, level).relPath) == want) return r;
+    return "";
+}
+
+// Where Save writes.
+struct CeTarget {
+    bool ok = false, loose = false, own = false;
+    std::string rel, abs, datLine, region, why;
+    int level = 0;
+};
+
+CeTarget ceTarget(const ModelViewer& v) {
+    CeTarget t;
+    if (!v.file.empty()) {  // a loose .col from disk: back into it
+        t.ok = t.loose = true;
+        t.rel = t.abs = v.file;
+        return t;
+    }
+    const std::string own = ceOwnRegionOf(v.colSource);
+    if (!own.empty()) {  // already the user's own file (an imported model, or a copy saved before)
+        t.ok = t.own = true;
+        t.region = own;
+        t.rel = v.colSource;
+        std::replace(t.rel.begin(), t.rel.end(), char(92), '/');
+        t.abs = app.root + "/" + t.rel;
+        return t;
+    }
+    bool ok = false;
+    const std::string dat = slurp(app.root + "/data/gta3.dat", ok);
+    const int level = ok ? colFileLevel(dat, v.colSource) : -1;
+    if (level < 0) {
+        t.why = v.colSource + " is not listed in data/gta3.dat, so the editor cannot tell which level a copy needs.";
+        return t;
+    }
+    const int sel = v.ce.count(ID_CE_REGION) ? int(SendMessageA(v.ce.at(ID_CE_REGION), CB_GETCURSEL, 0, 0)) : -1;
+    if (sel < 0) {
+        t.why = "Rockstar's files are never changed: the edited copy goes into a COL file of a region of your own. Make one with New region... first.";
+        return t;
+    }
+    char b[256] = "";
+    SendMessageA(v.ce.at(ID_CE_REGION), CB_GETLBTEXT, WPARAM(sel), (LPARAM)b);
+    const ColSaveTarget s = colSaveTarget(b, level);
+    t.ok = true;
+    t.region = b;
+    t.level = level;
+    t.rel = s.relPath;
+    t.abs = app.root + "/" + s.relPath;
+    t.datLine = s.datLine;
+    return t;
+}
+
+std::string ceSelectionText(const ModelViewer& v) {
+    std::vector<std::string> parts;
+    auto plural = [](size_t n, const char* one, const char* many) { return std::to_string(n) + " " + (n == 1 ? one : many); };
+    if (!v.selFaces.empty()) parts.push_back(plural(v.selFaces.size(), "mesh face", "mesh faces"));
+    if (!v.selBoxes.empty()) {
+        static const char* sides[6] = {"-X", "+X", "-Y", "+Y", "-Z", "+Z"};
+        std::string s = plural(v.selBoxes.size(), "box", "boxes");
+        if (v.selBoxes.size() == 1) s += " (no. " + std::to_string(*v.selBoxes.begin() + 1) + (v.selBoxFace >= 0 ? std::string(", side ") + sides[v.selBoxFace] : std::string()) + ")";
+        parts.push_back(s);
+    }
+    if (!v.selSpheres.empty()) parts.push_back(plural(v.selSpheres.size(), "sphere", "spheres"));
+    if (parts.empty()) return "nothing (click a shape)";
+    std::string t;
+    for (size_t i = 0; i < parts.size(); ++i) t += (i ? ", " : "") + parts[i];
+    return t;
+}
+
+const std::vector<std::array<uint32_t, 2>>& ceOpenEdges(ModelViewer& v) {
+    if (v.openEdgesRev != v.rev) {
+        v.openEdgesCache = openEdges(v.col);
+        v.openEdgesRev = v.rev;
+    }
+    return v.openEdgesCache;
+}
+
+void ceSetText(HWND h, const std::string& s) {
+    char b[512] = "";
+    GetWindowTextA(h, b, sizeof b);
+    if (s != b) SetWindowTextA(h, s.c_str());
+}
+
+// Everything the Edit tab shows: status, material, the selected box or sphere, which buttons work, the title.
+void ceRefresh(ModelViewer& v) {
+    if (v.kind != 1 || v.ce.empty()) return;
+    ceFixSelection(v);
+    const bool sel = ceHasSelection(v);
+    const bool oneBox = v.selBoxes.size() == 1 && v.selSpheres.empty() && v.selFaces.empty();
+    const bool oneSphere = v.selSpheres.size() == 1 && v.selBoxes.empty() && v.selFaces.empty();
+    const bool canPush = !v.selFaces.empty() || (oneBox && v.selBoxFace >= 0) || oneSphere;
+    EnableWindow(v.ce[ID_CE_DELETE], sel);
+    EnableWindow(v.ce[ID_CE_SELNONE], sel);
+    EnableWindow(v.ce[ID_CE_SELSIDE], !v.selFaces.empty());
+    EnableWindow(v.ce[ID_CE_SELALL], !v.col.faces.empty());
+    EnableWindow(v.ce[ID_CE_OUT], canPush);
+    EnableWindow(v.ce[ID_CE_IN], canPush);
+    EnableWindow(v.ce[ID_CE_MOVE], sel);
+    EnableWindow(v.ce[ID_CE_UNDO], !v.undo.empty());
+    EnableWindow(v.ce[ID_CE_REDO], !v.redo.empty());
+    EnableWindow(v.ce[ID_CE_APPLY], oneBox || oneSphere);
+    // the material of the selection (blank when mixed), else the one new shapes get
+    std::set<int> mats;
+    for (int i : v.selBoxes) mats.insert(v.col.boxes[size_t(i)].surface.material);
+    for (int i : v.selSpheres) mats.insert(v.col.spheres[size_t(i)].surface.material);
+    for (size_t i : v.selFaces) mats.insert(v.col.faces[i].material);
+    const int mat = sel ? (mats.size() == 1 ? *mats.begin() : -1) : v.newMaterial;
+    if (int(SendMessageA(v.ce[ID_CE_MAT], CB_GETCURSEL, 0, 0)) != mat) SendMessageA(v.ce[ID_CE_MAT], CB_SETCURSEL, WPARAM(mat), 0);
+    // the selected box or sphere in numbers
+    const std::string shapeLabel = oneBox ? "Selected box: Min X, Y, Z / Max X, Y, Z" : oneSphere ? "Selected sphere: Centre X, Y, Z / Radius" : "Select one box or sphere to type its size:";
+    ceSetText(v.ceLabels[3], shapeLabel);
+    float f[6] = {0, 0, 0, 0, 0, 0};
+    int nf = 0;
+    if (oneBox) {
+        const ColBox& b = v.col.boxes[size_t(*v.selBoxes.begin())];
+        for (int k = 0; k < 3; ++k) { f[k] = b.min[k]; f[3 + k] = b.max[k]; }
+        nf = 6;
+    } else if (oneSphere) {
+        const ColSphere& s = v.col.spheres[size_t(*v.selSpheres.begin())];
+        for (int k = 0; k < 3; ++k) f[k] = s.center[k];
+        f[3] = s.radius;
+        nf = 4;
+    }
+    const std::string shapeKey = std::to_string(nf) + ":" + std::to_string(v.rev) + ":" + ceSelectionText(v);
+    if (shapeKey != v.shownShapeKey) {  // only when the shape or the selection changed, so typing is not overwritten
+        v.shownShapeKey = shapeKey;
+        for (int k = 0; k < 6; ++k) {
+            HWND h = v.ce[ID_CE_F0 + k];
+            EnableWindow(h, k < nf);
+            SetWindowTextA(h, k < nf ? num(f[k], 3).c_str() : "");
+        }
+    }
+    // status
+    const CeTarget t = ceTarget(v);
+    std::string s = "Selected: " + ceSelectionText(v) + "\r\n";
+    auto count = [](size_t n, const char* one, const char* many) { return std::to_string(n) + " " + (n == 1 ? one : many); };
+    s += "Shapes: " + count(v.col.boxes.size(), "box", "boxes") + ", " + count(v.col.spheres.size(), "sphere", "spheres") + ", " +
+         count(v.col.faces.size(), "mesh face", "mesh faces") + "\r\n";
+    const size_t open = ceOpenEdges(v).size();
+    s += open ? "Open edges (red): " + std::to_string(open) + " - the mesh has holes or borders there\r\n" : std::string(v.col.faces.empty() ? "" : "No open edges: the mesh is closed\r\n");
+    if (v.col.boxes.empty() && v.col.spheres.empty() && v.col.faces.empty()) s += "Nothing is solid yet: Add Box gives a box around the model.\r\n";
+    if (v.dragging) s += "Push / pull: " + num(v.dragD, 2) + "\r\n";
+    s += v.dirty ? "Unsaved changes.\r\n" : "No unsaved changes.\r\n";
+    if (t.ok) {
+        if (t.loose) s += "Save writes back into " + t.rel + " (a backup is kept once).";
+        else if (t.own) s += "Save writes into your own " + t.rel + ".";
+        else
+            s += "Save writes a copy into " + t.rel + " (" + t.datLine.substr(0, 9) + ", loaded after Rockstar's file, so the game uses it on that island). Rockstar's " +
+                 v.colSource + " is not changed. Every placement of " + v.col.name + " gets the new collision.";
+    } else {
+        s += t.why;
+    }
+    ceSetText(v.ce[ID_CE_STATUS], s);
+    EnableWindow(v.ce[ID_CE_SAVE], t.ok && v.dirty);
+    const bool fixedRegion = !v.file.empty() || !ceOwnRegionOf(v.colSource).empty();
+    EnableWindow(v.ce[ID_CE_REGION], !fixedRegion);
+    EnableWindow(v.ce[ID_CE_NEWREGION], !fixedRegion);
+    // the window title says when something is unsaved; the View tab's table follows the edits
+    char title[512] = "";
+    GetWindowTextA(v.wnd, title, sizeof title);
+    std::string tt = title;
+    if (tt.size() > 2 && tt.substr(tt.size() - 2) == " *") tt.resize(tt.size() - 2);
+    if (v.dirty) tt += " *";
+    ceSetText(v.wnd, tt);
+    const std::string info = colInfoText(v);
+    if (info != v.shownInfo) {
+        v.shownInfo = info;
+        SetWindowTextA(v.info, info.c_str());
+    }
+}
+
+// After any change to v.col: bounds, dirty (compared with what was loaded or last saved), redraw caches.
+// `bounds`: an edit sets the bounds from the shapes; undo and redo give back a record exactly as it was (Rockstar's
+// own bounds are not the tight box, so recomputing them would change an untouched record).
+void ceChanged(ModelViewer& v, bool bounds = true) {
+    if (bounds) computeColBounds(v.col);
+    ++v.rev;
+    v.dirty = writeColl(v.col) != writeColl(v.loaded);
+    ceRefresh(v);
+}
+
+void ceUndo(ModelViewer& v) {
+    if (v.undo.empty()) return;
+    v.redo.push_back(v.col);
+    v.col = v.undo.back();
+    v.undo.pop_back();
+    ceClearSelection(v);
+    ceChanged(v, false);
+}
+
+void ceRedo(ModelViewer& v) {
+    if (v.redo.empty()) return;
+    v.undo.push_back(v.col);
+    v.col = v.redo.back();
+    v.redo.pop_back();
+    ceClearSelection(v);
+    ceChanged(v, false);
+}
+
+// Push or pull the selection by d on v.col (no undo step; callers take it).
+bool ceApplyPushPull(ModelViewer& v, float d, std::string& why) {
+    if (!v.selFaces.empty()) return pushPullFaces(v.col, v.selFaces, d, why);
+    const bool oneBox = v.selBoxes.size() == 1 && v.selSpheres.empty();
+    const bool oneSphere = v.selSpheres.size() == 1 && v.selBoxes.empty();
+    if (oneBox && v.selBoxFace >= 0) {
+        if (pushPullBoxFace(v.col.boxes[size_t(*v.selBoxes.begin())], v.selBoxFace, d)) return true;
+        why = "The box would get thinner than " + num(kMinBoxSize, 2) + ".";
+        return false;
+    }
+    if (oneSphere) {
+        ColSphere& s = v.col.spheres[size_t(*v.selSpheres.begin())];
+        if (!(s.radius + d >= kMinSphereRadius - 1e-6f)) {
+            why = "The sphere would get smaller than radius " + num(kMinSphereRadius, 2) + ".";
+            return false;
+        }
+        s.radius += d;
+        return true;
+    }
+    why = oneBox ? "Click the side of the box you want to move first." : "Select mesh faces, one side of a box or one sphere to push or pull.";
+    return false;
+}
+
+bool cePushPull(ModelViewer& v, float d) {
+    std::string why;
+    const ColModel before = v.col;
+    if (!ceApplyPushPull(v, d, why)) {
+        v.col = before;
+        ceWarn(v, why);
+        return false;
+    }
+    ColModel after = v.col;
+    v.col = before;
+    cePushUndo(v);
+    v.col = std::move(after);
+    ceChanged(v);
+    return true;
+}
+
+bool ceMove(ModelViewer& v, float dx, float dy, float dz) {
+    if (!ceHasSelection(v)) return false;
+    if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz)) return false;
+    if (dx == 0 && dy == 0 && dz == 0) return false;
+    cePushUndo(v);
+    const float d[3] = {dx, dy, dz};
+    for (int i : v.selBoxes)
+        for (int k = 0; k < 3; ++k) { v.col.boxes[size_t(i)].min[k] += d[k]; v.col.boxes[size_t(i)].max[k] += d[k]; }
+    for (int i : v.selSpheres)
+        for (int k = 0; k < 3; ++k) v.col.spheres[size_t(i)].center[k] += d[k];
+    std::set<uint32_t> verts;
+    for (size_t i : v.selFaces) for (uint32_t x : {v.col.faces[i].a, v.col.faces[i].b, v.col.faces[i].c}) verts.insert(x);
+    for (uint32_t x : verts)
+        for (int k = 0; k < 3; ++k) v.col.vertices[size_t(x) * 3 + size_t(k)] += d[k];
+    ceChanged(v);
+    return true;
+}
+
+bool ceDelete(ModelViewer& v) {
+    if (!ceHasSelection(v)) return false;
+    cePushUndo(v);
+    for (auto it = v.selBoxes.rbegin(); it != v.selBoxes.rend(); ++it) v.col.boxes.erase(v.col.boxes.begin() + *it);
+    for (auto it = v.selSpheres.rbegin(); it != v.selSpheres.rend(); ++it) v.col.spheres.erase(v.col.spheres.begin() + *it);
+    deleteFaces(v.col, v.selFaces);
+    ceClearSelection(v);
+    ceChanged(v);
+    return true;
+}
+
+void ceSetMaterial(ModelViewer& v, int mat) {
+    if (mat < 0 || mat > 255) return;
+    if (!ceHasSelection(v)) {  // nothing selected: the material new boxes and spheres get
+        v.newMaterial = mat;
+        ceRefresh(v);
+        return;
+    }
+    bool change = false;
+    for (int i : v.selBoxes) change = change || v.col.boxes[size_t(i)].surface.material != mat;
+    for (int i : v.selSpheres) change = change || v.col.spheres[size_t(i)].surface.material != mat;
+    for (size_t i : v.selFaces) change = change || v.col.faces[i].material != mat;
+    if (!change) return;
+    cePushUndo(v);
+    for (int i : v.selBoxes) v.col.boxes[size_t(i)].surface.material = uint8_t(mat);
+    for (int i : v.selSpheres) v.col.spheres[size_t(i)].surface.material = uint8_t(mat);
+    for (size_t i : v.selFaces) v.col.faces[i].material = uint8_t(mat);
+    ceChanged(v);
+}
+
+void ceAddBox(ModelViewer& v) {
+    cePushUndo(v);
+    ColBox b = newBoxFor(v.col);
+    b.surface.material = uint8_t(v.newMaterial);
+    v.col.boxes.push_back(b);
+    ceClearSelection(v);
+    v.selBoxes.insert(int(v.col.boxes.size()) - 1);
+    v.selBoxFace = 5;  // the top: push / pull makes it taller or lower
+    ceChanged(v);
+}
+
+void ceAddSphere(ModelViewer& v) {
+    cePushUndo(v);
+    ColSphere s = newSphereFor(v.col);
+    s.surface.material = uint8_t(v.newMaterial);
+    v.col.spheres.push_back(s);
+    ceClearSelection(v);
+    v.selSpheres.insert(int(v.col.spheres.size()) - 1);
+    ceChanged(v);
+}
+
+// The typed numbers of the one selected box (min, max) or sphere (centre, radius).
+bool ceApplyFields(ModelViewer& v) {
+    const bool oneBox = v.selBoxes.size() == 1 && v.selSpheres.empty() && v.selFaces.empty();
+    const bool oneSphere = v.selSpheres.size() == 1 && v.selBoxes.empty() && v.selFaces.empty();
+    if (!oneBox && !oneSphere) return false;
+    float f[6];
+    const int n = oneBox ? 6 : 4;
+    for (int k = 0; k < n; ++k) {
+        char b[64] = "";
+        GetWindowTextA(v.ce[ID_CE_F0 + k], b, sizeof b);
+        char* end = nullptr;
+        const double x = std::strtod(b, &end);
+        if (!b[0] || !end || *end || !std::isfinite(x) || std::fabs(x) > 1e5) {
+            ceWarn(v, std::string("'") + b + "' is not a number the editor can use.");
+            v.shownShapeKey.clear();
+            ceRefresh(v);
+            return false;
+        }
+        f[k] = float(x);
+    }
+    if (oneBox)
+        for (int k = 0; k < 3; ++k)
+            if (f[3 + k] - f[k] < kMinBoxSize - 1e-6f) {
+                ceWarn(v, "Each Max must be at least " + num(kMinBoxSize, 2) + " more than its Min.");
+                return false;
+            }
+    if (oneSphere && f[3] < kMinSphereRadius - 1e-6f) {
+        ceWarn(v, "The radius must be at least " + num(kMinSphereRadius, 2) + ".");
+        return false;
+    }
+    ColModel after = v.col;
+    if (oneBox) {
+        ColBox& b = after.boxes[size_t(*v.selBoxes.begin())];
+        for (int k = 0; k < 3; ++k) { b.min[k] = f[k]; b.max[k] = f[3 + k]; }
+    } else {
+        ColSphere& s = after.spheres[size_t(*v.selSpheres.begin())];
+        for (int k = 0; k < 3; ++k) s.center[k] = f[k];
+        s.radius = f[3];
+    }
+    if (writeColl(after) == writeColl(v.col)) return false;  // nothing changed
+    cePushUndo(v);
+    v.col = after;
+    ceChanged(v);
+    return true;
+}
+
+// Save: the record into its target file (backup once), gta3.dat lists the file (backup once).
+bool ceSave(ModelViewer& v) {
+    namespace fs = std::filesystem;
+    const CeTarget t = ceTarget(v);
+    if (!t.ok) {
+        ceWarn(v, t.why);
+        return false;
+    }
+    std::error_code ec;
+    bool existed = fs::exists(t.abs, ec), ok = false;
+    std::vector<unsigned char> bytes;
+    if (existed) {
+        const std::string s = slurp(t.abs, ok);
+        if (!ok) {
+            ceWarn(v, "Could not read " + t.rel + ".");
+            return false;
+        }
+        bytes.assign(s.begin(), s.end());
+    }
+    std::string err;
+    if (!putColRecord(bytes, v.col, err)) {
+        ceWarn(v, "Could not update " + t.rel + ": " + err);
+        return false;
+    }
+    if (existed && !fs::exists(t.abs + ".med-backup", ec)) fs::copy_file(t.abs, t.abs + ".med-backup", ec);
+    fs::create_directories(fs::path(t.abs).parent_path(), ec);
+    {
+        std::ofstream out(t.abs, std::ios::binary | std::ios::trunc);
+        out.write((const char*)bytes.data(), std::streamsize(bytes.size()));
+        if (!out) {
+            ceWarn(v, "Could not write " + t.rel + " (is it read-only?).");
+            return false;
+        }
+    }
+    if (!t.datLine.empty()) {  // gta3.dat must list the file, after Rockstar's of the same level
+        const std::string datPath = app.root + "/data/gta3.dat";
+        std::string dat = slurp(datPath, ok);
+        if (ok && addDatLine(dat, "COLFILE", t.datLine)) {
+            if (!fs::exists(datPath + ".med-backup", ec)) fs::copy_file(datPath, datPath + ".med-backup", ec);
+            std::ofstream out(datPath, std::ios::binary | std::ios::trunc);
+            out.write(dat.data(), std::streamsize(dat.size()));
+            if (!out) {
+                ceWarn(v, "The collision was saved into " + t.rel + ", but data/gta3.dat could not be written, so the game will not load it. Add this line after the COLFILE lines:\n" + t.datLine);
+                return false;
+            }
+        }
+    }
+    if (t.loose) {
+        for (ColModel& c : v.colModels)
+            if (toLower(c.name) == toLower(v.col.name)) c = v.col;
+    } else {
+        app.cols[toLower(v.col.name)] = v.col;  // the map's selection bounds follow
+        bool known = false;
+        for (const std::string& c : app.colFiles) known = known || ceLowerSlashes(c) == ceLowerSlashes(t.abs);
+        if (!known) app.colFiles.push_back(t.abs);  // gta3.dat lists it after the others, as here
+        v.colSource = t.rel;
+    }
+    v.loaded = v.col;
+    v.dirty = false;
+    v.lastMessage.clear();
+    ceRefresh(v);
+    return true;
+}
+
+// Close asks about unsaved edits. False = stay open.
+bool ceConfirmClose(ModelViewer& v) {
+    if (v.kind != 1 || !v.dirty || ceQuiet) return true;
+    const int a = MessageBoxA(v.wnd, ("Save the changes to the collision of " + v.col.name + "?").c_str(), "Collision editor", MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (a == IDCANCEL) return false;
+    if (a == IDYES) return ceSave(v);
+    return true;
+}
+
+// ---- the mouse in the 3D view ----
+
+bool ceRay(const ModelViewer& v, int x, int y, float o[3], float d[3]) {
+    double a[3], b[3];
+    const double wy = double(v.vp[3]) - y;
+    if (gluUnProject(x, wy, 0, v.mv, v.proj, v.vp, &a[0], &a[1], &a[2]) != GL_TRUE) return false;
+    if (gluUnProject(x, wy, 1, v.mv, v.proj, v.vp, &b[0], &b[1], &b[2]) != GL_TRUE) return false;
+    for (int k = 0; k < 3; ++k) { o[k] = float(a[k]); d[k] = float(b[k] - a[k]); }
+    return true;
+}
+
+ColHit cePick(const ModelViewer& v, int x, int y, float o[3], float d[3]) {
+    if (!ceRay(v, x, y, o, d)) return ColHit();
+    return pickCol(v.col, o, d, v.showBoxes, v.showSpheres, v.showMesh);
+}
+
+// A click: select what is under the mouse (Shift: add or remove it); `side` = the whole flat side of a mesh face.
+void ceClick(ModelViewer& v, int x, int y, bool add, bool side) {
+    float o[3], d[3];
+    const ColHit h = cePick(v, x, y, o, d);
+    if (!add) ceClearSelection(v);
+    if (h.kind == ColHit::Face) {
+        const std::set<size_t> faces = side ? coplanarNeighbours(v.col, size_t(h.index)) : std::set<size_t>{size_t(h.index)};
+        const bool all = std::all_of(faces.begin(), faces.end(), [&](size_t f) { return v.selFaces.count(f) > 0; });
+        for (size_t f : faces) {
+            if (add && all) v.selFaces.erase(f);
+            else v.selFaces.insert(f);
+        }
+    } else if (h.kind == ColHit::Box) {
+        if (add && v.selBoxes.count(h.index)) v.selBoxes.erase(h.index);
+        else {
+            v.selBoxes.insert(h.index);
+            v.selBoxFace = h.boxFace;
+        }
+    } else if (h.kind == ColHit::Sphere) {
+        if (add && v.selSpheres.count(h.index)) v.selSpheres.erase(h.index);
+        else v.selSpheres.insert(h.index);
+    }
+    ceRefresh(v);
+}
+
+// Ctrl+drag: everything whose points all fall inside the rectangle (boxes: all corners, spheres: the centre).
+void ceRectSelect(ModelViewer& v, RECT r, bool add) {
+    if (r.left > r.right) std::swap(r.left, r.right);
+    if (r.top > r.bottom) std::swap(r.top, r.bottom);
+    if (!add) ceClearSelection(v);
+    auto inside = [&](double x, double y, double z) {
+        double sx, sy, sz;
+        if (gluProject(x, y, z, v.mv, v.proj, v.vp, &sx, &sy, &sz) != GL_TRUE || sz < 0 || sz > 1) return false;
+        sy = v.vp[3] - sy;
+        return sx >= r.left && sx <= r.right && sy >= r.top && sy <= r.bottom;
+    };
+    if (v.showMesh)
+        for (size_t i = 0; i < v.col.faces.size(); ++i) {
+            const ColFace& f = v.col.faces[i];
+            bool in = true;
+            for (uint32_t k : {f.a, f.b, f.c})
+                if (k * 3 + 2 >= v.col.vertices.size() || !inside(v.col.vertices[k * 3], v.col.vertices[k * 3 + 1], v.col.vertices[k * 3 + 2])) in = false;
+            if (in) v.selFaces.insert(i);
+        }
+    if (v.showBoxes)
+        for (size_t i = 0; i < v.col.boxes.size(); ++i) {
+            const ColBox& b = v.col.boxes[i];
+            bool in = true;
+            for (int c = 0; c < 8; ++c)
+                if (!inside(c & 1 ? b.max[0] : b.min[0], c & 2 ? b.max[1] : b.min[1], c & 4 ? b.max[2] : b.min[2])) in = false;
+            if (in) v.selBoxes.insert(int(i));
+        }
+    if (v.showSpheres)
+        for (size_t i = 0; i < v.col.spheres.size(); ++i)
+            if (inside(v.col.spheres[i].center[0], v.col.spheres[i].center[1], v.col.spheres[i].center[2])) v.selSpheres.insert(int(i));
+    if (v.selBoxes.size() != 1) v.selBoxFace = -1;
+    ceRefresh(v);
+}
+
+// Button down on a selected shape: get ready to push or pull it (the direction and the point it is held at).
+bool ceStartDrag(ModelViewer& v, int x, int y) {
+    float o[3], d[3];
+    const ColHit h = cePick(v, x, y, o, d);
+    if (h.kind == ColHit::None) return false;
+    const bool onSelected = (h.kind == ColHit::Face && v.selFaces.count(size_t(h.index))) || (h.kind == ColHit::Box && v.selBoxes.count(h.index) && v.selBoxes.size() == 1) ||
+                            (h.kind == ColHit::Sphere && v.selSpheres.count(h.index) && v.selSpheres.size() == 1);
+    if (!onSelected) return false;
+    for (int k = 0; k < 3; ++k) v.dragP[k] = o[k] + double(d[k]) * h.t;
+    if (h.kind == ColHit::Face) {
+        double s[3] = {0, 0, 0};
+        for (size_t i : v.selFaces) {
+            float n[3];
+            if (!faceNormal(v.col, i, n)) continue;
+            const ColFace& f = v.col.faces[i];
+            const float *a = &v.col.vertices[f.a * 3], *b = &v.col.vertices[f.b * 3], *c = &v.col.vertices[f.c * 3];
+            const double ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], wx = c[0] - a[0], wy = c[1] - a[1], wz = c[2] - a[2];
+            const double area = std::sqrt((uy * wz - uz * wy) * (uy * wz - uz * wy) + (uz * wx - ux * wz) * (uz * wx - ux * wz) + (ux * wy - uy * wx) * (ux * wy - uy * wx));
+            for (int k = 0; k < 3; ++k) s[k] += n[k] * area;
+        }
+        const double len = std::sqrt(s[0] * s[0] + s[1] * s[1] + s[2] * s[2]);
+        if (len < 1e-9) return false;
+        for (int k = 0; k < 3; ++k) v.dragN[k] = s[k] / len;
+    } else if (h.kind == ColHit::Box) {
+        if (v.selSpheres.size() || v.selFaces.size()) return false;
+        v.selBoxFace = h.boxFace;
+        float n[3];
+        boxFaceNormal(h.boxFace, n);
+        for (int k = 0; k < 3; ++k) v.dragN[k] = n[k];
+    } else {
+        if (v.selBoxes.size() || v.selFaces.size()) return false;
+        const ColSphere& s = v.col.spheres[size_t(h.index)];
+        double n[3], len = 0;
+        for (int k = 0; k < 3; ++k) { n[k] = v.dragP[k] - s.center[k]; len += n[k] * n[k]; }
+        len = std::sqrt(len);
+        if (len < 1e-9) return false;
+        for (int k = 0; k < 3; ++k) v.dragN[k] = n[k] / len;
+    }
+    v.dragStart = v.col;
+    v.dragD = 0;
+    return true;
+}
+
+// While dragging: the distance along the push direction to the point of that line nearest the mouse ray, in
+// hundredths (Shift: tenths).
+void ceDragTo(ModelViewer& v, int x, int y, bool coarse) {
+    float o[3], d[3];
+    if (!ceRay(v, x, y, o, d)) return;
+    const double* n = v.dragN;
+    const double w0[3] = {v.dragP[0] - o[0], v.dragP[1] - o[1], v.dragP[2] - o[2]};
+    const double b = n[0] * d[0] + n[1] * d[1] + n[2] * d[2], c = double(d[0]) * d[0] + double(d[1]) * d[1] + double(d[2]) * d[2];
+    const double dn = n[0] * w0[0] + n[1] * w0[1] + n[2] * w0[2], e = d[0] * w0[0] + d[1] * w0[1] + d[2] * w0[2];
+    const double denom = c - b * b;  // n is a unit vector
+    if (std::fabs(denom) < 1e-9 * c) return;  // looking straight along the push direction
+    double s = (b * e - c * dn) / denom;
+    const double step = coarse ? 0.1 : 0.01;
+    s = std::round(s / step) * step;
+    if (!std::isfinite(s) || std::fabs(s) > 1e4) return;
+    if (float(s) == v.dragD) return;
+    ColModel keep = v.col;
+    v.col = v.dragStart;
+    std::string why;
+    if (s != 0 && !ceApplyPushPull(v, float(s), why)) {
+        v.col = keep;  // past what is allowed: stay at the last good distance
+        return;
+    }
+    v.dragD = float(s);
+    computeColBounds(v.col);
+    ++v.rev;
+    ceRefresh(v);
+}
+
+// ---- drawing the Edit tab's extras (inside drawColModel, in the model's coordinates) ----
+
+void drawGlModelWire(const GlModel& m) {
+    for (const GlGeometry& g : m.geoms) {
+        glPushMatrix();
+        glMultMatrixf(g.matrix);
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glVertexPointer(3, GL_FLOAT, 0, g.pos.data());
+        for (const GlBatch& b : g.batches) glDrawElements(GL_TRIANGLES, b.count, GL_UNSIGNED_INT, g.idx.data() + b.first);
+        glDisableClientState(GL_VERTEX_ARRAY);
+        glPopMatrix();
+    }
+}
+
+GlModel* viewerGl(ModelViewer& v);
+
+void drawColEditOverlay(ModelViewer& v) {
+    const ColModel& c = v.col;
+    glDisable(GL_LIGHTING);
+    glDisable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // the model itself as a grey outline, to build the collision against
+    if (v.showRef && v.id >= 0) {
+        if (GlModel* gm = viewerGl(v)) {
+            glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+            glDisable(GL_DEPTH_TEST);  // seen through the collision shapes, faintly
+            glColor4f(0.8f, 0.8f, 0.8f, 0.3f);
+            drawGlModelWire(*gm);
+            glEnable(GL_DEPTH_TEST);
+            glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+        }
+    }
+    // the selection in yellow
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1, -1);
+    glColor4f(1, 0.9f, 0, 0.55f);
+    glBegin(GL_TRIANGLES);
+    const size_t nv = c.vertices.size() / 3;
+    for (size_t i : v.selFaces) {
+        if (i >= c.faces.size()) continue;
+        const ColFace& f = c.faces[i];
+        if (f.a >= nv || f.b >= nv || f.c >= nv) continue;
+        glVertex3fv(&c.vertices[f.a * 3]);
+        glVertex3fv(&c.vertices[f.b * 3]);
+        glVertex3fv(&c.vertices[f.c * 3]);
+    }
+    glEnd();
+    if (v.selBoxes.size() == 1 && v.selBoxFace >= 0 && *v.selBoxes.begin() < int(c.boxes.size())) {  // the side push / pull moves
+        const ColBox& b = c.boxes[size_t(*v.selBoxes.begin())];
+        float mn[3] = {b.min[0], b.min[1], b.min[2]}, mx[3] = {b.max[0], b.max[1], b.max[2]};
+        const int axis = v.selBoxFace / 2;
+        if (v.selBoxFace % 2) mn[axis] = mx[axis];
+        else mx[axis] = mn[axis];
+        drawSolidBox(mn, mx);
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glLineWidth(2);
+    glColor4f(1, 0.9f, 0, 1);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    for (int i : v.selBoxes)
+        if (i < int(c.boxes.size())) drawSolidBox(c.boxes[size_t(i)].min, c.boxes[size_t(i)].max);
+    static GLUquadric* q = nullptr;
+    if (!q) q = gluNewQuadric();
+    gluQuadricDrawStyle(q, GLU_LINE);
+    for (int i : v.selSpheres)
+        if (i < int(c.spheres.size())) {
+            glPushMatrix();
+            glTranslatef(c.spheres[size_t(i)].center[0], c.spheres[size_t(i)].center[1], c.spheres[size_t(i)].center[2]);
+            gluSphere(q, c.spheres[size_t(i)].radius * 1.01, 12, 8);
+            glPopMatrix();
+        }
+    gluQuadricDrawStyle(q, GLU_FILL);
+    glPolygonMode(GL_FRONT_AND_BACK, v.wireframe ? GL_LINE : GL_FILL);
+    // open edges in red, on top
+    glDisable(GL_DEPTH_TEST);
+    glColor4f(1, 0.1f, 0.1f, 1);
+    glBegin(GL_LINES);
+    for (const auto& e : ceOpenEdges(v)) {
+        if (e[0] >= nv || e[1] >= nv) continue;
+        glVertex3fv(&c.vertices[e[0] * 3]);
+        glVertex3fv(&c.vertices[e[1] * 3]);
+    }
+    glEnd();
+    glEnable(GL_DEPTH_TEST);
+    glLineWidth(1);
+    // the selection rectangle
+    if (v.dragging && v.dragMode == 3) {
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glLoadIdentity();
+        glOrtho(0, v.vp[2], v.vp[3], 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        glLoadIdentity();
+        glDisable(GL_DEPTH_TEST);
+        glColor4f(1, 1, 1, 0.9f);
+        glBegin(GL_LINE_LOOP);
+        glVertex2i(v.down.x, v.down.y);
+        glVertex2i(v.cur.x, v.down.y);
+        glVertex2i(v.cur.x, v.cur.y);
+        glVertex2i(v.down.x, v.cur.y);
+        glEnd();
+        glEnable(GL_DEPTH_TEST);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_MODELVIEW);
+    }
+}
+
+// The mouse in the 3D view while the Edit tab is open. True = handled.
+bool ceMouse(ModelViewer& v, HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    const int x = int(short(LOWORD(lp))), y = int(short(HIWORD(lp)));
+    switch (msg) {
+        case WM_LBUTTONDOWN:
+            SetFocus(w);
+            SetCapture(w);
+            v.last = v.down = v.cur = {x, y};
+            v.dragging = true;
+            v.dragMoved = false;
+            v.dragMode = (wp & MK_CONTROL) ? 3 : ceStartDrag(v, x, y) ? 2 : 1;
+            return true;
+        case WM_MOUSEMOVE: {
+            if (!v.dragging || !(wp & MK_LBUTTON)) return false;  // the right button turns the view as in View
+            v.cur = {x, y};
+            if (std::abs(x - v.down.x) > 3 || std::abs(y - v.down.y) > 3) {
+                if (!v.dragMoved && v.dragMode == 2) {
+                    std::swap(v.col, v.dragStart);  // the undo step holds the shape before the drag
+                    cePushUndo(v);
+                    std::swap(v.col, v.dragStart);
+                }
+                v.dragMoved = true;
+            }
+            if (v.dragMode == 1 && v.dragMoved) {  // pan, as in View
+                v.view.tx += float((x - v.last.x) * 0.25);
+                v.view.ty -= float((y - v.last.y) * 0.25);
+            } else if (v.dragMode == 2 && v.dragMoved) {
+                ceDragTo(v, x, y, (wp & MK_SHIFT) != 0);
+            }
+            v.last = {x, y};
+            return true;
+        }
+        case WM_LBUTTONUP: {
+            if (!v.dragging) return false;
+            ReleaseCapture();
+            const int mode = v.dragMode;
+            const bool moved = v.dragMoved;
+            v.dragging = false;
+            v.dragMode = 0;
+            if (!moved) ceClick(v, x, y, (wp & MK_SHIFT) != 0, false);
+            else if (mode == 3) ceRectSelect(v, RECT{v.down.x, v.down.y, x, y}, (wp & MK_SHIFT) != 0);
+            else if (mode == 2) {
+                if (v.dragD == 0 && !v.undo.empty()) {  // let go where it started: no change, no undo step
+                    v.col = v.undo.back();
+                    v.undo.pop_back();
+                    ceChanged(v, false);
+                } else {
+                    ceChanged(v);
+                }
+            }
+            return true;
+        }
+        case WM_LBUTTONDBLCLK:
+            ceClick(v, x, y, (wp & MK_SHIFT) != 0, true);  // the whole flat side
+            return true;
+    }
+    return false;
+}
+
+// Keys in the 3D view while the Edit tab is open. True = handled.
+bool ceKey(ModelViewer& v, WPARAM key) {
+    const bool ctrl = GetKeyState(VK_CONTROL) < 0;
+    if (key == VK_DELETE) { ceDelete(v); return true; }
+    if (ctrl && key == 'Z') { ceUndo(v); return true; }
+    if (ctrl && key == 'Y') { ceRedo(v); return true; }
+    if (ctrl && key == 'S') { ceSave(v); return true; }
+    if (key == VK_ESCAPE && ceHasSelection(v)) { ceClearSelection(v); ceRefresh(v); return true; }
+    return false;
+}
+
+// ---- the Edit tab's controls ----
+
+void ceFillRegions(ModelViewer& v, const std::string& select = "") {
+    HWND box = v.ce[ID_CE_REGION];
+    char cur[256] = "";
+    const int was = int(SendMessageA(box, CB_GETCURSEL, 0, 0));
+    if (was >= 0) SendMessageA(box, CB_GETLBTEXT, WPARAM(was), (LPARAM)cur);
+    const std::string want = select.empty() ? std::string(cur) : select;
+    SendMessageA(box, CB_RESETCONTENT, 0, 0);
+    int pick = 0, k = 0;
+    const std::string own = ceOwnRegionOf(v.colSource);
+    for (const std::string& r : userRegionNames()) {
+        SendMessageA(box, CB_ADDSTRING, 0, (LPARAM)r.c_str());
+        if (toLower(r) == toLower(own.empty() ? want : own)) pick = k;
+        ++k;
+    }
+    SendMessageA(box, CB_SETCURSEL, k ? WPARAM(pick) : WPARAM(-1), 0);
+}
+
+void ceShowTab(ModelViewer& v, bool edit) {
+    v.editTab = edit;
+    for (HWND h : v.viewCtrls) ShowWindow(h, edit ? SW_HIDE : SW_SHOW);
+    for (auto& kv : v.ce) ShowWindow(kv.second, edit ? SW_SHOW : SW_HIDE);
+    for (HWND h : v.ceLabels) ShowWindow(h, edit ? SW_SHOW : SW_HIDE);
+    if (v.tabs && int(SendMessageA(v.tabs, TCM_GETCURSEL, 0, 0)) != (edit ? 1 : 0)) SendMessageA(v.tabs, TCM_SETCURSEL, edit ? 1 : 0, 0);
+    if (edit) {
+        ceFillRegions(v);
+        ceRefresh(v);
+    }
+}
+
+void ceCreateControls(ModelViewer& v, HFONT font) {
+    auto make = [&](const char* cls, const char* text, DWORD style, DWORD ex, int cid) {
+        HWND h = CreateWindowExA(ex, cls, text, WS_CHILD | style, 0, 0, 10, 10, v.wnd, (HMENU)(INT_PTR)cid, GetModuleHandle(nullptr), nullptr);
+        SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
+        if (cid != ID_CE_LBL) v.ce[cid] = h;
+        return h;
+    };
+    v.tabs = CreateWindowExA(0, WC_TABCONTROLA, "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, v.wnd, (HMENU)(INT_PTR)ID_CE_TABS, GetModuleHandle(nullptr), nullptr);
+    SendMessageA(v.tabs, WM_SETFONT, (WPARAM)font, TRUE);
+    TCITEMA ti = {};
+    ti.mask = TCIF_TEXT;
+    ti.pszText = const_cast<char*>("View");
+    SendMessageA(v.tabs, TCM_INSERTITEMA, 0, (LPARAM)&ti);
+    ti.pszText = const_cast<char*>("Edit");
+    SendMessageA(v.tabs, TCM_INSERTITEMA, 1, (LPARAM)&ti);
+    make("BUTTON", "Add Box", BS_PUSHBUTTON, 0, ID_CE_ADDBOX);
+    make("BUTTON", "Add Sphere", BS_PUSHBUTTON, 0, ID_CE_ADDSPHERE);
+    make("BUTTON", "Select flat side", BS_PUSHBUTTON, 0, ID_CE_SELSIDE);
+    make("BUTTON", "Select all faces", BS_PUSHBUTTON, 0, ID_CE_SELALL);
+    make("BUTTON", "Clear selection", BS_PUSHBUTTON, 0, ID_CE_SELNONE);
+    make("BUTTON", "Delete selected", BS_PUSHBUTTON, 0, ID_CE_DELETE);
+    for (const char* t : kCeLabels) v.ceLabels.push_back(make("STATIC", t, SS_LEFT, 0, ID_CE_LBL));
+    make("EDIT", "0.5", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_CE_DIST);
+    make("BUTTON", "Pull out", BS_PUSHBUTTON, 0, ID_CE_OUT);
+    make("BUTTON", "Push in", BS_PUSHBUTTON, 0, ID_CE_IN);
+    for (int id : {ID_CE_MX, ID_CE_MY, ID_CE_MZ}) make("EDIT", "0", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, id);
+    make("BUTTON", "Move", BS_PUSHBUTTON, 0, ID_CE_MOVE);
+    HWND mat = make("COMBOBOX", "", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL, 0, ID_CE_MAT);
+    for (int k = 0; k <= kColMaterialCount - 1; ++k) SendMessageA(mat, CB_ADDSTRING, 0, (LPARAM)("Material " + std::to_string(k)).c_str());
+    for (int k = 0; k < 6; ++k) make("EDIT", "", ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_CE_F0 + k);
+    make("BUTTON", "Apply typed size", BS_PUSHBUTTON, 0, ID_CE_APPLY);
+    HWND ref = make("BUTTON", "Show the model's outline", BS_AUTOCHECKBOX, 0, ID_CE_SHOWREF);
+    SendMessageA(ref, BM_SETCHECK, BST_CHECKED, 0);
+    make("BUTTON", "Undo", BS_PUSHBUTTON, 0, ID_CE_UNDO);
+    make("BUTTON", "Redo", BS_PUSHBUTTON, 0, ID_CE_REDO);
+    make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_CE_STATUS);
+    make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_CE_REGION);
+    make("BUTTON", "New region...", BS_PUSHBUTTON, 0, ID_CE_NEWREGION);
+    make("BUTTON", "Save", BS_PUSHBUTTON, 0, ID_CE_SAVE);
+    if (v.id < 0) EnableWindow(v.ce[ID_CE_SHOWREF], FALSE);  // a loose .col has no model to show
+}
+
+// Lay the Edit tab out in the right-hand panel from `y` down.
+void ceLayout(ModelViewer& v, int px, int pw, int y, int ch) {
+    auto put = [&](int id, int x, int yy, int w, int h) { MoveWindow(v.ce[id], x, yy, w, h, TRUE); };
+    const int half = (pw - 4) / 2, third = (pw - 8) / 3;
+    put(ID_CE_ADDBOX, px, y, half, 24);
+    put(ID_CE_ADDSPHERE, px + half + 4, y, half, 24);
+    y += 28;
+    put(ID_CE_SELSIDE, px, y, half, 24);
+    put(ID_CE_SELALL, px + half + 4, y, half, 24);
+    y += 28;
+    put(ID_CE_SELNONE, px, y, half, 24);
+    put(ID_CE_DELETE, px + half + 4, y, half, 24);
+    y += 32;
+    MoveWindow(v.ceLabels[0], px, y, pw, 16, TRUE);
+    y += 18;
+    const int bw = (pw - 64 - 8) / 2;
+    put(ID_CE_DIST, px, y, 60, 22);
+    put(ID_CE_OUT, px + 64, y, bw, 22);
+    put(ID_CE_IN, px + 68 + bw, y, bw, 22);
+    y += 28;
+    MoveWindow(v.ceLabels[1], px, y, pw, 16, TRUE);
+    y += 18;
+    const int ew = (pw - 60 - 12) / 3;
+    put(ID_CE_MX, px, y, ew, 22);
+    put(ID_CE_MY, px + ew + 4, y, ew, 22);
+    put(ID_CE_MZ, px + 2 * (ew + 4), y, ew, 22);
+    put(ID_CE_MOVE, px + 3 * (ew + 4), y, pw - 3 * (ew + 4), 22);
+    y += 30;
+    MoveWindow(v.ceLabels[2], px, y + 4, 96, 16, TRUE);
+    put(ID_CE_MAT, px + 98, y, pw - 98, 320);
+    y += 30;
+    MoveWindow(v.ceLabels[3], px, y, pw, 16, TRUE);
+    y += 18;
+    for (int k = 0; k < 6; ++k) put(ID_CE_F0 + k, px + (k % 3) * (third + 4), y + (k / 3) * 26, third, 22);
+    y += 52;
+    put(ID_CE_APPLY, px, y, pw, 22);
+    y += 28;
+    put(ID_CE_SHOWREF, px, y, pw, 20);
+    y += 24;
+    put(ID_CE_UNDO, px, y, half, 24);
+    put(ID_CE_REDO, px + half + 4, y, half, 24);
+    y += 30;
+    const int bottom = ch - 32 - 30 - 28 - 6;  // Close, Save, the region row
+    put(ID_CE_STATUS, px, y, pw, std::max(40, bottom - y));
+    y = std::max(y + 40, bottom) + 4;
+    MoveWindow(v.ceLabels[4], px, y + 4, 96, 16, TRUE);
+    put(ID_CE_REGION, px + 98, y, pw - 98 - 84, 200);
+    put(ID_CE_NEWREGION, px + pw - 80, y, 80, 22);
+    y += 28;
+    put(ID_CE_SAVE, px, y, pw, 26);
+}
+
+float ceNumber(HWND h, bool& ok) {
+    char b[64] = "";
+    GetWindowTextA(h, b, sizeof b);
+    std::string s = trim(b);
+    if (s.empty()) { ok = true; return 0; }
+    char* end = nullptr;
+    const double x = std::strtod(s.c_str(), &end);
+    ok = end && !*end && std::isfinite(x) && std::fabs(x) <= 1e4;
+    return ok ? float(x) : 0;
+}
+
+// WM_COMMAND from the Edit tab. True = handled.
+bool ceCommand(ModelViewer& v, int id, int code) {
+    switch (id) {
+        case ID_CE_ADDBOX: ceAddBox(v); return true;
+        case ID_CE_ADDSPHERE: ceAddSphere(v); return true;
+        case ID_CE_SELSIDE: {
+            std::set<size_t> all;
+            for (size_t f : v.selFaces)
+                for (size_t g : coplanarNeighbours(v.col, f)) all.insert(g);
+            v.selFaces.insert(all.begin(), all.end());
+            ceRefresh(v);
+            return true;
+        }
+        case ID_CE_SELALL:
+            for (size_t i = 0; i < v.col.faces.size(); ++i) v.selFaces.insert(i);
+            ceRefresh(v);
+            return true;
+        case ID_CE_SELNONE: ceClearSelection(v); ceRefresh(v); return true;
+        case ID_CE_DELETE: ceDelete(v); return true;
+        case ID_CE_OUT:
+        case ID_CE_IN: {
+            bool ok;
+            const float d = ceNumber(v.ce[ID_CE_DIST], ok);
+            if (!ok || !(d > 0)) {
+                ceWarn(v, "Type how far to push or pull, a number above 0 (for example 0.5).");
+                return true;
+            }
+            cePushPull(v, id == ID_CE_OUT ? d : -d);
+            return true;
+        }
+        case ID_CE_MOVE: {
+            bool ox, oy, oz;
+            const float dx = ceNumber(v.ce[ID_CE_MX], ox), dy = ceNumber(v.ce[ID_CE_MY], oy), dz = ceNumber(v.ce[ID_CE_MZ], oz);
+            if (!ox || !oy || !oz) {
+                ceWarn(v, "Type the move in X, Y and Z as numbers (empty counts as 0).");
+                return true;
+            }
+            ceMove(v, dx, dy, dz);
+            return true;
+        }
+        case ID_CE_MAT:
+            if (code == CBN_SELCHANGE) ceSetMaterial(v, int(SendMessageA(v.ce[ID_CE_MAT], CB_GETCURSEL, 0, 0)));
+            return true;
+        case ID_CE_APPLY: ceApplyFields(v); return true;
+        case ID_CE_SHOWREF: v.showRef = SendMessageA(v.ce[ID_CE_SHOWREF], BM_GETCHECK, 0, 0) == BST_CHECKED; return true;
+        case ID_CE_UNDO: ceUndo(v); return true;
+        case ID_CE_REDO: ceRedo(v); return true;
+        case ID_CE_REGION:
+            if (code == CBN_SELCHANGE) ceRefresh(v);
+            return true;
+        case ID_CE_NEWREGION: {
+            const std::vector<std::string> before = userRegionNames();
+            createRegionUi(v.wnd);
+            const std::vector<std::string> after = userRegionNames();
+            ceFillRegions(v, after.size() > before.size() ? after.back() : "");
+            ceRefresh(v);
+            return true;
+        }
+        case ID_CE_SAVE: ceSave(v); return true;
+    }
+    return false;
+}
+
+// The material list: MEd's colour beside each number, and how many shapes of this model use it.
+void ceDrawMaterialItem(ModelViewer& v, const DRAWITEMSTRUCT* di) {
+    if (di->itemID == UINT(-1)) return;
+    const int k = int(di->itemID);
+    const bool sel = (di->itemState & ODS_SELECTED) != 0;
+    FillRect(di->hDC, &di->rcItem, GetSysColorBrush(sel ? COLOR_HIGHLIGHT : COLOR_WINDOW));
+    unsigned char rgb[3];
+    colMaterialColour(k, rgb);
+    HBRUSH b = CreateSolidBrush(RGB(rgb[0], rgb[1], rgb[2]));
+    RECT sw = {di->rcItem.left + 3, di->rcItem.top + 3, di->rcItem.left + 19, di->rcItem.bottom - 3};
+    FillRect(di->hDC, &sw, b);
+    DeleteObject(b);
+    FrameRect(di->hDC, &sw, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    int used = 0;
+    for (const ColBox& x : v.col.boxes) used += x.surface.material == k;
+    for (const ColSphere& x : v.col.spheres) used += x.surface.material == k;
+    for (const ColFace& x : v.col.faces) used += x.material == k;
+    std::string text = "Material " + std::to_string(k) + (used ? "  (" + std::to_string(used) + " here)" : std::string());
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, GetSysColor(sel ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT));
+    RECT tr = di->rcItem;
+    tr.left += 24;
+    DrawTextA(di->hDC, text.c_str(), -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 }
 
 // The GL model a viewer shows: a loose file's own, or the game model's.
@@ -4765,6 +5829,9 @@ void drawViewer(ModelViewer& v) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glTranslatef(-v.centre[0], -v.centre[1], -v.centre[2]);  // MEd turns about the model's origin, often a corner of a building
+    glGetDoublev(GL_PROJECTION_MATRIX, v.proj);  // for picking in the Edit tab
+    glGetDoublev(GL_MODELVIEW_MATRIX, v.mv);
+    glGetIntegerv(GL_VIEWPORT, v.vp);
     if (v.kind == 1) drawColModel(v);
     else if (GlModel* gmp = viewerGl(v)) {
         GlModel& gm = *gmp;
@@ -4809,9 +5876,18 @@ void updateViewers() {
 LRESULT CALLBACK viewerGlProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     ModelViewer* v = viewerOf(w);
     if (!v) return DefWindowProcA(w, msg, wp, lp);
+    if (v->kind == 1 && v->editTab) {
+        if (msg == WM_KEYDOWN && ceKey(*v, wp)) return 0;
+        if (ceMouse(*v, w, msg, wp, lp)) return 0;
+    }
     switch (msg) {
+        case WM_KEYDOWN:
+            if (wp == VK_ESCAPE) SendMessageA(GetParent(w), WM_CLOSE, 0, 0);
+            return 0;
         case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK:
         case WM_RBUTTONDOWN:
+        case WM_RBUTTONDBLCLK:
             SetFocus(w);
             SetCapture(w);
             v->last = {int(short(LOWORD(lp))), int(short(HIWORD(lp)))};
@@ -4857,11 +5933,20 @@ void viewerLayout(ModelViewer& v) {
     const int cw = r.right, ch = r.bottom, m = 6, px = cw - kViewerPanelW + m, pw = kViewerPanelW - 2 * m;
     MoveWindow(v.gl, 0, 0, std::max(cw - kViewerPanelW, 50), ch, TRUE);
     int y = m;
+    if (v.tabs) {  // Collision Object Properties: View | Edit
+        MoveWindow(v.tabs, px, y, pw, 24, TRUE);
+        y += 28;
+    }
     const int third = (pw - 8) / 3;
     MoveWindow(GetDlgItem(v.wnd, ID_MV_ZOOMIN), px, y, third, 24, TRUE);
     MoveWindow(GetDlgItem(v.wnd, ID_MV_ZOOMOUT), px + third + 4, y, third, 24, TRUE);
     MoveWindow(GetDlgItem(v.wnd, ID_MV_RESET), px + 2 * (third + 4), y, third, 24, TRUE);
     y += 30;
+    if (v.kind == 1 && v.editTab) {
+        ceLayout(v, px, pw, y, ch);
+        MoveWindow(GetDlgItem(v.wnd, ID_MV_CLOSE), px, ch - 32, pw, 26, TRUE);
+        return;
+    }
     for (int id : {ID_MV_ROTATE, ID_MV_WIRE, ID_MV_2DFX, ID_MV_NIGHT, ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH, ID_MV_SHADOW}) {
         HWND c = GetDlgItem(v.wnd, id);
         if (!c) continue;  // each kind of viewer has its own set
@@ -4895,6 +5980,12 @@ void viewerPickColModel(ModelViewer& v, int k) {
     if (k < 0 || k >= int(v.colModels.size())) return;
     v.col = v.colModels[size_t(k)];
     v.dff = v.col.name;
+    v.loaded = v.col;
+    v.undo.clear();
+    v.redo.clear();
+    ceClearSelection(v);
+    v.dirty = false;
+    ++v.rev;
     viewerFitCol(v);
     SetWindowTextA(v.info, colInfoText(v).c_str());
     SetWindowTextA(v.wnd, ("Collision Object Properties - " + v.col.name + " (" + v.file.substr(v.file.find_last_of("/" + std::string(1, char(92))) + 1) + ")").c_str());
@@ -4907,11 +5998,30 @@ LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (v) viewerLayout(*v);
             return 0;
         case WM_GETMINMAXINFO:
-            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {kViewerPanelW + 260, 420};
+            reinterpret_cast<MINMAXINFO*>(lp)->ptMinTrackSize = {kViewerPanelW + 260, v && v->kind == 1 ? 660 : 420};
             return 0;
+        case WM_NOTIFY:
+            if (v && reinterpret_cast<NMHDR*>(lp)->idFrom == ID_CE_TABS && reinterpret_cast<NMHDR*>(lp)->code == TCN_SELCHANGE) {
+                ceShowTab(*v, SendMessageA(v->tabs, TCM_GETCURSEL, 0, 0) == 1);
+                viewerLayout(*v);
+            }
+            return 0;
+        case WM_MEASUREITEM:
+            if (reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->CtlID == ID_CE_MAT) {
+                reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight = 20;
+                return TRUE;
+            }
+            break;
+        case WM_DRAWITEM:
+            if (v && reinterpret_cast<DRAWITEMSTRUCT*>(lp)->CtlID == ID_CE_MAT) {
+                ceDrawMaterialItem(*v, reinterpret_cast<DRAWITEMSTRUCT*>(lp));
+                return TRUE;
+            }
+            break;
         case WM_COMMAND: {
             if (!v) return 0;
             const int id = LOWORD(wp), code = HIWORD(wp);
+            if (v->kind == 1 && ceCommand(*v, id, code)) return 0;
             if (id == ID_MV_ZOOMIN) v->view.tz += 3;   // 0x004143c0
             else if (id == ID_MV_ZOOMOUT) v->view.tz -= 3;  // 0x004143e0
             else if (id == ID_MV_RESET) v->view = v->home;
@@ -4924,16 +6034,22 @@ LRESULT CALLBACK viewerProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else if (id == ID_MV_MESH) v->showMesh = SendMessageA(GetDlgItem(w, id), BM_GETCHECK, 0, 0) == BST_CHECKED;
             else if (id == ID_MV_OBJECT && code == CBN_SELCHANGE) {
                 const int k = int(SendMessageA(v->objectBox, CB_GETCURSEL, 0, 0));
-                if (v->kind == 1) viewerPickColModel(*v, k);  // a loose .col: Model in file
+                if (v->kind == 1 && v->dirty) {  // the edits belong to the model shown: keep them until saved or undone
+                    for (size_t i = 0; i < v->colModels.size(); ++i)
+                        if (v->colModels[i].name == v->col.name) SendMessageA(v->objectBox, CB_SETCURSEL, WPARAM(i), 0);
+                    ceWarn(*v, "Save or undo the changes to " + v->col.name + " before picking another model.");
+                }
+                else if (v->kind == 1) viewerPickColModel(*v, k);  // a loose .col: Model in file
                 else v->object = k;
             }
-            else if (id == ID_MV_CLOSE) DestroyWindow(w);
+            else if (id == ID_MV_CLOSE) SendMessageA(w, WM_CLOSE, 0, 0);
             return 0;
         }
         case WM_KEYDOWN:
-            if (wp == VK_ESCAPE) DestroyWindow(w);
+            if (wp == VK_ESCAPE) SendMessageA(w, WM_CLOSE, 0, 0);
             return 0;
         case WM_CLOSE:
+            if (v && !ceConfirmClose(*v)) return 0;  // unsaved collision edits: Save / Discard / Cancel
             DestroyWindow(w);
             return 0;
         case WM_DESTROY:
@@ -5025,7 +6141,7 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind, const std::string& fi
             app.models.erase(v->modelKey);
             buildGlModel(app.models[v->modelKey], v->model, txdPath.empty() ? std::string("file:none") : txdKey);
         }
-    } else if (kind == 1) {  // the model's own collision record, from the COL files of gta3.dat (the first that has it)
+    } else if (kind == 1) {  // the model's own collision record, from the COL files of gta3.dat (the last that has it: the game's choice)
         std::vector<unsigned char> record;
         std::vector<ColModel> models;
         if (!findCollisionRecord(app.colFiles, d->second.model, record, v->colSource) || !parseCol(record, models, err) || models.empty()) {
@@ -5055,7 +6171,7 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind, const std::string& fi
         wc.lpszClassName = "MEdModelViewer";
         RegisterClassA(&wc);
         WNDCLASSA gc = {};
-        gc.style = CS_OWNDC;
+        gc.style = CS_OWNDC | CS_DBLCLKS;
         gc.lpfnWndProc = viewerGlProc;
         gc.hInstance = GetModuleHandle(nullptr);
         gc.hCursor = LoadCursor(nullptr, IDC_SIZEALL);
@@ -5069,7 +6185,7 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind, const std::string& fi
     const std::string fileName = file.empty() ? std::string() : file.substr(file.find_last_of("/" + std::string(1, char(92))) + 1);
     const std::string title = kind == 1 ? "Collision Object Properties - " + v->dff + (file.empty() ? "" : " (" + fileName + ")")
                                         : "DFF Properties - " + (file.empty() ? v->dff + ".dff" : file);
-    v->wnd = CreateWindowExA(0, "MEdModelViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 120 + 30 * n, r.top + 100 + 30 * n, 900, 600, owner,
+    v->wnd = CreateWindowExA(0, "MEdModelViewer", title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, r.left + 120 + 30 * n, r.top + 60 + 30 * n, 900, kind == 1 ? 720 : 600, owner,
                              nullptr, GetModuleHandle(nullptr), nullptr);
     v->gl = CreateWindowExA(0, "MEdModelViewerGL", "", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, 10, 10, v->wnd, nullptr, GetModuleHandle(nullptr), nullptr);
     HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
@@ -5099,6 +6215,10 @@ ModelViewer* openModelViewer(HWND owner, int id, int kind, const std::string& fi
         v->info = make("EDIT", "", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL, WS_EX_CLIENTEDGE, ID_MV_INFO);
         make("BUTTON", "Close", BS_PUSHBUTTON, 0, ID_MV_CLOSE);
         SetWindowTextA(v->info, colInfoText(*v).c_str());
+        for (int cid : {ID_MV_ROTATE, ID_MV_WIRE, ID_MV_BOXES, ID_MV_SPHERES, ID_MV_MESH, ID_MV_SHADOW, ID_MV_LBL_OBJECT, ID_MV_OBJECT, ID_MV_INFO})
+            if (HWND c = GetDlgItem(v->wnd, cid)) v->viewCtrls.push_back(c);
+        v->loaded = v->col;
+        ceCreateControls(*v, font);  // the Edit tab
     } else {
         HWND fx = make("BUTTON", "Show 2DFX Lighting", BS_AUTOCHECKBOX, 0, ID_MV_2DFX);
         HWND night = make("BUTTON", "Show Night Vertex Colours", BS_AUTOCHECKBOX, 0, ID_MV_NIGHT);
@@ -8066,6 +9186,585 @@ void runImportSelfTest(SelfTest& t) {
     ST_CHECK(t, stMapState() == mapBefore, "importing changes no placement (the test placement was undone)");
 }
 
+// ---- self-test of the collision editor (runs inside --selftest; saves only into a region it makes, put back after) ------
+namespace stce {
+void cmd(ModelViewer& v, int id, int code = BN_CLICKED) { SendMessageA(v.wnd, WM_COMMAND, MAKEWPARAM(id, code), (LPARAM)v.ce[id]); }
+void text(ModelViewer& v, int id, const std::string& s) { SetWindowTextA(v.ce[id], s.c_str()); }
+std::string read(HWND h) {
+    char b[8192] = "";
+    GetWindowTextA(h, b, sizeof b);
+    return b;
+}
+void mouse(ModelViewer& v, UINT msg, int x, int y, WPARAM keys) { SendMessageA(v.gl, msg, keys, MAKELPARAM(x, y)); }
+void click(ModelViewer& v, int x, int y, WPARAM keys = 0) {
+    mouse(v, WM_LBUTTONDOWN, x, y, MK_LBUTTON | keys);
+    mouse(v, WM_LBUTTONUP, x, y, keys);
+}
+void drag(ModelViewer& v, int x0, int y0, int x1, int y1, WPARAM keys = 0, int steps = 6) {
+    mouse(v, WM_LBUTTONDOWN, x0, y0, MK_LBUTTON | keys);
+    for (int k = 1; k <= steps; ++k) mouse(v, WM_MOUSEMOVE, x0 + (x1 - x0) * k / steps, y0 + (y1 - y0) * k / steps, MK_LBUTTON | keys);
+    mouse(v, WM_LBUTTONUP, x1, y1, keys);
+}
+// Where a point of the model shows in the 3D view (as last drawn); false when behind the camera or outside.
+bool screenOf(const ModelViewer& v, const float p[3], int& x, int& y) {
+    double sx, sy, sz;
+    if (gluProject(p[0], p[1], p[2], v.mv, v.proj, v.vp, &sx, &sy, &sz) != GL_TRUE || sz <= 0 || sz >= 1) return false;
+    x = int(std::lround(sx));
+    y = int(std::lround(v.vp[3] - sy));
+    return x >= 2 && y >= 2 && x < v.vp[2] - 2 && y < v.vp[3] - 2;
+}
+std::vector<unsigned char> bytes(const ColModel& m) { return writeColl(m); }
+}  // namespace stce
+
+// Everything the Edit tab must agree with after every step.
+void stColInvariants(SelfTest& t, ModelViewer& v, const std::string& what) {
+    const ColModel& c = v.col;
+    const size_t nv = c.vertices.size() / 3;
+    bool ok = c.vertices.size() % 3 == 0;
+    for (const ColFace& f : c.faces) ok = ok && f.a < nv && f.b < nv && f.c < nv;
+    ST_CHECK(t, ok, what + ": every face uses existing vertices");
+    bool boxesOk = true;
+    for (const ColBox& b : c.boxes)
+        for (int k = 0; k < 3; ++k) boxesOk = boxesOk && b.max[k] - b.min[k] >= kMinBoxSize - 1e-4f;
+    ST_CHECK(t, boxesOk, what + ": no box is thinner than the minimum");
+    bool spheresOk = true;
+    for (const ColSphere& s : c.spheres) spheresOk = spheresOk && s.radius >= kMinSphereRadius - 1e-4f;
+    ST_CHECK(t, spheresOk, what + ": no sphere is smaller than the minimum");
+    bool selOk = true;
+    for (int i : v.selBoxes) selOk = selOk && i >= 0 && i < int(c.boxes.size());
+    for (int i : v.selSpheres) selOk = selOk && i >= 0 && i < int(c.spheres.size());
+    for (size_t i : v.selFaces) selOk = selOk && i < c.faces.size();
+    ST_CHECK(t, selOk, what + ": the selection names only existing shapes");
+    ColModel rb = c;
+    computeColBounds(rb);
+    bool boundsOk = true;
+    if (v.dirty && (!c.boxes.empty() || !c.spheres.empty() || !c.faces.empty()))  // an untouched record keeps its own bounds
+        for (int k = 0; k < 3; ++k) boundsOk = boundsOk && rb.boundMin[k] == c.boundMin[k] && rb.boundMax[k] == c.boundMax[k];
+    ST_CHECK(t, boundsOk, what + ": the bounds hold every shape");
+    std::vector<ColModel> back;
+    std::string err;
+    ST_CHECK(t, parseCol(writeColl(c), back, err) && back.size() == 1 && writeColl(back[0]) == writeColl(c), what + ": the record writes and reads back unchanged");
+    ST_CHECK(t, v.dirty == (writeColl(c) != writeColl(v.loaded)), what + ": unsaved exactly when it differs from the saved record");
+    ST_CHECK(t, v.undo.size() <= 50, what + ": the undo list keeps 50 steps at most");
+    ST_CHECK(t, (IsWindowEnabled(v.ce[ID_CE_DELETE]) != 0) == ceHasSelection(v), what + ": Delete works exactly when something is selected");
+    ST_CHECK(t, (IsWindowEnabled(v.ce[ID_CE_UNDO]) != 0) == !v.undo.empty() && (IsWindowEnabled(v.ce[ID_CE_REDO]) != 0) == !v.redo.empty(), what + ": Undo and Redo buttons");
+    const std::string status = stce::read(v.ce[ID_CE_STATUS]);
+    ST_CHECK(t, status.find(std::to_string(c.faces.size()) + (c.faces.size() == 1 ? " mesh face" : " mesh faces")) != std::string::npos &&
+                    status.find(std::to_string(c.boxes.size()) + (c.boxes.size() == 1 ? " box" : " boxes")) != std::string::npos,
+             what + ": the status counts the shapes");
+    ST_CHECK(t, (status.find("Unsaved changes") != std::string::npos) == v.dirty, what + ": the status says whether something is unsaved");
+    char title[512] = "";
+    GetWindowTextA(v.wnd, title, sizeof title);
+    const std::string tt = title;
+    ST_CHECK(t, (tt.size() > 2 && tt.substr(tt.size() - 2) == " *") == v.dirty, what + ": the title has * exactly when something is unsaved");
+}
+
+// An independent ray / triangle test (for checking what a click selected).
+bool stRayTri(const float o[3], const float d[3], const float* a, const float* b, const float* c, double& t) {
+    const double ab[3] = {b[0] - double(a[0]), b[1] - double(a[1]), b[2] - double(a[2])}, ac[3] = {c[0] - double(a[0]), c[1] - double(a[1]), c[2] - double(a[2])};
+    const double n[3] = {ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
+    const double dn = n[0] * d[0] + n[1] * d[1] + n[2] * d[2];
+    if (std::fabs(dn) < 1e-12) return false;
+    t = (n[0] * (a[0] - double(o[0])) + n[1] * (a[1] - double(o[1])) + n[2] * (a[2] - double(o[2]))) / dn;
+    if (t <= 1e-6) return false;
+    const double p[3] = {o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t};
+    auto side = [&](const float* u, const float* w) {  // p on the inner side of edge u -> w
+        const double e[3] = {w[0] - double(u[0]), w[1] - double(u[1]), w[2] - double(u[2])}, q[3] = {p[0] - u[0], p[1] - u[1], p[2] - u[2]};
+        const double x[3] = {e[1] * q[2] - e[2] * q[1], e[2] * q[0] - e[0] * q[2], e[0] * q[1] - e[1] * q[0]};
+        return x[0] * n[0] + x[1] * n[1] + x[2] * n[2] >= -1e-9 * (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    };
+    return side(a, b) && side(b, c) && side(c, a);
+}
+
+void runColEditSelfTest(SelfTest& t) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    ceQuiet = true;
+    const std::string mapBefore = stMapState();
+    const std::string datPath = app.root + "/data/gta3.dat";
+    bool ok = false;
+    const std::string datBefore = slurp(datPath, ok);
+    const auto colsBefore = app.cols.size();
+    const std::vector<std::string> colFilesBefore = app.colFiles;
+    int hosp = -1;
+    for (const auto& kv : app.defs) if (kv.second.model == "hospitaland") hosp = kv.first;
+    ST_CHECK(t, hosp >= 0, "the test model is in the game");
+    if (hosp < 0) return;
+    const ColModel hospOriginal = app.cols["hospitaland"];
+
+    // 1. the window and its two tabs
+    ModelViewer* pv = openColViewer(app.hwnd, hosp);
+    ST_CHECK(t, pv && pv->tabs && !pv->editTab, "the collision window opens on its View tab");
+    if (!pv) return;
+    ModelViewer& v = *pv;
+    ST_CHECK(t, IsWindowVisible(v.info) && !IsWindowVisible(v.ce[ID_CE_ADDBOX]), "View shows the table, not the editing buttons");
+    ceShowTab(v, true);
+    viewerLayout(v);
+    ST_CHECK(t, !IsWindowVisible(v.info) && IsWindowVisible(v.ce[ID_CE_ADDBOX]) && IsWindowVisible(v.ce[ID_CE_SAVE]), "Edit shows the editing buttons");
+    drawViewer(v);
+    stColInvariants(t, v, "opened");
+    const std::vector<unsigned char> start = stce::bytes(v.col);
+    ST_CHECK(t, !v.dirty && v.undo.empty(), "nothing is unsaved at first");
+
+    // 2. a box: add, pull, push, refused push, typed size
+    const size_t boxes0 = v.col.boxes.size();
+    stce::cmd(v, ID_CE_ADDBOX);
+    ST_CHECK(t, v.col.boxes.size() == boxes0 + 1 && v.selBoxes == std::set<int>{int(boxes0)} && v.selBoxFace == 5, "Add Box adds one box, selected, top side ready");
+    const ColBox added = v.col.boxes.back();
+    {
+        const ColBox expect = newBoxFor(app.cols["hospitaland"]);
+        bool same = true;
+        for (int k = 0; k < 3; ++k) same = same && added.min[k] == expect.min[k] && added.max[k] == expect.max[k];
+        ST_CHECK(t, same, "the new box fits the model's bounds");
+    }
+    stColInvariants(t, v, "add box");
+    stce::text(v, ID_CE_DIST, "1.25");
+    stce::cmd(v, ID_CE_OUT);
+    ST_CHECK(t, std::fabs(v.col.boxes.back().max[2] - (added.max[2] + 1.25f)) < 1e-4f && v.col.boxes.back().min[2] == added.min[2], "Pull out 1.25 raises the top by exactly 1.25");
+    stce::cmd(v, ID_CE_IN);
+    ST_CHECK(t, std::fabs(v.col.boxes.back().max[2] - added.max[2]) < 1e-4f, "Push in 1.25 lowers it back");
+    const size_t undoBefore = v.undo.size();
+    stce::text(v, ID_CE_DIST, "100000");
+    v.lastMessage.clear();
+    stce::cmd(v, ID_CE_IN);
+    ST_CHECK(t, !v.lastMessage.empty() && v.undo.size() == undoBefore && std::fabs(v.col.boxes.back().max[2] - added.max[2]) < 1e-4f, "pushing through the box is refused, no change, no undo step");
+    for (const char* bad : {"", "0", "-1", "abc", "1e400", "nan"}) {
+        v.lastMessage.clear();
+        stce::text(v, ID_CE_DIST, bad);
+        stce::cmd(v, ID_CE_OUT);
+        ST_CHECK(t, !v.lastMessage.empty() && v.undo.size() == undoBefore, std::string("the distance '") + bad + "' is refused");
+    }
+    stce::text(v, ID_CE_DIST, "0.5");
+    stColInvariants(t, v, "box push / pull");
+    // typed size
+    const std::string fieldsShown = stce::read(v.ce[ID_CE_F5]);
+    ST_CHECK(t, fieldsShown == num(v.col.boxes.back().max[2], 3), "the selected box's numbers are shown");
+    const char* typed[6] = {"-1", "-2", "-3", "4", "5", "6.5"};
+    for (int k = 0; k < 6; ++k) stce::text(v, ID_CE_F0 + k, typed[k]);
+    stce::cmd(v, ID_CE_APPLY);
+    ST_CHECK(t, v.col.boxes.back().min[0] == -1 && v.col.boxes.back().min[2] == -3 && v.col.boxes.back().max[2] == 6.5f, "Apply sets the typed size exactly");
+    for (const auto& bad : std::vector<std::pair<int, std::string>>{{0, "abc"}, {1, ""}, {2, "1e400"}, {3, "-1"}, {5, "-2.99"}}) {
+        const auto before = stce::bytes(v.col);
+        v.lastMessage.clear();
+        stce::text(v, ID_CE_F0 + bad.first, bad.second);
+        stce::cmd(v, ID_CE_APPLY);
+        ST_CHECK(t, !v.lastMessage.empty() && stce::bytes(v.col) == before, "typed '" + bad.second + "' is refused, no change");
+        v.shownShapeKey.clear();
+        ceRefresh(v);
+    }
+    stColInvariants(t, v, "typed size");
+
+    // 3. a sphere: add, grow, refused shrink, typed size
+    stce::cmd(v, ID_CE_ADDSPHERE);
+    ST_CHECK(t, v.selSpheres.size() == 1 && v.selBoxes.empty(), "Add Sphere selects the new sphere");
+    const float r0 = v.col.spheres.back().radius;
+    stce::text(v, ID_CE_DIST, "0.5");
+    stce::cmd(v, ID_CE_OUT);
+    ST_CHECK(t, std::fabs(v.col.spheres.back().radius - (r0 + 0.5f)) < 1e-4f, "Pull out grows the sphere");
+    stce::text(v, ID_CE_DIST, "100000");
+    v.lastMessage.clear();
+    stce::cmd(v, ID_CE_IN);
+    ST_CHECK(t, !v.lastMessage.empty() && std::fabs(v.col.spheres.back().radius - (r0 + 0.5f)) < 1e-4f, "shrinking it to nothing is refused");
+    for (int k = 0; k < 4; ++k) stce::text(v, ID_CE_F0 + k, k == 3 ? "2.5" : std::to_string(k + 1));
+    stce::cmd(v, ID_CE_APPLY);
+    ST_CHECK(t, v.col.spheres.back().center[1] == 2 && v.col.spheres.back().radius == 2.5f, "Apply sets the sphere's centre and radius");
+    stColInvariants(t, v, "sphere");
+
+    // 4. move, material
+    v.selBoxes = {int(v.col.boxes.size()) - 1};
+    v.selBoxFace = -1;
+    ceRefresh(v);
+    const ColBox mb = v.col.boxes.back();
+    const ColSphere ms = v.col.spheres.back();
+    stce::text(v, ID_CE_MX, "1.5");
+    stce::text(v, ID_CE_MY, "");
+    stce::text(v, ID_CE_MZ, "-2");
+    stce::cmd(v, ID_CE_MOVE);
+    ST_CHECK(t, v.col.boxes.back().min[0] == mb.min[0] + 1.5f && v.col.boxes.back().max[2] == mb.max[2] - 2 && v.col.spheres.back().center[0] == ms.center[0] + 1.5f &&
+                    v.col.spheres.back().center[1] == ms.center[1],
+             "Move shifts the box and the sphere by exactly X 1.5, Y 0 (empty), Z -2");
+    v.lastMessage.clear();
+    stce::text(v, ID_CE_MX, "x");
+    const auto beforeMove = stce::bytes(v.col);
+    stce::cmd(v, ID_CE_MOVE);
+    ST_CHECK(t, !v.lastMessage.empty() && stce::bytes(v.col) == beforeMove, "a move that is not a number is refused");
+    stce::text(v, ID_CE_MX, "0");
+    SendMessageA(v.ce[ID_CE_MAT], CB_SETCURSEL, 17, 0);
+    stce::cmd(v, ID_CE_MAT, CBN_SELCHANGE);
+    ST_CHECK(t, v.col.boxes.back().surface.material == 17 && v.col.spheres.back().surface.material == 17, "the material list sets the selection's material");
+    ceClearSelection(v);
+    ceRefresh(v);
+    SendMessageA(v.ce[ID_CE_MAT], CB_SETCURSEL, 4, 0);
+    const auto beforeMat = stce::bytes(v.col);
+    stce::cmd(v, ID_CE_MAT, CBN_SELCHANGE);
+    ST_CHECK(t, v.newMaterial == 4 && stce::bytes(v.col) == beforeMat, "with nothing selected it sets the material of new shapes");
+    stce::cmd(v, ID_CE_ADDBOX);
+    ST_CHECK(t, v.col.boxes.back().surface.material == 4, "the next box gets it");
+    stColInvariants(t, v, "move and material");
+
+    // 5. undo everything, redo everything
+    std::vector<std::vector<unsigned char>> states;
+    while (!v.undo.empty()) {
+        states.push_back(stce::bytes(v.col));
+        stce::cmd(v, ID_CE_UNDO);
+    }
+    ST_CHECK(t, stce::bytes(v.col) == start && !v.dirty, "undoing every step gives back the record as opened, nothing unsaved");
+    for (auto it = states.rbegin(); it != states.rend(); ++it) {
+        stce::cmd(v, ID_CE_REDO);
+        ST_CHECK(t, stce::bytes(v.col) == *it, "redo gives back each step exactly");
+    }
+    while (!v.undo.empty()) stce::cmd(v, ID_CE_UNDO);
+    stColInvariants(t, v, "undo and redo");
+
+    // 6. the mesh: clicks select the face under the mouse, double-click the flat side, Shift adds, Ctrl+drag a rectangle
+    drawViewer(v);
+    int clicks = 0;
+    for (size_t i = 0; i < v.col.faces.size() && clicks < 25; i += 3) {
+        const ColFace& f = v.col.faces[i];
+        float p[3];
+        for (int k = 0; k < 3; ++k) p[k] = (v.col.vertices[f.a * 3 + k] + v.col.vertices[f.b * 3 + k] + v.col.vertices[f.c * 3 + k]) / 3;
+        int x, y;
+        if (!stce::screenOf(v, p, x, y)) continue;
+        stce::click(v, x, y);
+        float o[3], d[3];
+        ceRay(v, x, y, o, d);
+        // the nearest shape along the ray, worked out independently: the selection must be a face the ray hits, and nothing nearer
+        double best = 1e30;
+        for (size_t j = 0; j < v.col.faces.size(); ++j) {
+            const ColFace& g = v.col.faces[j];
+            double tt;
+            if (stRayTri(o, d, &v.col.vertices[g.a * 3], &v.col.vertices[g.b * 3], &v.col.vertices[g.c * 3], tt)) best = std::min(best, tt);
+        }
+        if (v.selFaces.size() == 1) {
+            const ColFace& g = v.col.faces[*v.selFaces.begin()];
+            double tt = 0;
+            const bool hit = stRayTri(o, d, &v.col.vertices[g.a * 3], &v.col.vertices[g.b * 3], &v.col.vertices[g.c * 3], tt);
+            ST_CHECK(t, hit && tt <= best + 1e-3 * std::max(1.0, best), "a click selects the nearest face under the mouse (face " + std::to_string(i) + ")");
+        } else if (best < 1e30) {  // the ray through the rounded pixel hits a face (a sliver's middle can fall beside it)
+            ST_CHECK(t, !v.selBoxes.empty() || !v.selSpheres.empty(), "a click on a face selects something (face " + std::to_string(i) + ")");
+        }
+        ++clicks;
+    }
+    ST_CHECK(t, clicks >= 10, "enough faces were clicked: " + std::to_string(clicks));
+    stColInvariants(t, v, "clicks");
+    stce::click(v, 1, 1);
+    ST_CHECK(t, !ceHasSelection(v), "a click on empty space clears the selection");
+    // Shift adds and removes
+    if (v.col.faces.size() > 10) {
+        size_t a = SIZE_MAX, b = SIZE_MAX;
+        int ax = 0, ay = 0, bx = 0, by = 0;
+        for (size_t i = 0; i < v.col.faces.size() && b == SIZE_MAX; ++i) {
+            const ColFace& f = v.col.faces[i];
+            float p[3];
+            for (int k = 0; k < 3; ++k) p[k] = (v.col.vertices[f.a * 3 + k] + v.col.vertices[f.b * 3 + k] + v.col.vertices[f.c * 3 + k]) / 3;
+            int x, y;
+            if (!stce::screenOf(v, p, x, y)) continue;
+            stce::click(v, x, y);
+            if (v.selFaces.size() != 1) continue;
+            if (a == SIZE_MAX) { a = *v.selFaces.begin(); ax = x; ay = y; }
+            else if (*v.selFaces.begin() != a) { b = *v.selFaces.begin(); bx = x; by = y; }
+        }
+        if (b != SIZE_MAX) {
+            stce::click(v, ax, ay);
+            stce::click(v, bx, by, MK_SHIFT);
+            ST_CHECK(t, v.selFaces == std::set<size_t>({a, b}), "Shift+click adds a face");
+            stce::click(v, bx, by, MK_SHIFT);
+            ST_CHECK(t, v.selFaces == std::set<size_t>({a}), "Shift+click on a selected face removes it");
+            stce::mouse(v, WM_LBUTTONDBLCLK, ax, ay, MK_LBUTTON);
+            stce::mouse(v, WM_LBUTTONUP, ax, ay, 0);
+            ST_CHECK(t, v.selFaces == coplanarNeighbours(v.col, a), "double-click selects the whole flat side");
+        }
+    }
+    // Ctrl+drag over the whole view: every face, box and sphere whose points are all in view
+    stce::drag(v, 1, 1, v.vp[2] - 2, v.vp[3] - 2, MK_CONTROL);
+    {
+        size_t expect = 0;
+        for (const ColFace& f : v.col.faces) {
+            bool in = true;
+            for (uint32_t k : {f.a, f.b, f.c}) {
+                int x, y;
+                in = in && stce::screenOf(v, &v.col.vertices[k * 3], x, y);
+            }
+            expect += in;
+        }
+        ST_CHECK(t, v.selFaces.size() >= expect && v.selFaces.size() > 0, "Ctrl+drag over the view selects the faces in it (" + std::to_string(v.selFaces.size()) + ")");
+    }
+    stce::drag(v, 2, 2, 6, 6, MK_CONTROL);
+    ST_CHECK(t, !ceHasSelection(v), "a rectangle over empty space selects nothing");
+    stce::cmd(v, ID_CE_SELALL);
+    ST_CHECK(t, v.selFaces.size() == v.col.faces.size(), "Select all faces");
+    stColInvariants(t, v, "selection");
+
+    // 7. delete faces, open edges, undo
+    {
+        std::set<size_t> some;
+        for (size_t i = 0; i < v.col.faces.size(); i += 4) some.insert(i);
+        v.selFaces = some;
+        v.selBoxes.clear();
+        ceRefresh(v);
+        const auto before = stce::bytes(v.col);
+        const size_t n = v.col.faces.size();
+        SendMessageA(v.gl, WM_KEYDOWN, VK_DELETE, 0);
+        ST_CHECK(t, v.col.faces.size() == n - some.size() && !ceHasSelection(v), "Del removes the selected faces");
+        ST_CHECK(t, ceOpenEdges(v) == openEdges(v.col), "the red open edges follow the change");
+        stce::cmd(v, ID_CE_UNDO);
+        ST_CHECK(t, stce::bytes(v.col) == before, "undo brings them back exactly");
+    }
+    stColInvariants(t, v, "delete faces");
+
+    // 8. dragging a selected box's side and a selected mesh face pushes / pulls them; letting go where it started changes nothing
+    stce::cmd(v, ID_CE_ADDBOX);
+    drawViewer(v);
+    {
+        ColBox& b = v.col.boxes.back();
+        bool dragged = false;
+        for (int face : {5, 1, 0, 3, 2}) {
+            float p[3];
+            for (int k = 0; k < 3; ++k) p[k] = (b.min[k] + b.max[k]) / 2;
+            p[face / 2] = face % 2 ? b.max[face / 2] : b.min[face / 2];
+            int x, y;
+            if (!stce::screenOf(v, p, x, y)) continue;
+            float o[3], d[3];
+            ceRay(v, x, y, o, d);
+            const ColHit h = pickCol(v.col, o, d);
+            if (h.kind != ColHit::Box || h.index != int(v.col.boxes.size()) - 1 || h.boxFace != face) continue;
+            v.selBoxes = {h.index};
+            v.selBoxFace = face;
+            ceRefresh(v);
+            const ColBox before = v.col.boxes.back();
+            const size_t undos = v.undo.size();
+            stce::drag(v, x, y, x + 25, y - 35);
+            const ColBox after = v.col.boxes.back();
+            bool onlyThatSide = true;
+            for (int k = 0; k < 3; ++k) {
+                if (k == face / 2) continue;
+                onlyThatSide = onlyThatSide && after.min[k] == before.min[k] && after.max[k] == before.max[k];
+            }
+            const float moved = face % 2 ? after.max[face / 2] - before.max[face / 2] : before.min[face / 2] - after.min[face / 2];
+            ST_CHECK(t, onlyThatSide && (face % 2 ? after.min[face / 2] == before.min[face / 2] : after.max[face / 2] == before.max[face / 2]), "a drag moves only the side that was grabbed");
+            ST_CHECK(t, moved != 0 && v.undo.size() == undos + 1, "a drag moves it and is one undo step");
+            ST_CHECK(t, std::fabs(moved * 100 - std::round(moved * 100)) < 1e-2, "a drag moves in hundredths");
+            const size_t undos2 = v.undo.size();
+            const auto before2 = stce::bytes(v.col);
+            drawViewer(v);
+            int x2, y2;
+            float q[3];
+            for (int k = 0; k < 3; ++k) q[k] = (after.min[k] + after.max[k]) / 2;
+            q[face / 2] = face % 2 ? after.max[face / 2] : after.min[face / 2];
+            if (stce::screenOf(v, q, x2, y2)) {
+                stce::mouse(v, WM_LBUTTONDOWN, x2, y2, MK_LBUTTON);
+                stce::mouse(v, WM_MOUSEMOVE, x2 + 20, y2 + 20, MK_LBUTTON);
+                stce::mouse(v, WM_MOUSEMOVE, x2, y2, MK_LBUTTON);
+                stce::mouse(v, WM_LBUTTONUP, x2, y2, 0);
+                ST_CHECK(t, v.undo.size() == undos2 && stce::bytes(v.col) == before2, "a drag that ends where it started changes nothing and adds no undo step");
+            }
+            dragged = true;
+            break;
+        }
+        ST_CHECK(t, dragged, "a side of the new box could be grabbed");
+    }
+    stColInvariants(t, v, "drag");
+
+    // 9. Save: a copy into the user's own region file of the same level, gta3.dat lists it once, Rockstar's file untouched
+    const std::string region = "stce" + std::to_string(GetCurrentProcessId() % 100000);
+    std::string rel, err;
+    ST_CHECK(t, createRegionNamed(region, rel, err), "a region for the test");
+    const std::string datWithRegion = slurp(datPath, ok);  // put back at the end (the region itself stays, as other sections' do)
+    ceFillRegions(v, region);
+    ceRefresh(v);
+    const std::string rockstarFile = app.root + "/" + v.colSource;
+    const std::string rockstarBytes = slurp(rockstarFile, ok);
+    bool dat2ok = false;
+    const int level = colFileLevel(slurp(datPath, dat2ok), v.colSource);
+    const ColSaveTarget target = colSaveTarget(region, level);
+    ST_CHECK(t, level >= 1 && stce::read(v.ce[ID_CE_STATUS]).find(target.relPath) != std::string::npos, "the status names the file Save will write");
+    ST_CHECK(t, IsWindowEnabled(v.ce[ID_CE_SAVE]) && v.dirty, "Save is on when something is unsaved");
+    stce::cmd(v, ID_CE_SAVE);
+    const std::string own = app.root + "/" + target.relPath;
+    std::vector<ColModel> saved;
+    {
+        const std::string sb = slurp(own, ok);
+        ST_CHECK(t, ok && parseCol(std::vector<unsigned char>(sb.begin(), sb.end()), saved, err) && saved.size() == 1 && writeColl(saved[0]) == writeColl(v.col),
+                 "Save writes the record into " + target.relPath);
+    }
+    ST_CHECK(t, !v.dirty && !IsWindowEnabled(v.ce[ID_CE_SAVE]) && v.colSource == target.relPath, "after Save nothing is unsaved and the window shows the own file");
+    ST_CHECK(t, slurp(rockstarFile, ok) == rockstarBytes, "Rockstar's file is not changed");
+    {
+        const std::string dat = slurp(datPath, ok);
+        size_t n = 0;
+        for (size_t p = dat.find(target.datLine); p != std::string::npos; p = dat.find(target.datLine, p + 1)) ++n;
+        ST_CHECK(t, n == 1 && dat.find(target.datLine) > dat.rfind("COLFILE " + std::to_string(level) + " DATA" + std::string(1, char(92)) + "MAPS" + std::string(1, char(92)) + "INDUSTSE"),
+                 "gta3.dat lists the file once, after Rockstar's");
+        ST_CHECK(t, colFileLevel(dat, target.relPath) == level, "with Rockstar's level");
+    }
+    ST_CHECK(t, writeColl(app.cols["hospitaland"]) == writeColl(v.col), "the editor uses the saved collision at once");
+    // a second change saved again: the same file, still one gta3.dat line, one record
+    stce::cmd(v, ID_CE_ADDSPHERE);
+    stce::cmd(v, ID_CE_SAVE);
+    {
+        const std::string sb = slurp(own, ok);
+        saved.clear();
+        ST_CHECK(t, parseCol(std::vector<unsigned char>(sb.begin(), sb.end()), saved, err) && saved.size() == 1 && saved[0].spheres.size() == v.col.spheres.size(),
+                 "saving again replaces the record in the own file");
+        const std::string dat = slurp(datPath, ok);
+        ST_CHECK(t, dat.find(target.datLine) == dat.rfind(target.datLine), "still one gta3.dat line");
+    }
+    // closed and opened again: the saved copy is what is shown (the last file wins, as in the game)
+    const auto savedBytes = stce::bytes(v.col);
+    SendMessageA(v.wnd, WM_CLOSE, 0, 0);
+    updateViewers();
+    ModelViewer* again = openColViewer(app.hwnd, hosp);
+    ST_CHECK(t, again && stce::bytes(again->col) == savedBytes && ceLowerSlashes(again->colSource).find(ceLowerSlashes(target.relPath)) != std::string::npos,
+             "opened again it shows the saved copy from the own file");
+    if (again) {
+        ceShowTab(*again, true);
+        stce::cmd(*again, ID_CE_ADDBOX);
+        ST_CHECK(t, again->dirty, "an edit");
+        SendMessageA(again->wnd, WM_CLOSE, 0, 0);  // quiet: unsaved edits are dropped
+        updateViewers();
+        ST_CHECK(t, std::none_of(viewers.begin(), viewers.end(), [&](const std::unique_ptr<ModelViewer>& x) { return x.get() == again; }), "closing with unsaved edits closes (the test drops them)");
+        ST_CHECK(t, stce::bytes(app.cols["hospitaland"]) == savedBytes, "unsaved edits never reach the map");
+    }
+
+    // 10. a loose .col with two models: edit the second, the first stays byte for byte, a backup is kept, picking is guarded
+    char tmp[MAX_PATH];
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string loose = std::string(tmp) + "med_selftest_col_" + std::to_string(GetCurrentProcessId()) + ".col";
+    {
+        ColModel a = hospOriginal, b = hospOriginal;
+        a.name = "first";
+        a.nameField.clear();
+        b.name = "second";
+        b.nameField.clear();
+        std::vector<unsigned char> f = writeColl(a), g = writeColl(b);
+        f.insert(f.end(), g.begin(), g.end());
+        std::ofstream(loose, std::ios::binary).write((const char*)f.data(), std::streamsize(f.size()));
+    }
+    const std::string looseBefore = slurp(loose, ok);
+    ST_CHECK(t, openLooseFile(app.hwnd, loose), "the loose .col opens");
+    ModelViewer* lv = viewers.empty() ? nullptr : viewers.back().get();
+    if (lv && lv->kind == 1 && lv->objectBox) {
+        ceShowTab(*lv, true);
+        SendMessageA(lv->objectBox, CB_SETCURSEL, 1, 0);
+        SendMessageA(lv->wnd, WM_COMMAND, MAKEWPARAM(ID_MV_OBJECT, CBN_SELCHANGE), (LPARAM)lv->objectBox);
+        ST_CHECK(t, lv->col.name == "second", "Model in file picks the second model");
+        stce::cmd(*lv, ID_CE_ADDBOX);
+        lv->lastMessage.clear();
+        SendMessageA(lv->objectBox, CB_SETCURSEL, 0, 0);
+        SendMessageA(lv->wnd, WM_COMMAND, MAKEWPARAM(ID_MV_OBJECT, CBN_SELCHANGE), (LPARAM)lv->objectBox);
+        ST_CHECK(t, lv->col.name == "second" && !lv->lastMessage.empty() && SendMessageA(lv->objectBox, CB_GETCURSEL, 0, 0) == 1, "picking another model with unsaved edits is refused");
+        ST_CHECK(t, stce::read(lv->ce[ID_CE_STATUS]).find("back into") != std::string::npos, "the status says Save writes back into the file");
+        stce::cmd(*lv, ID_CE_SAVE);
+        std::vector<ColModel> back;
+        const std::string after = slurp(loose, ok);
+        ST_CHECK(t, parseCol(std::vector<unsigned char>(after.begin(), after.end()), back, err) && back.size() == 2 && back[1].boxes.size() == lv->col.boxes.size(),
+                 "Save writes the second model back into the file");
+        ST_CHECK(t, after.compare(0, size_t(back[0].fileSize), looseBefore, 0, size_t(back[0].fileSize)) == 0, "the first model is unchanged byte for byte");
+        ST_CHECK(t, slurp(loose + ".med-backup", ok) == looseBefore, "the file's original is kept as .med-backup");
+        ST_CHECK(t, !IsWindowEnabled(lv->ce[ID_CE_REGION]), "no region choice for a loose file");
+        SendMessageA(lv->wnd, WM_CLOSE, 0, 0);
+        updateViewers();
+    } else {
+        ST_CHECK(t, false, "the loose .col window has a Model in file list");
+    }
+    fs::remove(loose, ec);
+    fs::remove(loose + ".med-backup", ec);
+
+    // 11. random steps with every action, checking everything after each
+    ModelViewer* rv = openColViewer(app.hwnd, hosp);
+    ST_CHECK(t, rv != nullptr, "the collision window opens again for the random steps (" + insp.lastMessage + ")");
+    if (rv) {
+        ModelViewer& r = *rv;
+        ceShowTab(r, true);
+        viewerLayout(r);
+        drawViewer(r);
+        unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;
+        auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return n <= 0 ? 0 : int((seed >> 8) % unsigned(n)); };
+        const int steps = std::max(300, (std::getenv("MED_SELFTEST_STEPS") ? std::atoi(std::getenv("MED_SELFTEST_STEPS")) : 1500) / 2);
+        const char* dists[] = {"0.5", "0.01", "2", "abc", "", "-1", "0.25", "7"};
+        const char* nums[] = {"0", "1", "-1.5", "0.25", "x", "", "3"};
+        int changed[17] = {};
+        for (int step = 0; step < steps; ++step) {
+            const int op = rnd(17);
+            std::string what;
+            const auto beforeBytes = stce::bytes(r.col);
+            const size_t undoN = r.undo.size();
+            switch (op) {
+                case 0: what = "add box"; if (r.col.boxes.size() < 12) stce::cmd(r, ID_CE_ADDBOX); break;
+                case 1: what = "add sphere"; if (r.col.spheres.size() < 12) stce::cmd(r, ID_CE_ADDSPHERE); break;
+                case 2: what = "click"; stce::click(r, rnd(r.vp[2]), rnd(r.vp[3]), rnd(3) == 0 ? MK_SHIFT : 0); break;
+                case 3: what = "double-click"; { const int x = rnd(r.vp[2]), y = rnd(r.vp[3]); stce::mouse(r, WM_LBUTTONDBLCLK, x, y, MK_LBUTTON); stce::mouse(r, WM_LBUTTONUP, x, y, 0); } break;
+                case 4: what = "rectangle"; stce::drag(r, rnd(r.vp[2]), rnd(r.vp[3]), rnd(r.vp[2]), rnd(r.vp[3]), MK_CONTROL | (rnd(2) ? MK_SHIFT : 0)); break;
+                case 5: what = "drag"; {
+                    int x = rnd(r.vp[2]), y = rnd(r.vp[3]);
+                    float p[3];
+                    bool grab = false;  // mostly grab the selection where it is on screen, as a user would
+                    if (rnd(4) != 0) {
+                        if (!r.selFaces.empty()) {
+                            auto it = r.selFaces.begin();
+                            std::advance(it, rnd(int(r.selFaces.size())));
+                            const ColFace& f = r.col.faces[*it];
+                            for (int k = 0; k < 3; ++k) p[k] = (r.col.vertices[f.a * 3 + k] + r.col.vertices[f.b * 3 + k] + r.col.vertices[f.c * 3 + k]) / 3;
+                            grab = true;
+                        } else if (r.selBoxes.size() == 1 && r.selBoxFace >= 0) {
+                            const ColBox& b = r.col.boxes[size_t(*r.selBoxes.begin())];
+                            for (int k = 0; k < 3; ++k) p[k] = (b.min[k] + b.max[k]) / 2;
+                            p[r.selBoxFace / 2] = r.selBoxFace % 2 ? b.max[r.selBoxFace / 2] : b.min[r.selBoxFace / 2];
+                            grab = true;
+                        } else if (r.selSpheres.size() == 1) {
+                            const ColSphere& sp = r.col.spheres[size_t(*r.selSpheres.begin())];
+                            for (int k = 0; k < 3; ++k) p[k] = sp.center[k];
+                            p[2] += sp.radius * 0.7f;
+                            grab = true;
+                        }
+                    }
+                    if (grab) stce::screenOf(r, p, x, y);
+                    stce::drag(r, x, y, x + rnd(81) - 40, y + rnd(81) - 40, rnd(2) ? MK_SHIFT : 0);
+                } break;
+                case 6: what = "pull out"; stce::text(r, ID_CE_DIST, dists[rnd(8)]); stce::cmd(r, ID_CE_OUT); break;
+                case 7: what = "push in"; stce::text(r, ID_CE_DIST, dists[rnd(8)]); stce::cmd(r, ID_CE_IN); break;
+                case 8: what = "move";
+                    stce::text(r, ID_CE_MX, nums[rnd(7)]); stce::text(r, ID_CE_MY, nums[rnd(7)]); stce::text(r, ID_CE_MZ, nums[rnd(7)]);
+                    stce::cmd(r, ID_CE_MOVE); break;
+                case 9: what = "material"; SendMessageA(r.ce[ID_CE_MAT], CB_SETCURSEL, WPARAM(rnd(kColMaterialCount)), 0); stce::cmd(r, ID_CE_MAT, CBN_SELCHANGE); break;
+                case 10: what = "delete"; if (rnd(3) == 0) SendMessageA(r.gl, WM_KEYDOWN, VK_DELETE, 0); break;
+                case 11: what = "undo"; stce::cmd(r, ID_CE_UNDO); break;
+                case 12: what = "redo"; stce::cmd(r, ID_CE_REDO); break;
+                case 13: what = "select side"; stce::cmd(r, ID_CE_SELSIDE); break;
+                case 14: what = "select all"; if (rnd(3) == 0) stce::cmd(r, ID_CE_SELALL); break;
+                case 15: what = "typed size"; for (int k = 0; k < 6; ++k) if (rnd(2)) stce::text(r, ID_CE_F0 + k, nums[rnd(7)]); stce::cmd(r, ID_CE_APPLY); break;
+                case 16: what = "clear selection"; stce::cmd(r, ID_CE_SELNONE); break;
+            }
+            drawViewer(r);
+            stColInvariants(t, r, "random step " + std::to_string(step) + " (" + what + ")");
+            // every change is one undo step that gives back exactly what was there
+            if (stce::bytes(r.col) != beforeBytes) ++changed[op];
+            if (stce::bytes(r.col) != beforeBytes && op != 11 && op != 12) {
+                ST_CHECK(t, r.undo.size() == std::min<size_t>(undoN + 1, 50) && (r.undo.size() < 50 ? stce::bytes(r.undo.back()) == beforeBytes : true),
+                         "random step " + std::to_string(step) + " (" + what + "): one undo step holding the shape before");
+            }
+        }
+        std::printf("collision editor: %d random steps; changes by add box %d, add sphere %d, drag %d, pull %d, push %d, move %d, material %d, delete %d, undo %d, "
+                    "redo %d, typed size %d\n",
+                    steps, changed[0], changed[1], changed[5], changed[6], changed[7], changed[8], changed[9], changed[10], changed[11], changed[12], changed[15]);
+        while (!r.undo.empty()) stce::cmd(r, ID_CE_UNDO);
+        SendMessageA(r.wnd, WM_CLOSE, 0, 0);
+        updateViewers();
+    }
+
+    // put everything back: gta3.dat, the region's files, the editor's collision table
+    {
+        std::ofstream(datPath, std::ios::binary | std::ios::trunc).write(datWithRegion.data(), std::streamsize(datWithRegion.size()));
+    }
+    fs::remove(app.root + "/" + target.relPath, ec);
+    (void)datBefore;
+    app.cols["hospitaland"] = hospOriginal;
+    app.colFiles = colFilesBefore;
+    ST_CHECK(t, app.cols.size() == colsBefore, "the editor's collision table is back");
+    ST_CHECK(t, stMapState() == mapBefore, "editing collision changes no placement");
+    ceQuiet = false;
+}
+
 void runBookmarksSelfTest(SelfTest& t) {
     const std::string realFile = app.bookmarkFile;
     const std::vector<Bookmark> realList = app.bookmarks;
@@ -8192,8 +9891,9 @@ void runBookmarksSelfTest(SelfTest& t) {
 int runPlacementsSelfTest() {
     SelfTest t;
     std::printf("Placements tab self-test on %s (%zu placements, %zu regions)\n", app.root.c_str(), app.instances.size(), regions.size());
-    if (const char* only = std::getenv("MED_SELFTEST_ONLY"); only && std::string(only) == "import") {  // just one section, for quick runs
-        runImportSelfTest(t);
+    if (const char* only = std::getenv("MED_SELFTEST_ONLY"); only && (std::string(only) == "import" || std::string(only) == "coledit")) {  // one section, for quick runs
+        if (std::string(only) == "import") runImportSelfTest(t);
+        else runColEditSelfTest(t);
         std::printf("self-test: %d checks, %d failures\n", t.checks, t.failures);
         std::fflush(stdout);
         return t.failures == 0 ? 0 : 1;
@@ -8445,6 +10145,8 @@ int runPlacementsSelfTest() {
     runLooseFileSelfTest(t);
     // Import Model (real imports into the test's game copy, put back afterwards)
     runImportSelfTest(t);
+    // the collision editor (saves into a region it makes, put back afterwards)
+    runColEditSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -8808,6 +10510,7 @@ int main(int argc, char** argv) {
     std::string onlyRegions;
     int benchmark = 0;
     std::string selectModel, pickTestModel, openDffAtStart, openColAtStart, openTxdAtStart;
+    bool colEditAtStart = false;  // --col-edit: the collision window opened by --open-col starts on its Edit tab
     std::vector<std::string> openFilesAtStart;  // --open-file path (repeatable): loose files in the viewers
     bool addedOnly = false;
     double moveBy[3] = {0, 0, 0};
@@ -8838,6 +10541,7 @@ int main(int argc, char** argv) {
         else if (a == "--added-only") addedOnly = true;
         else if (a == "--open-dff" && i + 1 < argc) openDffAtStart = argv[++i];
         else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
+        else if (a == "--col-edit") colEditAtStart = true;
         else if (a == "--open-txd" && i + 1 < argc) openTxdAtStart = argv[++i];
         else if (a == "--open-file" && i + 1 < argc) openFilesAtStart.push_back(argv[++i]);
         else if (a == "--import-window" && i + 1 < argc) importAtStart = argv[++i];
@@ -9211,7 +10915,11 @@ int main(int argc, char** argv) {
     if (!importAtStart.empty()) PostMessageA(app.hwnd, WM_COMMAND, ID_TB_IMPORT, 0);  // opened from the message loop (the window is modal)
     if (!openColAtStart.empty())  // tests: open Collision Object Properties for this model
         for (const auto& kv : app.defs)
-            if (kv.second.model == toLower(openColAtStart)) { openColViewer(app.hwnd, kv.first); break; }
+            if (kv.second.model == toLower(openColAtStart)) {
+                ModelViewer* cv = openColViewer(app.hwnd, kv.first);
+                if (cv && colEditAtStart) { ceShowTab(*cv, true); viewerLayout(*cv); }
+                break;
+            }
     if (!openDffAtStart.empty())  // tests: open DFF Properties for this model
         for (const auto& kv : app.defs)
             if (kv.second.model == toLower(openDffAtStart)) { openDffViewer(app.hwnd, kv.first); break; }

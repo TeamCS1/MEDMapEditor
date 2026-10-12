@@ -86,10 +86,10 @@ int main() {
     CHECK(r.written.size() == 4);
     CHECK(readAll(root / "out/box/box.dff") == padded(dff));         // byte for byte
     CHECK(readAll(root / "out/box/boxtex.txd") == padded(txd));
-    CHECK(readAll(root / "out/box/box.col") == boxRec);      // exactly the record from the FIRST file
+    CHECK(readAll(root / "out/box/box.col") == colB);      // exactly the record from the LAST file (the game's choice)
     std::vector<ColModel> back;
     CHECK(parseCol(readAll(root / "out/box/box.col"), back, err) && back.size() == 1 && back[0].name == "box");  // a valid one-model COL file
-    CHECK(r.colSource == req.colFiles[0]);
+    CHECK(r.colSource == req.colFiles[1]);
     CHECK(r.warnings.size() == 1 && r.warnings[0].find("2 COL files") == 0);  // the second copy is mentioned
     {
         const std::vector<unsigned char> info = readAll(root / "out/box/box.txt");

@@ -215,6 +215,45 @@ The rules it checks:
 
 Afterwards a message lists the files that changed, and the model is in the **Item** tab straight away, ready to place with **Add to map** like any other (it takes a Building slot). Tested on a copy of GTA III: imported models load on the next start, are drawn with their textures, and Check Map reports no problem with them. Not tested yet in the game itself.
 
+### Editing collision (the Edit tab)
+
+Collision is what the game treats as solid: you walk on it, cars hit it. Open a model's collision (Item tab **View Collision**, right-click an object > **Collision Properties...**, or a `.col` file from disk) and click the **Edit** tab. The model itself is shown as a faint grey outline, so you can build the collision around it (**Show the model's outline**).
+
+**Selecting** (in the 3D view):
+
+| Do this | Selects |
+|---|---|
+| Click | the box, sphere or mesh face under the mouse (a box remembers which side you clicked) |
+| Shift + click | adds it, or removes it again |
+| Double-click a mesh face | its whole flat side (all the joined triangles in the same plane) |
+| Ctrl + drag | everything inside the rectangle |
+| Click empty space, or Esc | nothing |
+
+Right-drag still turns the view and a left-drag on empty space still moves it, as on the View tab.
+
+**Changing it:**
+
+- **Push / pull** (as in SketchUp): drag a selected face, box side or sphere towards you or away. It moves in steps of 0.01 (hold Shift for 0.1). Or type a distance and press **Pull out** / **Push in**.
+  - A **box side** moves on its own, so the box gets longer or shorter. A box is never made thinner than 0.05.
+  - **Mesh faces** move along their direction. Sides that run along that direction stretch with them (pulling the top of a box-shaped mesh makes it taller). Elsewhere, new side walls join the moved faces to the rest, so the mesh stays closed.
+  - A **sphere** gets bigger or smaller.
+- **Add Box / Add Sphere**: a new box or sphere around the model, already selected. For a bin or a dumpster, one box is usually all it needs: Add Box, then pull its sides to fit.
+- **Move** shifts the selection by the X, Y, Z you type. **Apply typed size** sets the exact Min / Max of one selected box, or the centre and radius of one sphere.
+- **Delete selected** (or Del) removes it. Deleting mesh faces can leave holes.
+- **Surface material**: the colour beside each number is the one MEd draws it in. It shows how many shapes of this model use each one. With nothing selected it sets the material for the next new box or sphere.
+- **Open edges** are drawn in red: edges that only one face uses, so the mesh has a hole or a border there. A building's walls should normally be closed; ground pieces have borders by nature.
+- **Undo / Redo** (Ctrl+Z / Ctrl+Y), up to 50 steps.
+
+**Saving** (Save, or Ctrl+S): Rockstar's own COL files are never changed.
+
+- **One of Rockstar's models:** a copy goes into a COL file of one of **your** regions, picked under **Save into region**. It is `data/maps/<region>/<region>_lvl1.col` for Portland (level 1), `_lvl2` for Staunton Island, `_lvl3` for Shoreside Vale, and `<region>.col` for models that are loaded everywhere (level 0). `data/gta3.dat` gets a `COLFILE` line for it after Rockstar's (backed up first).
+  - Why this works: the game loads every collision file in `gta3.dat` order, and a later record of the same model replaces the earlier one. When you cross to another island it reloads that island's level, so your copy must have the same level to stay in force. This was checked in the game's own code; it hasn't been tried in the game yet.
+  - Every placement of that model in the whole map gets the new collision.
+- **A model you imported, or one you saved before:** saved straight into your own file.
+- **A `.col` file from disk:** saved back into that file. The other models in it are kept byte for byte, and the original is kept once as `.med-backup`.
+
+Closing the window with unsaved changes asks whether to save them.
+
 ### Extract Object (copy an object's files out of the game)
 
 Right-click an object > **Extract Object...** (or **Extract Objects...** with several selected), or pick an item in the Item tab and press **Extract...**. Choose a folder; the editor remembers it for next time.
@@ -381,4 +420,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-Editing collision (next: an Edit tab beside the collision viewer, with boxes, spheres, push/pull of faces and deleting faces), changing or removing an imported model from inside the editor (for now `models/med-imports.txt` says how to undo an import), editing Rockstar's IDE files, the IMG tool, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+changing or removing an imported model from inside the editor (for now `models/med-imports.txt` says how to undo an import), editing Rockstar's IDE files, the IMG tool, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.

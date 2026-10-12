@@ -37,7 +37,7 @@ std::vector<std::string> extractTargetsThatExist(const std::string& folder, cons
 // Copy the object's files into folder/<model>/. Existing files are overwritten (ask first with extractTargetsThatExist).
 ExtractResult extractObject(const ImgArchive& img, const std::string& folder, const ExtractRequest& req);
 
-// The raw COLL record of `model` in the COL files (the first one in gta3.dat order), or false. `source` is the file.
+// The raw COLL record of `model` in the COL files (the LAST one in gta3.dat order: the game loads each record over an earlier one of the same name), or false. `source` is the file.
 bool findCollisionRecord(const std::vector<std::string>& colFiles, const std::string& model, std::vector<unsigned char>& record, std::string& source,
                          int* matches = nullptr);
 
