@@ -38,6 +38,8 @@ struct CheckInput {
     // "data/maps/industse/industse.ipl"). Files not listed here are read from disk. This lets the check run
     // on unsaved edits.
     std::map<std::string, std::string> iplText;
+    // IDE files with unsaved definition edits, the same way (lower-case game-relative path with '/').
+    std::map<std::string, std::string> ideText;
     // The pool sizes the game can really have. The editor never blocks going over the vanilla sizes; the check
     // says when a map is over them and only calls it an error when it is over these as well. Vanilla unless a
     // limit adjuster file was found.

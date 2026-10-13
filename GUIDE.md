@@ -50,7 +50,7 @@ Everything below was checked against the real GTA III files and the game's own c
 +-----------------+--------------------------------------+---------------------+
 ```
 
-- **Top row (files and checks):** **File** drops down Open..., Save All (Ctrl+S) and Save as Mod...; **Save All** is also a button of its own; **Reference** drops down Pools and Check Map (F7); **View** drops down **Show hidden regions** (see below); **Bookmarks** opens the bookmarks list. Save All is greyed out until something has changed.
+- **Top row (files and checks):** **File** drops down Open..., Save All (Ctrl+S), Save as Mod..., View a DFF / TXD / COL file..., Import Model... and **Image Archive...** (see below); **Save All** is also a button of its own; **Reference** drops down Pools and Check Map (F7); **View** drops down **Show hidden regions**, **Show traffic paths** and **Full Screen** (F11) (see below); **Bookmarks** opens the bookmarks list. Save All is greyed out until something has changed.
 - **Editor toolbar (second row):** Undo (back arrow), Redo (forward arrow), New Object..., Centre on Object, Duplicate, Delete and the LOD view toggle. Buttons are greyed out until they can do something (Undo only after an edit, Delete, Duplicate and Centre only with a selection).
 - **Left column, three tabs:** **Scene** (which regions are drawn, plus the LOD controls), **Placements** (find, list and pick placed objects) and **Item** (every object definition; see below).
 - **3D view (middle):** the map.
@@ -82,7 +82,7 @@ It starts at the first of MEd's own bookmarks (Portland Hospital).
 - Small things (traffic cones, bins) can be double-clicked a few pixels beside them: the editor looks up to about 6 pixels around the cursor for a small object that is in front of the ground or wall behind it.
 - **Shift + double-click** adds or removes objects from the selection.
 - **Double-click empty ground**, or press **Esc**, to clear the selection.
-- **Right-click** an object for its menu (Centre on Object, Extract Object..., Duplicate Object, Replace Object..., Copy, Delete options; Properties is shown greyed out because the Properties panel on the right already does that job). With several objects selected (or Shift + right-click) the menu offers Duplicate, Replace, Copy, Extract and Delete for all of them.
+- **Right-click** an object for its menu (Centre on Object, **Properties...** (its item definition: draw distance, flags, times; see "Editing an item definition"), DFF Properties, View TXD, Collision Properties, Extract Object..., Duplicate Object, Replace Object..., Copy, Delete options). With several objects selected (or Shift + right-click) the menu offers Duplicate, Replace, Copy, Extract and Delete for all of them.
 - **Move it:**
   - **Alt + left mouse button, drag** slides the selected objects over the ground.
   - **Alt + arrow keys** (or W/A/S/D) nudge them; **Alt + Ctrl + arrows** or **Alt + Page Up/Down** move them up and down.
@@ -145,7 +145,41 @@ The **Item** tab (MEd's name for it) lists every object definition from the IDE 
 - **Add to map**: puts the picked item in the region chosen in the Placements tab, in the middle of the view (like New Object, without the pop-up list).
 - **Show placements** (or double-click / Enter): opens the Placements tab with every placement of that item, in all regions.
 - **Extract...**: copies the item's files into a folder (see below).
+- **Edit Definition (draw distance, flags, times)...**: the Item Definition Entry window (see below).
 - Selecting an object in the 3D view highlights its definition here.
+
+### Full screen (View > Full Screen, or F11)
+
+The 3D view fills the whole screen, without toolbars or panels. As in MEd it asks first; answer **Yes**. While it is on you can only look around (the mouse and the movement keys work); nothing can be selected, moved or deleted. To get back: **double-click**, or press **Enter**, **Esc** or **F11**. The window comes back exactly as it was (also when it was maximised).
+
+### Editing an item definition (draw distance, flags, times)
+
+The **Item Definition Entry** window (MEd's name) changes a model's line in its IDE file. Open it with right-click on an object > **Properties...**, or in the Item tab with **Edit Definition...**.
+
+- **ID Number**, **Model Name** and **Object Count** are shown but cannot be changed here: the placements, `gta3.img` and the collision all refer to them.
+- **Texture Name**: the texture dictionary. It must exist in `gta3.img` (otherwise the change is refused). The model is redrawn with it at once.
+- **Draw distance (LOD)**: how far away the game still draws it (one box per part of the model; most have one). Decimals are kept (Rockstar uses some, such as 152.25). 0 to 10,000. Above 300 the game may treat a model as a "big building", the way it treats LOD models (the window says so).
+- **Time On / Time Off**: for objects that only appear at certain hours (street lights, lit windows). Both at 00:00 means an ordinary object; anything else makes it a time-controlled one (`tobj`). On and off cannot be the same hour (the game would never show it).
+- **Parameters**: the flags as one number, with a box per flag; ticking a box changes the number and the other way round. The boxes say what each flag does **in GTA III**: 1 normal cull, 2 no fade-in, 4 draw last (for transparency), 8 additive blending, 16 subway object, 32 ignore lighting, 64 no depth writes. MEd also offers 128 to 1024 (Vice City flags); GTA III ignores them, so the boxes say "not used by GTA III".
+- Every change applies at once (as in MEd). A box that holds something invalid shows **Not applied: ...** under the boxes and nothing changes until it is right.
+- **Undo** goes back to what the window opened with. **Save** (or Enter) keeps the change and closes; **Cancel** (or Esc, or the X) undoes and closes.
+- The IDE file is written by **Save All** (with the other changed files, the original kept once as `<file>.med-backup`) or **Save as Mod...**. Until then the title shows `*` and the editor's title says UNSAVED. Putting a value back to what it was makes the file unchanged again.
+- **Add to Map**, **DFF Properties**, **View TXD** and **COL Properties** do what their names say for this model.
+- IDE edits are not part of the map's Undo / Redo (the window has its own Undo).
+
+### The Image Archive (gta3.img: delete, rename, add, extract, rebuild)
+
+**File > Image Archive...** opens MEd's IMG tool on the game's `models/gta3.img` (the archive that holds every model `.dff` and texture dictionary `.txd`). The other archives of the game folder are listed on the left; **Open...** adds any other `.img`.
+
+- The list shows each file's **Name**, **Offset**, **Size**, **Filetype** (3D Model, Texture Dictionary, Collision File, Binary IPL File) and what you have changed. **Show** filters by type, **Find** by part of the name; click a header to sort.
+- **Delete File(s)** (or Del): asks first, and names the item definitions that use the file and how often they are placed. Without its model the game cannot draw those objects (Check Map will report them).
+- **Rename File...** (or F2): at most 23 characters, no spaces. Definitions still look for the old name, and it says so.
+- **Import File(s)...**: adds files from disk. A file whose name is already in the archive asks: **Yes** replace it, **No** skip that file, **Cancel** stop.
+- **Extract File(s)...**: copies the selected files into a folder (byte for byte).
+- **Open File** (or Enter, or double-click): shows a model, texture dictionary or collision file in the viewers.
+- **Nothing is written until you press Rebuild Archive.** The status line says "Please Rebuild Archive!" and the title shows `*` while there are changes. Switching archives or closing asks: **Yes** rebuild now, **No** forget the changes, **Cancel** stay.
+- **Rebuild Archive** writes a new archive next to the old one, checks that every file reads back exactly, and only then puts it in place. The archive as it was is kept as `gta3.img.med-backup` and `gta3.dir.med-backup` (the first time; later rebuilds keep that first backup). If anything goes wrong (for example the game has the archive open) the old archive stays exactly as it was. Close the game and the Mod Manager before rebuilding. The editor uses the new archive at once.
+- **Removing an imported model:** delete its `.dff` (and its `.txd` if nothing else uses it) here and rebuild. Then remove its definition line and collision as `models/med-imports.txt` describes. After a rebuild that file gets a note that its "cut gta3.img back" steps no longer apply: do not follow those any more.
 
 ### Replace Object (swap a placed object for another model)
 
@@ -399,7 +433,7 @@ Your unmodified game gives **no errors and no warnings**. The original has 221 L
 
 ## 8. Saving
 
-- **Ctrl+S** or the **Save All** button writes only the IPL files that changed.
+- **Ctrl+S** or the **Save All** button writes only the files that changed: IPL files (placements) and IDE files (item definitions changed in the Item Definition Entry window).
 - By default they go to a **separate folder** (`MEd_saved`, next to the game folder), in the same folder layout as the game. Your game folder is **not touched**.
 - Only the placement lines are rewritten; everything else in the file (zone, cull, comments) is kept exactly as it was. An unchanged file saves **byte for byte identical** to the original.
 - To use the result in the game, copy the saved files over the game's files (keep the original first).
@@ -408,7 +442,7 @@ Your unmodified game gives **no errors and no warnings**. The original has 221 L
 
 ### Mods
 
-Switching mods on and off, launching the game with chosen mods, and the limit adjuster are done by the separate **GTA3 Mod Manager** (its own folder and guide). From the editor, **Save as Mod...** (toolbar) saves your changed map files into a folder you pick, for example your mod's folder under the Mod Manager's `mods` folder. To keep building on earlier edits, open the editor on the game folder the mod is applied to.
+Switching mods on and off, launching the game with chosen mods, and the limit adjuster are done by the separate **GTA3 Mod Manager** (its own folder and guide). From the editor, **Save as Mod...** (toolbar) saves your changed map files (IPL and IDE) into a folder you pick, for example your mod's folder under the Mod Manager's `mods` folder. To keep building on earlier edits, open the editor on the game folder the mod is applied to.
 
 ---
 
@@ -419,7 +453,7 @@ Switching mods on and off, launching the game with chosen mods, and the limit ad
 3. **Stay under 9,516 placements.**
 4. **Run Check Map** before every game test.
 5. **Test in the game** after each batch of edits, and keep the original game folder as your backup.
-6. **New models only through Import Model.** It writes the model, textures and collision the way the game reads them, with backups and an undo note. Rockstar's own IDE and COL files are never edited.
+6. **New models only through Import Model.** It writes the model, textures and collision the way the game reads them, with backups and an undo note. Rockstar's own IDE files change only when you edit a definition yourself (one line, backed up), and their COL files never.
 
 ---
 
@@ -456,4 +490,4 @@ That was a build problem (fixed): the program is now self-contained. If you stil
 
 ## 11. What the editor cannot do yet
 
-changing or removing an imported model from inside the editor (for now `models/med-imports.txt` says how to undo an import), editing Rockstar's IDE files, the IMG tool, Vice City and San Andreas, full-screen mode. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.
+removing an imported model in one step (for now: Image Archive for its files, then `models/med-imports.txt` for its definition line and collision), changing a model's ID or name, Vice City and San Andreas. Not tried in the game yet: an edited IDE definition and a rebuilt `gta3.img`. See `CLAUDE.md` for the full status and for how each part was recovered from the original program.

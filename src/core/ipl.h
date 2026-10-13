@@ -71,8 +71,9 @@ std::string formatIplInstanceLine(const IplInstance& inst, GameVersion version);
 // everything up to and including the "inst" line is kept byte for byte, then one line per
 // instance, then everything from the first following "end" line to the end of the file is kept
 // byte for byte (so cull, zone, pick and other sections survive). The line ending of the "inst"
-// line (CRLF or LF) is used for the new lines. Returns false with `error` if the file has no
-// inst block.
+// line (CRLF or LF) is used for the new lines. A file with no inst block
+// gets one at the top when there are instances (and is returned unchanged when there are none). Returns false
+// with `error` when the inst block has no end line.
 bool replaceIplInstSection(const std::string& originalText, const std::vector<IplInstance>& instances,
                            GameVersion version, std::string& result, std::string& error);
 

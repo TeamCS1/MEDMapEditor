@@ -27,3 +27,5 @@
 004ab8f0	CSurfaceTable_Initialise_maybe
 004aba60	CSurfaceTable_GetAdhesionGroup_maybe
 004abaa0	CSurfaceTable_GetWetMultiplier_maybe
+00477040	CFileLoader_LoadObject_maybe
+004772b0	CFileLoader_LoadTimeObject_maybe

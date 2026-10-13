@@ -56,7 +56,7 @@ inline std::vector<MenuItem> objectMenu(bool multiple) {
         return m;
     }
     m.push_back({"Centre on Object", kCmdCentre, true, false});
-    m.push_back({"Properties", kCmdProperties, false, false});
+    m.push_back({"Properties...", kCmdProperties, true, false});  // the Item Definition Entry (MEd: showIDE)
     m.push_back({"DFF Properties...", kCmdDffView, true, false});
     m.push_back({"View TXD...", kCmdTxdView, true, false});
     m.push_back({"Collision Properties...", kCmdColView, true, false});

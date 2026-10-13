@@ -65,6 +65,8 @@
 #include "importer.h"
 #include "coledit.h"
 #include "paths.h"
+#include "ideedit.h"
+#include "imgedit.h"
 #include "bookmarks.h"
 #include "region.h"
 #include "rotation.h"
@@ -97,6 +99,7 @@ struct ModelDef {
     std::string model, txd;
     std::string name;  // the model name as written in the IDE (model is lower case)
     std::string ide;   // the IDE file that defines it (file name only)
+    std::string ideRel;  // the same file relative to the game folder, as gta3.dat lists it ('/' slashes)
     std::string ideLine;  // its line in that IDE file, rebuilt from the parsed values (for Extract's info file)
     bool timed = false;   // a tobj entry
     double drawDistance = 300;
@@ -170,6 +173,13 @@ struct App {
     std::vector<std::string> iplPaths;     // IPL files that were loaded, relative to the game folder
     std::vector<int> instFile;             // for each instance, the index into iplPaths
     std::set<int> dirty;                   // IPL files with moved objects
+    // IDE files with edited definitions (the Item Definition Entry window), by lower-case game-relative path, as they
+    // will be written by Save All. A file whose text is back to what is on disk is dropped from here.
+    std::map<std::string, std::string> ideText;
+    std::map<std::string, std::string> ideRelOf;  // lower-case key -> the path as gta3.dat spells it
+    // The edited definitions that differ from disk, per file: ideText is always the disk file with exactly these applied,
+    // so a definition put back to its saved values (even after moving between objs and tobj) leaves the file untouched.
+    std::map<std::string, std::map<int, IdeObject>> ideEdits;
     std::string saveRoot;                  // where Ctrl+S writes (unless saveInPlace)
     bool saveInPlace = false;
     bool backupTarget = false;             // Save as Mod: copy an existing file in the target folder to <file>.med-backup first
@@ -227,6 +237,7 @@ ModelViewer* openDffViewer(HWND owner, int id);
 ModelViewer* openColViewer(HWND owner, int id);
 struct TxdViewer;
 TxdViewer* openTxdViewer(HWND owner, const std::string& txdName, const std::string& file = "");
+bool openIdeEditor(HWND owner, int id);  // Item Definition Entry
 void updateTxdViewers();
 void updateViewers();
 const std::vector<RoadEnd>& roadEndsOf(int id);
@@ -286,6 +297,7 @@ bool loadGameData() {
             d.model = toLower(o.model);
             d.name = o.model;
             d.ide = p.substr(p.find_last_of('/') + 1);
+            d.ideRel = p;
             d.ideLine = ideLineOf(o);
             d.timed = o.timed;
             d.txd = toLower(o.txd);
@@ -1147,6 +1159,7 @@ void showObjectMenu(HWND hwnd, int mx, int my) {
     DestroyMenu(menu);
     switch (cmd) {
         case kCmdCentre: if (!app.selected.empty()) centreOnObject(app.selected[0]); break;
+        case kCmdProperties: if (!app.selected.empty()) openIdeEditor(hwnd, app.instances[size_t(app.selected[0])].id); break;
         case kCmdDuplicate: duplicateSelected(); break;
         case kCmdCopy: copySelected(); break;
         case kCmdReplace: replaceSelectedUi(hwnd); break;
@@ -1197,13 +1210,49 @@ void moveSelected(double dx, double dy, double dz) {
 //  - with --in-place each original is copied to <file>.med-backup first;
 //  - a failure is reported (MEd silently loses the changes when the file is read-only).
 // Returns a human readable report.
+bool anyUnsaved() { return !app.dirty.empty() || !app.ideText.empty(); }
+
+// Write one changed game file (relative path) the way Save writes: in place after a one-time <file>.med-backup, or into
+// app.saveRoot. Adds a line to `report`; false on failure.
+bool writeChangedFile(const std::string& rel, const std::string& text, std::string& report) {
+    const std::string source = app.root + "/" + rel;
+    std::string target = app.saveInPlace ? source : app.saveRoot + "/" + rel;
+    std::error_code ec;
+    if (app.saveInPlace) {
+        std::string backup = source + ".med-backup";
+        if (!fs::exists(backup, ec)) fs::copy_file(source, backup, ec);
+        if (ec) { report += "FAILED " + rel + ": cannot write the backup\n"; return false; }
+    } else {
+        fs::create_directories(fs::path(target).parent_path(), ec);
+        // "Save as mod" into a folder that already holds this file (for example a game folder): keep the old copy once
+        if (app.backupTarget && fs::exists(target, ec) && !fs::exists(target + ".med-backup", ec)) {
+            fs::copy_file(target, target + ".med-backup", ec);
+            if (ec) { report += "FAILED " + rel + ": cannot write the backup of " + target + "\n"; return false; }
+        }
+    }
+    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    if (!out) { report += "FAILED " + rel + ": cannot write " + target + " (read-only?)\n"; return false; }
+    out.write(text.data(), std::streamsize(text.size()));
+    out.close();
+    if (!out) { report += "FAILED " + rel + ": write error\n"; return false; }
+    report += "saved " + target + "\n";
+    return true;
+}
+
 std::string saveAll(bool* allOk) {
     std::string report;
     bool ok = true;
-    if (app.dirty.empty()) {
+    if (!anyUnsaved()) {
         if (allOk) *allOk = true;
         return "Nothing to save.";
     }
+    for (const auto& kv : std::map<std::string, std::string>(app.ideText)) {  // edited definitions
+        const std::string rel = app.ideRelOf.count(kv.first) ? app.ideRelOf[kv.first] : kv.first;
+        if (writeChangedFile(rel, kv.second, report)) {
+            if (app.saveInPlace) { app.ideText.erase(kv.first); app.ideEdits.erase(kv.first); }  // the disk now holds it
+        } else ok = false;
+    }
+    if (!app.saveInPlace) { app.ideText.clear(); app.ideEdits.clear(); }  // written elsewhere (a mod folder): nothing left to save, as for IPL files
     for (int fileIndex : std::set<int>(app.dirty)) {
         const std::string& rel = app.iplPaths[fileIndex];
         const std::string source = app.root + "/" + rel;
@@ -1219,30 +1268,7 @@ std::string saveAll(bool* allOk) {
             ok = false;
             continue;
         }
-        std::string target = app.saveInPlace ? source : app.saveRoot + "/" + rel;
-        std::error_code ec;
-        if (app.saveInPlace) {
-            std::string backup = source + ".med-backup";
-            if (!fs::exists(backup, ec)) fs::copy_file(source, backup, ec);
-            if (ec) { report += "FAILED " + rel + ": cannot write the backup\n"; ok = false; continue; }
-        } else {
-            fs::create_directories(fs::path(target).parent_path(), ec);
-            // "Save as mod" into a folder that already holds this file (for example a game folder): keep the old copy once
-            if (app.backupTarget && fs::exists(target, ec) && !fs::exists(target + ".med-backup", ec)) {
-                fs::copy_file(target, target + ".med-backup", ec);
-                if (ec) { report += "FAILED " + rel + ": cannot write the backup of " + target + "\n"; ok = false; continue; }
-            }
-        }
-        std::ofstream out(target, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            report += "FAILED " + rel + ": cannot write " + target + " (read-only?)\n";
-            ok = false;
-            continue;
-        }
-        out.write(text.data(), std::streamsize(text.size()));
-        out.close();
-        if (!out) { report += "FAILED " + rel + ": write error\n"; ok = false; continue; }
-        report += "saved " + target + "\n";
+        if (!writeChangedFile(rel, text, report)) { ok = false; continue; }
         app.dirty.erase(fileIndex);
     }
     if (allOk) *allOk = ok;
@@ -1428,6 +1454,7 @@ CheckResult runCheck() {
     in.root = app.root;
     in.limits = app.limits;
     in.pathLimits = app.pathLimits;
+    in.ideText = app.ideText;
     for (int fileIndex : app.dirty) {
         bool ok;
         std::string original = slurp(app.root + "/" + app.iplPaths[fileIndex], ok);
@@ -1808,7 +1835,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT, ID_TB_VIEWPATHS };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT, ID_TB_VIEWPATHS, ID_TB_FULLSCREEN, ID_TB_IMGTOOL, ID_TB_LAST = ID_TB_IMGTOOL };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1890,7 +1917,7 @@ void createToolbar(HWND parent) {
 void updateToolbarState() {
     if (!app.toolbar) return;
     struct Item { HWND bar; int id; int enabled; };
-    const Item items[] = {{app.menubar, ID_TB_SAVE, !app.dirty.empty()},
+    const Item items[] = {{app.menubar, ID_TB_SAVE, anyUnsaved()},
                           {app.toolbar, ID_TB_UNDO, app.history.canUndo()},
                           {app.toolbar, ID_TB_REDO, app.history.canRedo()},
                           {app.toolbar, ID_TB_CENTRE, !app.selected.empty()},
@@ -1927,7 +1954,7 @@ int CALLBACK startFolderProc(HWND w, UINT msg, LPARAM, LPARAM data) {
 }
 
 void saveAsMod(HWND owner) {
-    if (app.dirty.empty() && regionsAddedSinceBackup(app.root).empty()) {
+    if (!anyUnsaved() && regionsAddedSinceBackup(app.root).empty()) {
         MessageBoxA(owner, "Nothing to save: no file has been changed.", "Save as Mod", MB_ICONINFORMATION);
         return;
     }
@@ -1987,7 +2014,7 @@ void saveAsMod(HWND owner) {
 // --shot for tests) writes to that other folder instead and asks nothing.
 void saveFromUi(HWND owner) {
     static bool agreed = false;
-    if (app.saveInPlace && !agreed && !app.dirty.empty()) {
+    if (app.saveInPlace && !agreed && anyUnsaved()) {
         const std::string msg = "Save writes your changes directly into this game folder:\n\n" + app.root +
                                 "\n\nThe original of each file is kept once next to it as <file>.med-backup. Continue?";
         if (MessageBoxA(owner, msg.c_str(), "Save", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
@@ -2001,7 +2028,7 @@ void saveFromUi(HWND owner) {
 // Open another game folder. The editor loads everything at start-up, so this remembers the chosen folder and starts a
 // new editor window on it, then closes this one (after a warning when there are unsaved changes).
 void openGameFolder(HWND owner) {
-    if (!app.dirty.empty() &&
+    if (anyUnsaved() &&
         MessageBoxA(owner, "There are unsaved changes. Opening another folder closes this editor window and they are lost.\n\nUse Save All or Save as Mod first if you need them.\n\nOpen another folder anyway?",
                     "Open", MB_YESNO | MB_ICONWARNING) != IDYES)
         return;
@@ -2043,8 +2070,33 @@ bool openLooseFile(HWND owner, const std::string& path);
 
 std::string importAtStart;  // --import-window dff: the Import Model window opens on this model once the editor is up
 
+// ---- full screen ---------------------------------------------------------------------------------
+// MEd's MainWindow::fullScreen (0x0044fe80) asks first ("You are entering fullscreen mode ...", Yes / No), then shows the
+// 3D view alone over the whole screen with editing switched off (CMapView +0x9c = 0, +0xab = 1); showNormal
+// (0x00454ec0) puts it back and switches editing on again. While it is on, a double-click, Enter, Esc or F11 leaves
+// (MEd's help text). Here the main window becomes a borderless window over its monitor and the toolbars and panels are
+// hidden, so the 3D view is the whole window; leaving restores the window exactly as it was.
+struct FullScreenState {
+    bool on = false;
+    WINDOWPLACEMENT place = {sizeof(WINDOWPLACEMENT)};
+    LONG style = 0;
+    int leftW = 0, inspectorW = 0, toolbarH = 0, menubarH = 0, leftTabH = 0;
+    std::vector<HWND> hidden;  // the panels that were visible, shown again on the way out
+} fullScr;
+
+const char* const kFullScreenQuestion =
+    "You are entering fullscreen mode. You can exit from it in the following ways:\n\n"
+    "- Double-click the screen with your left mouse button.\n"
+    "- Press \"Enter\",\"Esc\",\"F11\" or \"Return\" on your keyboard";
+
+bool enterFullScreen(HWND h, bool ask);
+void showImgTool(HWND owner);  // Image Archive
+void leaveFullScreen(HWND h);
+
 void doCommand(HWND h, int id) {
     switch (id) {
+        case ID_TB_FULLSCREEN: enterFullScreen(h, true); return;
+        case ID_TB_IMGTOOL: showImgTool(h); return;
         case ID_TB_OPEN: openGameFolder(h); return;
         case ID_TB_BOOKMARKS: showBookmarksWindow(h); return;  // the window keeps the focus
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
@@ -2074,14 +2126,17 @@ void showToolbarMenu(HWND owner, int buttonId) {
     HMENU menu = CreatePopupMenu();
     if (buttonId == ID_TB_FILEMENU) {
         AppendMenuA(menu, MF_STRING, ID_TB_OPEN, "Open...");
-        AppendMenuA(menu, MF_STRING | (app.dirty.empty() ? MF_GRAYED : MF_ENABLED), ID_TB_SAVE, "Save All" "\tCtrl+S");
+        AppendMenuA(menu, MF_STRING | (anyUnsaved() ? MF_ENABLED : MF_GRAYED), ID_TB_SAVE, "Save All" "\tCtrl+S");
         AppendMenuA(menu, MF_STRING, ID_TB_SAVEMOD, "Save as Mod...");
         AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuA(menu, MF_STRING, ID_TB_VIEWFILE, "View a DFF / TXD / COL file...");
         AppendMenuA(menu, MF_STRING, ID_TB_IMPORT, "Import Model (DFF + TXD + COL)...");
+        AppendMenuA(menu, MF_STRING, ID_TB_IMGTOOL, "Image Archive (gta3.img: delete, rename, add, extract, rebuild)...");
     } else if (buttonId == ID_TB_VIEWMENU) {
         AppendMenuA(menu, MF_STRING | (app.showEmptyRegions ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWEMPTY, "Show hidden regions");
         AppendMenuA(menu, MF_STRING | (app.showPaths ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWPATHS, "Show traffic paths (cars orange, pedestrians blue, dead ends red)");
+        AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(menu, MF_STRING, ID_TB_FULLSCREEN, "Full Screen" "\tF11");
     } else {
         AppendMenuA(menu, MF_STRING, ID_TB_POOLS, "Pools");
         AppendMenuA(menu, MF_STRING, ID_TB_CHECK, "Check Map" "\tF7");
@@ -3647,7 +3702,7 @@ void closeRoadStrip();
 // (as New Object, without the chooser); "Show where it is placed" (also double-click / Enter) opens the Placements tab
 // filtered to that model in all regions. Selecting an object in 3D highlights its definition here.
 
-enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW, ID_IT_EXTRACT, ID_IT_DFF, ID_IT_TXD, ID_IT_COL };
+enum { ID_IT_SEARCH = 6001, ID_IT_SHOW, ID_IT_LIST, ID_IT_COUNT, ID_IT_ADD, ID_IT_WHERE, ID_IT_LBL_SEARCH, ID_IT_LBL_SHOW, ID_IT_EXTRACT, ID_IT_DFF, ID_IT_TXD, ID_IT_COL, ID_IT_IDE };
 
 struct ItemUi {
     HWND panel = nullptr, search = nullptr, show = nullptr, list = nullptr, count = nullptr, tips = nullptr;
@@ -3847,6 +3902,8 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             HWND dffb = make("BUTTON", "DFF Properties", BS_PUSHBUTTON, 0, ID_IT_DFF);
             HWND txdb = make("BUTTON", "View TXD", BS_PUSHBUTTON, 0, ID_IT_TXD);
             HWND colb = make("BUTTON", "View Collision", BS_PUSHBUTTON, 0, ID_IT_COL);
+            HWND ideb = make("BUTTON", "Edit Definition (draw distance, flags, times)...", BS_PUSHBUTTON, 0, ID_IT_IDE);
+            itAddTip(ideb, "Item Definition Entry: change this item's draw distance, texture dictionary, flags and on / off hours in its IDE file (written by Save All)");
             itAddTip(dffb, "View Information about the 3D Model: the model on its own (right button turns, left button moves, wheel zooms) and its details");
             itAddTip(txdb, "View Texture Dictionary: every texture of this item's .txd with its size and format");
             itAddTip(colb, "View this model's collision file: its boxes, spheres and mesh, coloured by surface");
@@ -3866,7 +3923,7 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(it.search, m, y, iw, 22, TRUE); y += 28;
             MoveWindow(GetDlgItem(w, ID_IT_LBL_SHOW), m, y + 4, 36, 16, TRUE);
             MoveWindow(it.show, m + 38, y, iw - 38, 200, TRUE); y += 30;
-            const int bottom = ch - m - 26 - 6 - 30 - 30;
+            const int bottom = ch - m - 26 - 6 - 30 - 30 - 30;
             MoveWindow(it.list, m, y, iw, std::max(60, bottom - y), TRUE);
             y = std::max(y + 60, bottom) + 4;
             MoveWindow(it.count, m, y, iw, 30, TRUE); y += 32;
@@ -3878,6 +3935,8 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(GetDlgItem(w, ID_IT_DFF), m, y, third, 26, TRUE);
             MoveWindow(GetDlgItem(w, ID_IT_TXD), m + third + 4, y, third, 26, TRUE);
             MoveWindow(GetDlgItem(w, ID_IT_COL), m + 2 * (third + 4), y, third, 26, TRUE);
+            y += 30;
+            MoveWindow(GetDlgItem(w, ID_IT_IDE), m, y, iw, 26, TRUE);
             return 0;
         }
         case WM_COMMAND: {
@@ -3894,6 +3953,9 @@ LRESULT CALLBACK itemProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == ID_IT_COL && code == BN_CLICKED) {
                 if (itSelectedId() >= 0) openColViewer(GetParent(w), itSelectedId());
                 else inspWarn(GetParent(w), "Pick an item in the list first.", "Collision Object Properties");
+            } else if (id == ID_IT_IDE && code == BN_CLICKED) {
+                if (itSelectedId() >= 0) openIdeEditor(GetParent(w), itSelectedId());
+                else inspWarn(GetParent(w), "Pick an item in the list first.", "Item Definition Entry");
             } else if (id == ID_IT_EXTRACT && code == BN_CLICKED) extractObjectsUi(GetParent(w), itSelectedId() >= 0 ? std::vector<int>{itSelectedId()} : std::vector<int>());
             else if (id == ID_IT_WHERE && code == BN_CLICKED) {
                 if (itSelectedId() < 0) inspWarn(GetParent(w), "Click an item in the list first.", "Show where it is placed");
@@ -6983,6 +7045,7 @@ void imLoadImported(const ImportRequest& r, const ImportPlan& p) {
     d.name = r.name;
     d.txd = toLower(p.txdName);
     d.ide = r.region + ".ide";
+    d.ideRel = "data/maps/" + r.region + "/" + r.region + ".ide";
     d.ideLine = ideObjsLine(r.id, r.name, p.txdName, r.drawDistance, r.flags);
     d.drawDistance = r.drawDistance;
     d.farModel = isFarModel(d.model, d.drawDistance);
@@ -7164,12 +7227,989 @@ void importModelUi(HWND owner, const std::string& dffPath) {
     SetForegroundWindow(owner);
 }
 
+// ---- Item Definition Entry: editing a model's IDE line ---------------------------------------------------------------
+// After MEd's IDEView ("Item Definition Entry", 0x0042e080): ID Number, Model Name, Texture Name, Object Count, the draw
+// distance ("LOD"), Time On / Time Off (00:00 to 23:00; both 00:00 = an objs entry, anything else = tobj, as
+// IDEView::updateText 0x0042ddc0 decides), Parameters (the flags as a number) with a check box per bit kept in step
+// (paramChanged 0x0042cf70 / updateParams 0x0042d150), and Add to Map, DFF Properties, View TXD, COL Properties, Undo,
+// Save, Cancel. As in MEd every change applies at once (updateText), Undo puts back what the window opened with
+// (0x00432410), Cancel undoes and closes (0x00432610), Save keeps it and marks the IDE file changed (0x0042d3c0); the
+// file itself is written by Save All. Deliberate differences: the ID, the model name and the object count are shown but
+// not editable (placements, gta3.img and the collision refer to them, and the count is the model's atomics); a draw
+// distance keeps its decimals (MEd reads it with toInt, which turns Rockstar's 152.25 into 0); a value that is not
+// valid is reported and not applied; the flag boxes say what each bit does in GTA III (MEd's labels are Vice City's,
+// and GTA III reads only bits 1 to 64); a texture dictionary must exist in gta3.img.
+enum { ID_IE_TXD = 9601, ID_IE_DIST0, ID_IE_DIST1, ID_IE_DIST2, ID_IE_ON, ID_IE_OFF, ID_IE_FLAGS, ID_IE_ADDMAP, ID_IE_DFF, ID_IE_VTXD, ID_IE_COL,
+       ID_IE_UNDO, ID_IE_SAVE, ID_IE_CANCEL, ID_IE_FLAG0 = 9640 };
+
+struct IdeEditUi {
+    HWND wnd = nullptr;
+    int id = -1;
+    IdeObject original;  // the definition when the window opened: Undo and Cancel go back to it
+    HWND type = nullptr, idBox = nullptr, model = nullptr, txd = nullptr, count = nullptr, dist[3] = {}, on = nullptr, off = nullptr,
+         flags = nullptr, box[kIdeFlagCount] = {}, status = nullptr, file = nullptr;
+    bool filling = false;     // fields being set by code: no change events
+    bool quiet = false;       // self-test: no message boxes
+    std::string lastMessage;  // why the last change was not applied ("" = it was)
+} ie;
+
+// The definition of `id` as it is now: from the edited text when its IDE file has unsaved edits, else from disk.
+bool ideCurrent(int id, IdeObject& o, std::string& key, std::string& text) {
+    auto d = app.defs.find(id);
+    if (d == app.defs.end() || d->second.ideRel.empty()) return false;
+    key = toLower(d->second.ideRel);
+    auto pending = app.ideText.find(key);
+    if (pending != app.ideText.end()) text = pending->second;
+    else {
+        bool ok;
+        text = slurp(app.root + "/" + d->second.ideRel, ok);
+        if (!ok) return false;
+    }
+    IdeEntryLoc loc;
+    if (!findIdeEntry(text, id, loc)) return false;
+    o = loc.object;
+    return true;
+}
+
+// Apply an edited definition: the IDE text (kept until Save All), the editor's model table, and anything drawn from it.
+bool applyIdeEdit(int id, const IdeObject& edited, std::string& why) {
+    IdeObject cur;
+    std::string key, text;
+    if (!ideCurrent(id, cur, key, text)) { why = "The IDE file that defines this model cannot be read."; return false; }
+    if (!validIdeEdit(cur, edited, why)) return false;
+    if (toLower(edited.txd) != toLower(cur.txd) && app.img.find(edited.txd + ".txd") < 0) {
+        why = "There is no texture dictionary " + edited.txd + ".txd in gta3.img.";
+        return false;
+    }
+    if (!setIdeEntry(text, edited, why)) return false;  // checks the line once more
+    ModelDef& d = app.defs[id];
+    bool ok;
+    const std::string disk = slurp(app.root + "/" + d.ideRel, ok);
+    IdeEntryLoc onDisk;
+    if (!ok || !findIdeEntry(disk, id, onDisk)) { why = "The IDE file that defines this model cannot be read."; return false; }
+    std::map<int, IdeObject>& edits = app.ideEdits[key];
+    if (sameIdeEntry(edited, onDisk.object)) edits.erase(id);
+    else edits[id] = edited;
+    text = disk;  // the disk file with every edit of this file that differs from it
+    for (const auto& e : edits) {
+        std::string w;
+        setIdeEntry(text, e.second, w);
+    }
+    if (edits.empty()) { app.ideEdits.erase(key); app.ideText.erase(key); }  // back to what is saved
+    else { app.ideText[key] = text; app.ideRelOf[key] = d.ideRel; }
+    const bool txdChanged = toLower(edited.txd) != d.txd;
+    d.txd = toLower(edited.txd);
+    d.timed = edited.timed;
+    d.drawDistance = edited.drawDistances.empty() ? 300 : *std::max_element(edited.drawDistances.begin(), edited.drawDistances.end());
+    d.farModel = isFarModel(d.model, d.drawDistance);
+    d.ideLine = formatIdeEntry(edited);
+    if (txdChanged) app.models.erase(d.model);  // built again with the other texture dictionary
+    buildLodPartnerRanges();
+    itRefill();
+    why.clear();
+    return true;
+}
+
+void ieSetText(HWND h, const std::string& s) { SetWindowTextA(h, s.c_str()); }
+std::string ieText(HWND h) {
+    char b[256] = "";
+    GetWindowTextA(h, b, sizeof b);
+    return b;
+}
+std::string ieNum(double d) {
+    char b[48];
+    for (int p = 6; p <= 17; ++p) {
+        std::snprintf(b, sizeof b, "%.*g", p, d);
+        if (std::strtod(b, nullptr) == d) break;
+    }
+    return b;
+}
+
+// Show a definition in the fields (no change events while doing it).
+void ieFill(const IdeObject& o) {
+    ie.filling = true;
+    ieSetText(ie.idBox, std::to_string(o.id));
+    ieSetText(ie.model, o.model);
+    ieSetText(ie.txd, o.txd);
+    ieSetText(ie.count, std::to_string(o.drawDistances.size()));
+    for (int i = 0; i < 3; ++i) {
+        const bool used = i < int(o.drawDistances.size());
+        ieSetText(ie.dist[i], used ? ieNum(o.drawDistances[size_t(i)]) : "");
+        EnableWindow(ie.dist[i], used);
+    }
+    SendMessageA(ie.on, CB_SETCURSEL, o.timed ? std::clamp(o.timeOn, 0, 23) : 0, 0);
+    SendMessageA(ie.off, CB_SETCURSEL, o.timed ? std::clamp(o.timeOff, 0, 23) : 0, 0);
+    ieSetText(ie.flags, std::to_string(o.flags));
+    for (int i = 0; i < kIdeFlagCount; ++i) SendMessageA(ie.box[i], BM_SETCHECK, (o.flags & ideFlag(i).bit) ? BST_CHECKED : BST_UNCHECKED, 0);
+    ie.filling = false;
+}
+
+void ieShowState() {
+    IdeObject cur;
+    std::string key, text;
+    const bool have = ideCurrent(ie.id, cur, key, text);
+    ieSetText(ie.type, !have ? "Item Definition" : cur.timed ? "Item Definition: Type: tobj (Time Controlled Object)" : "Item Definition: Type: objs (Standard Object)");
+    const ModelDef& d = app.defs[ie.id];
+    ieSetText(ie.file, "IDE file: " + d.ideRel + (app.ideText.count(toLower(d.ideRel)) ? "   (changed, not saved yet: Save All writes it)" : ""));
+    ieSetText(ie.status, ie.lastMessage.empty() ? (have && cur.drawDistances.size() && !d.farModel && d.drawDistance > 300
+                                                       ? "Note: above 300 the game may handle this model as a big building, the way it handles LOD models (re3: SetupBigBuilding)."
+                                                       : "")
+                                                 : ie.lastMessage);
+    std::string title = "Item Definition Entry - " + d.name + " (" + std::to_string(ie.id) + ")";
+    if (app.ideText.count(toLower(d.ideRel))) title += " *";
+    SetWindowTextA(ie.wnd, title.c_str());
+}
+
+// Read the fields into a definition. False with `why` when a field is not a number.
+bool ieRead(IdeObject& o, std::string& why) {
+    IdeObject cur;
+    std::string key, text;
+    if (!ideCurrent(ie.id, cur, key, text)) { why = "The IDE file that defines this model cannot be read."; return false; }
+    o = cur;
+    o.txd = trim(ieText(ie.txd));
+    for (size_t i = 0; i < o.drawDistances.size() && i < 3; ++i) {
+        const std::string s = trim(ieText(ie.dist[i]));
+        char* end = nullptr;
+        const double v = std::strtod(s.c_str(), &end);
+        if (s.empty() || *end) { why = "Draw distance " + std::to_string(i + 1) + " is not a number."; return false; }
+        o.drawDistances[i] = v;
+    }
+    {
+        const std::string s = trim(ieText(ie.flags));
+        char* end = nullptr;
+        const long v = std::strtol(s.c_str(), &end, 10);
+        if (s.empty() || *end) { why = "Parameters is not a whole number."; return false; }
+        o.flags = int(std::clamp<long>(v, -1, 1 << 20));
+    }
+    const int on = int(SendMessageA(ie.on, CB_GETCURSEL, 0, 0)), off = int(SendMessageA(ie.off, CB_GETCURSEL, 0, 0));
+    o.timed = on != 0 || off != 0;  // MEd: both 00:00 = objs
+    if (o.timed) { o.timeOn = on; o.timeOff = off; }
+    else { o.timeOn = 0; o.timeOff = 24; }
+    return true;
+}
+
+// A field changed: apply it when valid, else say why.
+void ieChanged() {
+    if (ie.filling || !ie.wnd) return;
+    IdeObject o;
+    std::string why;
+    if (ieRead(o, why) && applyIdeEdit(ie.id, o, why)) ie.lastMessage.clear();
+    else ie.lastMessage = "Not applied: " + why;
+    ieShowState();
+}
+
+// Undo (MEd): back to what the window opened with.
+void ieUndo() {
+    std::string why;
+    applyIdeEdit(ie.id, ie.original, why);
+    ie.lastMessage.clear();
+    ieFill(ie.original);
+    ieShowState();
+}
+
+void ieClose(bool keep) {
+    if (!ie.wnd) return;
+    if (!keep) {
+        std::string why;
+        applyIdeEdit(ie.id, ie.original, why);
+    }
+    HWND w = ie.wnd;
+    ie.wnd = nullptr;
+    DestroyWindow(w);
+    if (app.hwnd) SetFocus(app.hwnd);
+}
+
+LRESULT CALLBACK ideEditProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            auto make = [&](const char* cls, const char* text, DWORD style, int id) {
+                HWND c = CreateWindowExA(std::string(cls) == "EDIT" ? WS_EX_CLIENTEDGE : 0, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, w,
+                                         (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+                SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+                return c;
+            };
+            ie.type = make("STATIC", "", SS_LEFT, 0);
+            const char* labels[] = {"ID Number:", "Model Name:", "Texture Name:", "Object Count:", "Draw distance (LOD):", "Time On:", "Time Off:", "Parameters:"};
+            for (int i = 0; i < 8; ++i) make("STATIC", labels[i], SS_LEFT, 9580 + i);
+            ie.idBox = make("EDIT", "", ES_READONLY | ES_AUTOHSCROLL, 0);
+            ie.model = make("EDIT", "", ES_READONLY | ES_AUTOHSCROLL, 0);
+            ie.txd = make("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, ID_IE_TXD);
+            ie.count = make("EDIT", "", ES_READONLY, 0);
+            for (int i = 0; i < 3; ++i) ie.dist[i] = make("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, ID_IE_DIST0 + i);
+            ie.on = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_IE_ON);
+            ie.off = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_IE_OFF);
+            for (int h = 0; h < 24; ++h) {
+                char b[8];
+                std::snprintf(b, sizeof b, "%02d:00", h);
+                SendMessageA(ie.on, CB_ADDSTRING, 0, (LPARAM)b);
+                SendMessageA(ie.off, CB_ADDSTRING, 0, (LPARAM)b);
+            }
+            ie.flags = make("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, ID_IE_FLAGS);
+            for (int i = 0; i < kIdeFlagCount; ++i) {
+                const std::string text = std::to_string(ideFlag(i).bit) + "  " + ideFlag(i).name;
+                ie.box[i] = make("BUTTON", text.c_str(), BS_AUTOCHECKBOX | WS_TABSTOP, ID_IE_FLAG0 + i);
+            }
+            ie.file = make("STATIC", "", SS_LEFT | SS_PATHELLIPSIS, 0);
+            ie.status = make("STATIC", "", SS_LEFT, 0);
+            const char* buttons[] = {"Add to Map", "DFF Properties", "View TXD", "COL Properties", "Undo", "Save", "Cancel"};
+            for (int i = 0; i < 7; ++i) make("BUTTON", buttons[i], BS_PUSHBUTTON | WS_TABSTOP, ID_IE_ADDMAP + i);
+            return 0;
+        }
+        case WM_SIZE: {
+            const int cw = LOWORD(lp), m = 8, lw = 118, fx = m + lw, fw = cw - fx - m;
+            int y = m;
+            MoveWindow(ie.type, m, y, cw - 2 * m, 18, TRUE); y += 24;
+            auto row = [&](int label, HWND field, int width) {
+                MoveWindow(GetDlgItem(w, 9580 + label), m, y + 3, lw, 18, TRUE);
+                MoveWindow(field, fx, y, width, 22, TRUE);
+                y += 27;
+            };
+            row(0, ie.idBox, 90);
+            row(1, ie.model, fw);
+            row(2, ie.txd, fw);
+            row(3, ie.count, 40);
+            MoveWindow(GetDlgItem(w, 9584), m, y + 3, lw, 18, TRUE);
+            const int dw = (fw - 8) / 3;
+            for (int i = 0; i < 3; ++i) MoveWindow(ie.dist[i], fx + i * (dw + 4), y, dw, 22, TRUE);
+            y += 27;
+            MoveWindow(GetDlgItem(w, 9585), m, y + 3, lw, 18, TRUE);
+            MoveWindow(ie.on, fx, y, 80, 300, TRUE);
+            MoveWindow(GetDlgItem(w, 9586), fx + 96, y + 3, 60, 18, TRUE);
+            MoveWindow(ie.off, fx + 156, y, 80, 300, TRUE);
+            y += 30;
+            row(7, ie.flags, 90);
+            for (int i = 0; i < kIdeFlagCount; ++i) { MoveWindow(ie.box[i], fx, y, fw, 19, TRUE); y += 20; }
+            y += 6;
+            MoveWindow(ie.file, m, y, cw - 2 * m, 18, TRUE); y += 20;
+            MoveWindow(ie.status, m, y, cw - 2 * m, 32, TRUE); y += 36;
+            const int bw = (cw - 2 * m - 3 * 4) / 4;
+            for (int i = 0; i < 4; ++i) MoveWindow(GetDlgItem(w, ID_IE_ADDMAP + i), m + i * (bw + 4), y, bw, 26, TRUE);
+            y += 32;
+            const int bw3 = (cw - 2 * m - 2 * 4) / 3;
+            for (int i = 0; i < 3; ++i) MoveWindow(GetDlgItem(w, ID_IE_UNDO + i), m + i * (bw3 + 4), y, bw3, 28, TRUE);
+            return 0;
+        }
+        case WM_COMMAND: {
+            const int id = LOWORD(wp), code = HIWORD(wp);
+            HWND owner = GetWindow(w, GW_OWNER);
+            if (id >= ID_IE_FLAG0 && id < ID_IE_FLAG0 + kIdeFlagCount && code == BN_CLICKED) {  // a box: the number follows
+                if (ie.filling) return 0;
+                long v = std::strtol(ieText(ie.flags).c_str(), nullptr, 10);
+                const int bit = ideFlag(id - ID_IE_FLAG0).bit;
+                v = SendMessageA(ie.box[id - ID_IE_FLAG0], BM_GETCHECK, 0, 0) == BST_CHECKED ? (v | bit) : (v & ~long(bit));
+                ie.filling = true;
+                ieSetText(ie.flags, std::to_string(v));
+                ie.filling = false;
+                ieChanged();
+            } else if (id == ID_IE_FLAGS && code == EN_CHANGE) {  // the number: the boxes follow
+                if (ie.filling) return 0;
+                char* end = nullptr;
+                const std::string s = ieText(ie.flags);
+                const long v = std::strtol(s.c_str(), &end, 10);
+                if (!s.empty() && !*end) {
+                    ie.filling = true;
+                    for (int i = 0; i < kIdeFlagCount; ++i) SendMessageA(ie.box[i], BM_SETCHECK, (v & ideFlag(i).bit) ? BST_CHECKED : BST_UNCHECKED, 0);
+                    ie.filling = false;
+                }
+                ieChanged();
+            } else if ((id == ID_IE_TXD || (id >= ID_IE_DIST0 && id <= ID_IE_DIST2)) && code == EN_CHANGE) ieChanged();
+            else if ((id == ID_IE_ON || id == ID_IE_OFF) && code == CBN_SELCHANGE) ieChanged();
+            else if (code == BN_CLICKED) {
+                switch (id) {
+                    case ID_IE_ADDMAP: newObjectAt(owner, app.viewX + app.width / 2, app.toolbarH + app.height / 2, ie.id); break;
+                    case ID_IE_DFF: openDffViewer(owner, ie.id); break;
+                    case ID_IE_VTXD: openTxdViewer(owner, app.defs[ie.id].txd); break;
+                    case ID_IE_COL: openColViewer(owner, ie.id); break;
+                    case ID_IE_UNDO: ieUndo(); break;
+                    case ID_IE_SAVE: ieClose(true); break;
+                    case ID_IE_CANCEL: ieClose(false); break;
+                }
+            }
+            return 0;
+        }
+        case WM_CLOSE:  // the title bar's X: like Cancel (MEd's dialog rejects)
+            ieClose(false);
+            return 0;
+        case WM_DESTROY:
+            if (ie.wnd == w) ie.wnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// Open the window on model `id` (the Item tab's Edit Definition, the right-click Properties). A window already open on
+// another model keeps its changes (as Save) and shows this one.
+bool openIdeEditor(HWND owner, int id) {
+    IdeObject o;
+    std::string key, text;
+    if (!app.defs.count(id) || !ideCurrent(id, o, key, text)) {
+        ie.lastMessage = "No item definition with ID " + std::to_string(id) + " can be read.";
+        if (!ie.quiet) MessageBoxA(owner, ie.lastMessage.c_str(), "Item Definition Entry", MB_ICONWARNING);
+        return false;
+    }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = ideEditProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdIdeEdit";
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    if (!ie.wnd) {
+        RECT r;
+        GetWindowRect(owner, &r);
+        ie.wnd = CreateWindowExA(WS_EX_TOOLWINDOW, "MEdIdeEdit", "Item Definition Entry", WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE | WS_CLIPCHILDREN,
+                                 r.left + 140, r.top + 90, 520, 650, owner, nullptr, GetModuleHandle(nullptr), nullptr);
+    }
+    ie.id = id;
+    ie.original = o;
+    ie.lastMessage.clear();
+    ieFill(o);
+    ieShowState();
+    SetForegroundWindow(ie.wnd);
+    return true;
+}
+
+// Enter = Save, Esc = Cancel while the window has the keyboard (called from the message loop).
+bool ieHandleKey(const MSG& m) {
+    if (!ie.wnd || m.message != WM_KEYDOWN || (m.hwnd != ie.wnd && !IsChild(ie.wnd, m.hwnd))) return false;
+    if (m.wParam == VK_ESCAPE) { ieClose(false); return true; }
+    if (m.wParam == VK_RETURN) { ieClose(true); return true; }
+    return false;
+}
+
+// ---- Image Archive: MEd's IMG tool -----------------------------------------------------------------------------------
+// After MEd's CIMGTool (0x0043c3b0, "Image Archive", toolbar "Edit Image Archive"): a list of the game's archives
+// (FileList 0x0043e420), the files of the picked one with Offset, Size and Filetype (displayFiles 0x0043a620), a Show
+// filter (Everything, Only 3D Models, Only Texture Dictionaries, Only Collision Files, Only Binary IPL Files), Find,
+// Open File / Import File(s) / Extract File(s) / Delete File(s) / Rename File (also on the right-click menu, CIMGTreeView)
+// and Rebuild Archive; the status line says "Image Archive: Version 1 Archive N Files" and "-- Please Rebuild Archive!"
+// while there are changes, and leaving asks "This archive has been modified. Changes will not be saved until you rebuild
+// the archive. Would you like to do this now?". Deliberate differences: Add is staged like Delete and Rename (MEd
+// appends to the .img at once), adding a name that exists asks to replace it (MEd makes a second entry of the same
+// name), Delete names the definitions that use the file, and Rebuild never writes into the old archive (core/imgedit.h):
+// the old one is kept as <file>.med-backup the first time.
+enum { ID_IG_OPEN = 9701, ID_IG_ADD, ID_IG_EXTRACT, ID_IG_DELETE, ID_IG_RENAME, ID_IG_PREVIEW, ID_IG_REBUILD, ID_IG_CLOSE, ID_IG_ARCHIVES, ID_IG_LIST,
+       ID_IG_SHOW, ID_IG_FIND, ID_IG_STATUS, ID_IG_LBL_SHOW, ID_IG_LBL_FIND };
+
+struct ImgToolUi {
+    HWND wnd = nullptr, archives = nullptr, list = nullptr, show = nullptr, find = nullptr, status = nullptr;
+    std::vector<std::string> paths;  // the archives in the left list
+    int current = -1;
+    ImgEdit edit;
+    std::vector<int> rows;  // entry indices shown, in list order
+    int sortColumn = -1;
+    bool sortDescending = false;
+    bool quiet = false;        // self-test: no message boxes; questions get `answer`
+    int answer = IDYES;        // the self-test's answer to a question (IDYES, IDNO or IDCANCEL)
+    std::string lastMessage;   // the last message the tool showed
+    std::vector<std::string> extracted;  // the files the last extract wrote
+} imgt;
+
+int igAsk(const std::string& text, UINT buttons) {
+    imgt.lastMessage = text;
+    if (imgt.quiet) return imgt.answer;
+    return MessageBoxA(imgt.wnd ? imgt.wnd : app.hwnd, text.c_str(), "Image Archive", buttons);
+}
+void igTell(const std::string& text, UINT icon = MB_ICONINFORMATION) {
+    imgt.lastMessage = text;
+    if (!imgt.quiet) MessageBoxA(imgt.wnd ? imgt.wnd : app.hwnd, text.c_str(), "Image Archive", icon);
+}
+
+bool igSamePath(const std::string& a, const std::string& b) {
+    std::error_code ec;
+    return fs::equivalent(a, b, ec) || toLower(fs::path(a).lexically_normal().string()) == toLower(fs::path(b).lexically_normal().string());
+}
+bool igIsGameArchive() { return imgt.current >= 0 && igSamePath(imgt.paths[size_t(imgt.current)], app.img.path()); }
+
+// The game's archives (MEd lists the ones of the loaded game): models/*.img and anim/*.img, gta3.img first.
+std::vector<std::string> igGameArchives() {
+    std::vector<std::string> out;
+    std::error_code ec;
+    for (const char* sub : {"models", "anim"})
+        for (const auto& e : fs::directory_iterator(fs::path(app.root) / sub, ec))
+            if (e.is_regular_file(ec) && toLower(e.path().extension().string()) == ".img" && toLower(e.path().stem().string()).find(".med-") == std::string::npos)
+                out.push_back(e.path().string());
+    std::stable_sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        const bool ga = toLower(fs::path(a).filename().string()) == "gta3.img", gb = toLower(fs::path(b).filename().string()) == "gta3.img";
+        return ga != gb ? ga : toLower(a) < toLower(b);
+    });
+    return out;
+}
+
+std::string igStatusText() {
+    if (imgt.current < 0) return "Image Archive: Ready.";
+    std::string s = "Image Archive: Version " + std::to_string(imgt.edit.version()) + " Archive  " + std::to_string(imgt.edit.entries().size()) + " Files";
+    if (imgt.rows.size() != imgt.edit.entries().size()) s += " (" + std::to_string(imgt.rows.size()) + " shown)";
+    if (imgt.edit.changed()) s += "   --  Please Rebuild Archive!";
+    return s;
+}
+
+void igRefreshTitle() {
+    if (!imgt.wnd) return;
+    std::string t = "Image Archive";
+    if (imgt.current >= 0) t += " - " + imgt.paths[size_t(imgt.current)] + (imgt.edit.changed() ? " *" : "");
+    SetWindowTextA(imgt.wnd, t.c_str());
+    SetWindowTextA(imgt.status, igStatusText().c_str());
+    SendMessageA(imgt.archives, LB_RESETCONTENT, 0, 0);
+    for (size_t i = 0; i < imgt.paths.size(); ++i) {
+        std::string n = fs::path(imgt.paths[i]).filename().string();
+        if (int(i) == imgt.current && imgt.edit.changed()) n += " *";
+        SendMessageA(imgt.archives, LB_ADDSTRING, 0, (LPARAM)n.c_str());
+    }
+    SendMessageA(imgt.archives, LB_SETCURSEL, imgt.current, 0);
+}
+
+// Rows: the Show filter (by MEd's file types) and the Find text, then the column sort.
+void igRefill() {
+    imgt.rows.clear();
+    const int show = imgt.show ? int(SendMessageA(imgt.show, CB_GETCURSEL, 0, 0)) : 0;
+    static const char* const kTypes[] = {"", "3D Model", "Texture Dictionary", "Collision File", "Binary IPL File"};
+    char buf[128] = "";
+    if (imgt.find) GetWindowTextA(imgt.find, buf, sizeof buf);
+    const std::string needle = toLower(trim(buf));
+    const auto& es = imgt.edit.entries();
+    for (size_t i = 0; i < es.size(); ++i) {
+        if (show > 0 && show < 5 && std::string(imgFileType(es[i].name)) != kTypes[show]) continue;
+        if (!needle.empty() && toLower(es[i].name).find(needle) == std::string::npos) continue;
+        imgt.rows.push_back(int(i));
+    }
+    if (imgt.sortColumn >= 0) {
+        const int c = imgt.sortColumn;
+        auto key = [&](int i) -> std::pair<std::string, uint64_t> {
+            const ImgEditEntry& e = es[size_t(i)];
+            switch (c) {
+                case 1: return {"", e.file.empty() ? e.offset : 0xffffffffull};
+                case 2: return {"", e.size};
+                case 3: return {imgFileType(e.name), 0};
+                case 4: return {ImgEdit::status(e), 0};
+                default: return {toLower(e.name), 0};
+            }
+        };
+        std::stable_sort(imgt.rows.begin(), imgt.rows.end(), [&](int a, int b) { return imgt.sortDescending ? key(b) < key(a) : key(a) < key(b); });
+    }
+    if (imgt.list) {
+        ListView_SetItemCountEx(imgt.list, int(imgt.rows.size()), 0);
+        ListView_SetItemState(imgt.list, -1, 0, LVIS_SELECTED);
+        InvalidateRect(imgt.list, nullptr, TRUE);
+    }
+    igRefreshTitle();
+}
+
+// Leaving an archive with changes (switching, closing): MEd's question. True when it is fine to go on.
+bool igRebuild(bool ask);
+bool igLeave() {
+    if (imgt.current < 0 || !imgt.edit.changed()) return true;
+    const int a = igAsk("This archive has been modified. Changes will not be saved until you rebuild the archive.\n\nWould you like to do this now?\n\n"
+                        "Yes: rebuild it now.   No: forget the changes.   Cancel: stay.",
+                        MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (a == IDCANCEL) return false;
+    if (a == IDYES) return igRebuild(false);
+    return true;
+}
+
+bool igOpenArchive(const std::string& path) {
+    ImgArchive a;
+    std::string err;
+    if (!ImgArchive::open(path, a, err)) {
+        igTell("Invalid Image Archive: " + err, MB_ICONWARNING);
+        return false;
+    }
+    int at = -1;
+    for (size_t i = 0; i < imgt.paths.size(); ++i) if (igSamePath(imgt.paths[i], path)) at = int(i);
+    if (at < 0) { imgt.paths.push_back(path); at = int(imgt.paths.size()) - 1; }
+    imgt.current = at;
+    imgt.edit = ImgEdit(a);
+    igRefill();
+    return true;
+}
+
+bool igSelectArchive(int index) {
+    if (index == imgt.current) return true;
+    if (index < 0 || index >= int(imgt.paths.size()) || !igLeave()) { igRefreshTitle(); return false; }
+    return igOpenArchive(imgt.paths[size_t(index)]);
+}
+
+std::vector<std::string> igSelectedNames() {
+    std::vector<std::string> out;
+    for (int r = ListView_GetNextItem(imgt.list, -1, LVNI_SELECTED); r >= 0; r = ListView_GetNextItem(imgt.list, r, LVNI_SELECTED))
+        if (r < int(imgt.rows.size())) out.push_back(imgt.edit.entries()[size_t(imgt.rows[size_t(r)])].name);
+    return out;
+}
+void igSelectNames(const std::vector<std::string>& names) {
+    ListView_SetItemState(imgt.list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+    for (size_t r = 0; r < imgt.rows.size(); ++r)
+        for (const std::string& n : names)
+            if (toLower(imgt.edit.entries()[size_t(imgt.rows[r])].name) == toLower(n)) ListView_SetItemState(imgt.list, int(r), LVIS_SELECTED, LVIS_SELECTED);
+}
+
+// Which definitions use an entry of the game's gta3.img (its model file or its texture dictionary).
+std::string igUsers(const std::string& name) {
+    if (!igIsGameArchive()) return "";
+    const std::string n = toLower(name), stem = n.substr(0, n.find_last_of('.')), ext = n.substr(n.find_last_of('.') + 1);
+    std::string out;
+    int count = 0;
+    for (const auto& kv : app.defs) {
+        const bool uses = (ext == "dff" && kv.second.model == stem) || (ext == "txd" && kv.second.txd == stem);
+        if (!uses) continue;
+        if (++count <= 6) out += "\n  " + kv.second.name + " (ID " + std::to_string(kv.first) + ", placed " + std::to_string(itPlacedCount(kv.first)) + " times)";
+    }
+    if (count > 6) out += "\n  and " + std::to_string(count - 6) + " more";
+    return out.empty() ? "" : name + " is used by:" + out;
+}
+
+bool igDelete(const std::vector<std::string>& names) {
+    if (imgt.current < 0 || names.empty()) { igTell("Select the file(s) you want to delete first.", MB_ICONWARNING); return false; }
+    std::string q = names.size() == 1 ? "Are you sure you want to delete " + names[0] + "?" : "Are you sure you want to delete the " + std::to_string(names.size()) + " selected files?";
+    std::string users;
+    for (const std::string& n : names) { const std::string u = igUsers(n); if (!u.empty()) users += "\n\n" + u; }
+    if (!users.empty()) q += users + "\n\nWithout it the game cannot load those models (Check Map will report them).";
+    q += "\n\nNothing is written until you rebuild the archive.";
+    if (igAsk(q, MB_YESNO | (users.empty() ? MB_ICONQUESTION : MB_ICONWARNING)) != IDYES) return false;
+    std::string why;
+    for (const std::string& n : names) imgt.edit.remove(n, why);
+    igRefill();
+    return true;
+}
+
+bool igRename(const std::string& from, std::string to) {
+    if (imgt.current < 0 || from.empty()) { igTell("Select the file you want to rename first.", MB_ICONWARNING); return false; }
+    if (to.empty() && !imgt.quiet) {
+        to = from;
+        if (!askText(imgt.wnd, "Rename File", ("New name for " + from + " (at most 23 characters):").c_str(), to)) return false;
+    }
+    std::string why;
+    if (!imgt.edit.rename(from, to, why)) { igTell(why, MB_ICONWARNING); return false; }
+    std::string users = igUsers(from);
+    igRefill();
+    igSelectNames({to});
+    if (!users.empty() && toLower(from) != toLower(to)) igTell(users + "\n\nThey will look for " + from + ", not " + to + ".", MB_ICONWARNING);
+    return true;
+}
+
+// Add files (staged). A name that is already there: replace it (Yes), leave that file out (No) or stop (Cancel).
+int igAdd(const std::vector<std::string>& files) {
+    if (imgt.current < 0) return 0;
+    int added = 0;
+    for (const std::string& f : files) {
+        const std::string name = fs::path(f).filename().string();
+        std::string why;
+        bool replace = false;
+        if (imgt.edit.find(name) >= 0) {
+            const int a = igAsk("The archive already has " + name + ". Replace it with " + f + "?", MB_YESNOCANCEL | MB_ICONQUESTION);
+            if (a == IDCANCEL) break;
+            if (a != IDYES) continue;
+            replace = true;
+        }
+        if (imgt.edit.addFile(f, name, replace, why)) ++added;
+        else igTell("Could not add " + f + ": " + why, MB_ICONWARNING);
+    }
+    igRefill();
+    return added;
+}
+
+std::vector<std::string> igAskFiles() {
+    std::vector<char> buf(32768, 0);
+    OPENFILENAMEA o = {sizeof o};
+    o.hwndOwner = imgt.wnd;
+    o.lpstrFilter = "All files (*.*)\0*.*\0Models, textures, collision\0*.dff;*.txd;*.col\0";
+    o.lpstrFile = buf.data();
+    o.nMaxFile = DWORD(buf.size());
+    o.lpstrTitle = "Please choose the file(s) you wish to add to the image";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+    if (!GetOpenFileNameA(&o)) return {};
+    std::vector<std::string> parts;
+    for (const char* p = buf.data(); *p; p += std::strlen(p) + 1) parts.push_back(p);
+    if (parts.size() == 1) return parts;
+    std::vector<std::string> out;
+    for (size_t i = 1; i < parts.size(); ++i) out.push_back(parts[0] + "\\" + parts[i]);
+    return out;
+}
+
+// Extract (byte copies; an archive entry keeps its sector padding, as MEd's extract and Extract Object do).
+int igExtract(const std::vector<std::string>& names, const std::string& folder) {
+    imgt.extracted.clear();
+    if (imgt.current < 0 || names.empty()) { igTell("Please select the item(s) you wish to extract", MB_ICONWARNING); return 0; }
+    ImgArchive a;
+    std::string err;
+    if (!ImgArchive::open(imgt.edit.imgPath(), a, err)) { igTell(err, MB_ICONWARNING); return 0; }
+    int existing = 0;
+    std::error_code ec;
+    for (const std::string& n : names) existing += fs::exists(fs::path(folder) / imgt.edit.entries()[size_t(imgt.edit.find(n))].name, ec) ? 1 : 0;
+    if (existing && igAsk(std::to_string(existing) + " of the files are already in that folder. Replace them?", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+    int done = 0;
+    std::string failed;
+    for (const std::string& n : names) {
+        const ImgEditEntry& e = imgt.edit.entries()[size_t(imgt.edit.find(n))];
+        const std::string to = (fs::path(folder) / e.name).string();
+        bool ok;
+        if (e.file.empty()) ok = a.extractToFile(e.sourceName, to, err);
+        else { fs::copy_file(e.file, to, fs::copy_options::overwrite_existing, ec); ok = !ec; }
+        if (ok) { ++done; imgt.extracted.push_back(to); }
+        else failed += "\n" + e.name;
+    }
+    if (!failed.empty()) igTell("These could not be extracted:" + failed, MB_ICONWARNING);
+    return done;
+}
+
+std::string igAskFolder() {
+    char last[MAX_PATH] = "";
+    GetPrivateProfileStringA("ImageArchive", "folder", "", last, sizeof last, modIniPath().c_str());
+    BROWSEINFOA bi = {};
+    bi.hwndOwner = imgt.wnd;
+    bi.lpszTitle = "Please choose a location for the extracted files:";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpfn = startFolderProc;
+    bi.lParam = last[0] ? reinterpret_cast<LPARAM>(last) : 0;
+    LPITEMIDLIST pid = SHBrowseForFolderA(&bi);
+    if (!pid) return "";
+    char path[MAX_PATH];
+    const bool got = SHGetPathFromIDListA(pid, path) != FALSE;
+    CoTaskMemFree(pid);
+    if (!got) return "";
+    WritePrivateProfileStringA("ImageArchive", "folder", path, modIniPath().c_str());
+    return path;
+}
+
+// Open File (MEd's preview): a model, texture dictionary or collision file in the viewers. A model's texture dictionary
+// goes along so the viewer can show its textures.
+bool igPreview(const std::string& name) {
+    if (imgt.current < 0 || name.empty()) { igTell("Select a file first.", MB_ICONWARNING); return false; }
+    const std::string ext = toLower(fs::path(name).extension().string());
+    if (ext != ".dff" && ext != ".txd" && ext != ".col") { igTell(name + " is a " + imgFileType(name) + "; only models, texture dictionaries and collision files can be opened.", MB_ICONINFORMATION); return false; }
+    const fs::path dir = fs::temp_directory_path() / ("med_preview_" + std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    std::vector<std::string> names = {name};
+    if (ext == ".dff" && igIsGameArchive())
+        for (const auto& kv : app.defs)
+            if (kv.second.model + ".dff" == toLower(name) && imgt.edit.find(kv.second.txd + ".txd") >= 0) { names.push_back(kv.second.txd + ".txd"); break; }
+    const bool q = imgt.quiet;
+    imgt.quiet = true;
+    const int n = igExtract(names, dir.string());
+    imgt.quiet = q;
+    if (n == 0) { igTell("Could not read " + name + ".", MB_ICONWARNING); return false; }
+    return openLooseFile(imgt.wnd ? imgt.wnd : app.hwnd, imgt.extracted[0]);
+}
+
+// After the game's own gta3.img was rebuilt: the editor reads the new archive, and models and texture dictionaries
+// whose file changed are loaded again when next drawn.
+void igReloadGameArchive(const ImgArchive& reopened, const std::set<std::string>& changedStems) {
+    app.img = reopened;
+    for (const std::string& s : changedStems) {
+        app.models.erase(s);
+        auto t = app.textures.find(s);
+        if (t != app.textures.end()) {
+            for (auto& kv : t->second) glDeleteTextures(1, &kv.second);
+            app.textures.erase(t);
+        }
+    }
+}
+
+bool igRebuild(bool ask) {
+    if (imgt.current < 0) return false;
+    const std::string path = imgt.edit.imgPath();
+    std::error_code ec;
+    uint64_t bytes = 0;
+    for (const ImgEditEntry& e : imgt.edit.entries()) bytes += uint64_t(e.size) * kImgSectorSize;
+    if (ask) {
+        const std::string q = "Rebuild " + path + "?\n\nThe archive is written anew (" + std::to_string(imgt.edit.entries().size()) + " files, about " +
+                              std::to_string(bytes / (1024 * 1024)) + " MB) and swapped in only once every file reads back correctly. " +
+                              (fs::exists(path + ".med-backup", ec) ? "The backup from the first rebuild (" + fs::path(path).filename().string() + ".med-backup) is kept."
+                                                                     : "The archive as it is now is kept as " + fs::path(path).filename().string() + ".med-backup.") +
+                              (igIsGameArchive() && fs::exists(fs::path(path).parent_path() / "med-imports.txt", ec)
+                                   ? "\n\nThe import log (models/med-imports.txt) gets a note that its \"cut gta3.img back\" undo steps no longer apply."
+                                   : "") +
+                              "\n\nClose the game and the Mod Manager first if they are running.";
+        if (igAsk(q, MB_YESNO | MB_ICONQUESTION) != IDYES) return false;
+    }
+    // what changed, for the editor's caches
+    std::set<std::string> stems;
+    {
+        std::set<std::string> now;
+        for (const ImgEditEntry& e : imgt.edit.entries()) {
+            now.insert(toLower(e.sourceName));
+            if (!ImgEdit::status(e).empty()) { stems.insert(toLower(e.name)); stems.insert(toLower(e.sourceName)); }
+        }
+        for (const ImgEntry& e : app.img.entries()) if (!now.count(toLower(e.name))) stems.insert(toLower(e.name));
+    }
+    std::set<std::string> stemOnly;
+    for (const std::string& s : stems) if (!s.empty()) stemOnly.insert(s.substr(0, s.find_last_of('.')));
+    ImgArchive reopened;
+    ImgRebuildReport rep;
+    std::string why;
+    HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    const bool ok = rebuildImg(imgt.edit, reopened, rep, why, [&](size_t done, size_t total) {
+        if (imgt.status && (done % 200 == 0 || done == total)) {
+            const std::string s = "Rebuilding: " + std::to_string(done) + " of " + std::to_string(total) + " files written...";
+            SetWindowTextA(imgt.status, s.c_str());
+            UpdateWindow(imgt.status);
+        }
+    });
+    SetCursor(old);
+    if (!ok) {
+        igTell("The archive was not rebuilt; it is unchanged.\n\n" + why, MB_ICONERROR);
+        igRefreshTitle();
+        return false;
+    }
+    if (igIsGameArchive()) {
+        igReloadGameArchive(reopened, stemOnly);
+        // the import log's "to undo: cut gta3.img back to N bytes" notes describe the archive before this rebuild
+        const fs::path log = fs::path(path).parent_path() / "med-imports.txt";
+        if (fs::exists(log, ec)) {
+            std::ofstream note(log, std::ios::app);
+            const std::time_t now = std::time(nullptr);
+            char when[32];
+            std::strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+            note << when << "  gta3.img rebuilt with the Image Archive tool: the \"to undo\" notes above no longer apply to gta3.img and gta3.dir "
+                 << "(do NOT cut the archive back); remove an imported file with the Image Archive tool (Delete File(s), Rebuild Archive) instead."
+                 << (rep.backupMade ? " The archive before this rebuild is gta3.img.med-backup / gta3.dir.med-backup." : "") << "\n";
+        }
+    }
+    imgt.edit = ImgEdit(reopened);
+    igRefill();
+    std::string msg = "Rebuilt " + path + ": " + std::to_string(rep.entries) + " files, " + std::to_string(rep.bytesAfter / 1024) + " KB (was " +
+                      std::to_string(rep.bytesBefore / 1024) + " KB).";
+    if (rep.backupMade) msg += "\n\nThe archive as it was is kept as " + rep.backupImg + (rep.backupDir.empty() ? "" : " and " + rep.backupDir) + ".";
+    igTell(msg);
+    return true;
+}
+
+void igClose() {
+    if (!imgt.wnd || !igLeave()) return;
+    HWND w = imgt.wnd;
+    imgt.wnd = nullptr;
+    DestroyWindow(w);
+    imgt.current = -1;
+    imgt.edit = ImgEdit();
+    imgt.rows.clear();
+    if (app.hwnd) SetFocus(app.hwnd);
+}
+
+void igCommand(int id) {
+    const std::vector<std::string> sel = igSelectedNames();
+    switch (id) {
+        case ID_IG_OPEN: {
+            char name[MAX_PATH] = "";
+            OPENFILENAMEA o = {sizeof o};
+            o.hwndOwner = imgt.wnd;
+            o.lpstrFilter = "Image Archives (*.img)\0*.img\0";
+            o.lpstrFile = name;
+            o.nMaxFile = MAX_PATH;
+            o.lpstrTitle = "Please choose the location of your file";
+            o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            if (GetOpenFileNameA(&o) && igLeave()) igOpenArchive(name);
+            break;
+        }
+        case ID_IG_ADD: { const auto files = igAskFiles(); if (!files.empty()) igAdd(files); break; }
+        case ID_IG_EXTRACT: {
+            if (sel.empty()) { igTell("Please select the item(s) you wish to extract", MB_ICONWARNING); break; }
+            const std::string folder = igAskFolder();
+            if (!folder.empty()) {
+                const int n = igExtract(sel, folder);
+                if (n) igTell("Extracted " + std::to_string(n) + " file(s) to " + folder + ".");
+            }
+            break;
+        }
+        case ID_IG_DELETE: igDelete(sel); break;
+        case ID_IG_RENAME: igRename(sel.empty() ? "" : sel[0], ""); break;
+        case ID_IG_PREVIEW: igPreview(sel.empty() ? "" : sel[0]); break;
+        case ID_IG_REBUILD: igRebuild(true); break;
+        case ID_IG_CLOSE: igClose(); break;
+    }
+}
+
+LRESULT CALLBACK imgToolProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_CREATE: {
+            auto make = [&](const char* cls, const char* text, DWORD style, DWORD ex, int id) {
+                HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 10, 10, w, (HMENU)(INT_PTR)id, GetModuleHandle(nullptr), nullptr);
+                SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+                return c;
+            };
+            const char* buttons[] = {"Open...", "Import File(s)...", "Extract File(s)...", "Delete File(s)", "Rename File...", "Open File", "Rebuild Archive", "Close"};
+            for (int i = 0; i < 8; ++i) make("BUTTON", buttons[i], BS_PUSHBUTTON | WS_TABSTOP, 0, ID_IG_OPEN + i);
+            make("STATIC", "Show:", SS_LEFT, 0, ID_IG_LBL_SHOW);
+            imgt.show = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, ID_IG_SHOW);
+            for (const char* s : {"Everything", "Only 3D Models", "Only Texture Dictionary Files", "Only Collision Files", "Only Binary IPL Files"})
+                SendMessageA(imgt.show, CB_ADDSTRING, 0, (LPARAM)s);
+            SendMessageA(imgt.show, CB_SETCURSEL, 0, 0);
+            make("STATIC", "Find:", SS_LEFT, 0, ID_IG_LBL_FIND);
+            imgt.find = make("EDIT", "", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, ID_IG_FIND);
+            imgt.archives = make("LISTBOX", "", LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | LBS_NOINTEGRALHEIGHT, WS_EX_CLIENTEDGE, ID_IG_ARCHIVES);
+            imgt.list = make(WC_LISTVIEWA, "", LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS | WS_TABSTOP, WS_EX_CLIENTEDGE, ID_IG_LIST);
+            ListView_SetExtendedListViewStyle(imgt.list, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+            const char* cols[] = {"Name", "Offset", "Size", "Filetype", "Change (until rebuilt)"};
+            const int widths[] = {190, 90, 80, 140, 190};
+            for (int i = 0; i < 5; ++i) {
+                LVCOLUMNA c = {};
+                c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
+                c.fmt = (i == 1 || i == 2) ? LVCFMT_RIGHT : LVCFMT_LEFT;
+                c.pszText = const_cast<char*>(cols[i]);
+                c.cx = widths[i];
+                ListView_InsertColumn(imgt.list, i, &c);
+            }
+            imgt.status = make("STATIC", "Image Archive: Ready.", SS_LEFT, 0, ID_IG_STATUS);
+            return 0;
+        }
+        case WM_SIZE: {
+            const int cw = LOWORD(lp), ch = HIWORD(lp), m = 8;
+            const int bw = (cw - 2 * m - 7 * 4) / 8;
+            for (int i = 0; i < 8; ++i) MoveWindow(GetDlgItem(w, ID_IG_OPEN + i), m + i * (bw + 4), m, bw, 26, TRUE);
+            int y = m + 32;
+            MoveWindow(GetDlgItem(w, ID_IG_LBL_SHOW), m + 200, y + 4, 36, 16, TRUE);
+            MoveWindow(imgt.show, m + 238, y, 200, 300, TRUE);
+            MoveWindow(GetDlgItem(w, ID_IG_LBL_FIND), m + 452, y + 4, 32, 16, TRUE);
+            MoveWindow(imgt.find, m + 486, y, std::max(80, cw - m - 486 - m), 22, TRUE);
+            y += 28;
+            MoveWindow(imgt.archives, m, y, 192, ch - y - 30, TRUE);
+            MoveWindow(imgt.list, m + 200, y, cw - 2 * m - 200, ch - y - 30, TRUE);
+            MoveWindow(imgt.status, m, ch - 24, cw - 2 * m, 18, TRUE);
+            return 0;
+        }
+        case WM_COMMAND: {
+            const int id = LOWORD(wp), code = HIWORD(wp);
+            if (id >= ID_IG_OPEN && id <= ID_IG_CLOSE && code == BN_CLICKED) igCommand(id);
+            else if (id == ID_IG_SHOW && code == CBN_SELCHANGE) igRefill();
+            else if (id == ID_IG_FIND && code == EN_CHANGE) igRefill();
+            else if (id == ID_IG_ARCHIVES && code == LBN_SELCHANGE) igSelectArchive(int(SendMessageA(imgt.archives, LB_GETCURSEL, 0, 0)));
+            return 0;
+        }
+        case WM_NOTIFY: {
+            NMHDR* h = reinterpret_cast<NMHDR*>(lp);
+            if (h->hwndFrom != imgt.list) break;
+            if (h->code == LVN_GETDISPINFOA) {
+                NMLVDISPINFOA* d = reinterpret_cast<NMLVDISPINFOA*>(lp);
+                if (!(d->item.mask & LVIF_TEXT) || d->item.iItem < 0 || d->item.iItem >= int(imgt.rows.size())) return 0;
+                const ImgEditEntry& e = imgt.edit.entries()[size_t(imgt.rows[size_t(d->item.iItem)])];
+                std::string s;
+                char b[32];
+                switch (d->item.iSubItem) {
+                    case 0: s = e.name; break;
+                    case 1: if (e.file.empty()) { std::snprintf(b, sizeof b, "%x", unsigned(e.offset) << 11); s = b; } else s = "(new)"; break;  // MEd: hex bytes
+                    case 2: s = std::to_string(uint64_t(e.size) * kImgSectorSize / 1024) + " KB"; break;
+                    case 3: s = imgFileType(e.name); break;
+                    case 4: s = ImgEdit::status(e); break;
+                }
+                lstrcpynA(d->item.pszText, s.c_str(), d->item.cchTextMax);
+                return 0;
+            }
+            if (h->code == LVN_COLUMNCLICK) {
+                const int c = reinterpret_cast<NMLISTVIEW*>(lp)->iSubItem;
+                imgt.sortDescending = imgt.sortColumn == c ? !imgt.sortDescending : false;
+                imgt.sortColumn = c;
+                igRefill();
+                return 0;
+            }
+            if (h->code == NM_DBLCLK) { const auto s = igSelectedNames(); if (!s.empty()) igPreview(s[0]); return 0; }
+            if (h->code == NM_RCLICK) {  // CIMGTreeView's menu
+                HMENU menu = CreatePopupMenu();
+                const bool any = !igSelectedNames().empty();
+                AppendMenuA(menu, MF_STRING | (any ? 0 : MF_GRAYED), ID_IG_PREVIEW, "Open File");
+                AppendMenuA(menu, MF_STRING, ID_IG_ADD, "Import File(s)...");
+                AppendMenuA(menu, MF_STRING | (any ? 0 : MF_GRAYED), ID_IG_EXTRACT, "Extract File(s)...");
+                AppendMenuA(menu, MF_STRING | (any ? 0 : MF_GRAYED), ID_IG_DELETE, "Delete File(s)\tDel");
+                AppendMenuA(menu, MF_STRING | (any ? 0 : MF_GRAYED), ID_IG_RENAME, "Rename File...\tF2");
+                POINT pt;
+                GetCursorPos(&pt);
+                const int cmd = int(TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, w, nullptr));
+                DestroyMenu(menu);
+                if (cmd) igCommand(cmd);
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE: igClose(); return 0;
+        case WM_DESTROY: if (imgt.wnd == w) imgt.wnd = nullptr; return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// File > Image Archive...: the tool on the game's gta3.img.
+void showImgTool(HWND owner) {
+    if (imgt.wnd) { SetForegroundWindow(imgt.wnd); return; }
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = imgToolProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdImgTool";
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    RECT r;
+    GetWindowRect(owner, &r);
+    imgt.wnd = CreateWindowExA(0, "MEdImgTool", "Image Archive", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE, r.left + 60, r.top + 60, 980, 620, owner, nullptr,
+                               GetModuleHandle(nullptr), nullptr);
+    imgt.paths = igGameArchives();
+    imgt.current = -1;
+    imgt.sortColumn = -1;
+    if (!imgt.paths.empty()) igOpenArchive(imgt.paths[0]);
+    else igRefreshTitle();
+}
+
+// Del, F2 and Enter in the file list (called from the message loop).
+bool igHandleKey(const MSG& m) {
+    if (!imgt.wnd || m.message != WM_KEYDOWN || m.hwnd != imgt.list) return false;
+    if (m.wParam == VK_DELETE) { igCommand(ID_IG_DELETE); return true; }
+    if (m.wParam == VK_F2) { igCommand(ID_IG_RENAME); return true; }
+    if (m.wParam == VK_RETURN) { igCommand(ID_IG_PREVIEW); return true; }
+    return false;
+}
+
 // The tabs at the top of the left column: Scene (which regions are shown), Placements and Item.
 void showLeftTab(int tab) {
     if (app.leftTabs) TabCtrl_SetCurSel(app.leftTabs, tab);
     if (app.scenePanel) ShowWindow(app.scenePanel, tab == 0 ? SW_SHOW : SW_HIDE);
     if (pl.panel) ShowWindow(pl.panel, tab == 1 ? SW_SHOW : SW_HIDE);
     if (it.panel) ShowWindow(it.panel, tab == 2 ? SW_SHOW : SW_HIDE);
+}
+
+bool enterFullScreen(HWND h, bool ask) {
+    if (fullScr.on) return true;
+    if (ask && MessageBoxA(h, kFullScreenQuestion, "MEd", MB_YESNO | MB_ICONQUESTION) != IDYES) return false;
+    if (roadStripOpen()) closeRoadStrip();
+    fullScr.place.length = sizeof fullScr.place;
+    GetWindowPlacement(h, &fullScr.place);
+    fullScr.style = GetWindowLongA(h, GWL_STYLE);
+    fullScr.leftW = app.leftW; fullScr.inspectorW = app.inspectorW; fullScr.toolbarH = app.toolbarH;
+    fullScr.menubarH = app.menubarH; fullScr.leftTabH = app.leftTabH;
+    fullScr.hidden.clear();
+    for (HWND c : {app.menubar, app.toolbar, app.leftTabs, app.scenePanel, pl.panel, it.panel, app.inspector})
+        if (c && IsWindowVisible(c)) { fullScr.hidden.push_back(c); ShowWindow(c, SW_HIDE); }
+    fullScr.on = true;
+    app.leftW = app.inspectorW = app.toolbarH = app.menubarH = app.leftTabH = 0;  // the 3D view is the whole window
+    MONITORINFO mi = {sizeof mi};
+    GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
+    SetWindowLongA(h, GWL_STYLE, (fullScr.style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE);
+    SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    RECT cr;
+    GetClientRect(h, &cr);
+    SendMessageA(h, WM_SIZE, SIZE_RESTORED, MAKELPARAM(cr.right, cr.bottom));
+    SetFocus(h);
+    return true;
+}
+
+void leaveFullScreen(HWND h) {
+    if (!fullScr.on) return;
+    fullScr.on = false;
+    app.leftW = fullScr.leftW; app.inspectorW = fullScr.inspectorW; app.toolbarH = fullScr.toolbarH;
+    app.menubarH = fullScr.menubarH; app.leftTabH = fullScr.leftTabH;
+    SetWindowLongA(h, GWL_STYLE, fullScr.style);
+    SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    SetWindowPlacement(h, &fullScr.place);
+    for (HWND c : fullScr.hidden) ShowWindow(c, SW_SHOW);
+    fullScr.hidden.clear();
+    RECT cr;
+    GetClientRect(h, &cr);
+    SendMessageA(h, WM_SIZE, SIZE_RESTORED, MAKELPARAM(cr.right, cr.bottom));
+    SetFocus(h);
 }
 
 void createPlacementsPanel(HWND parent) {
@@ -10048,12 +11088,799 @@ void runBookmarksSelfTest(SelfTest& t) {
     app.bookmarks = realList;
 }
 
+// ---- full screen: med_viewer <game copy> --selftest (MED_SELFTEST_ONLY=fullscreen) -----------------------------
+struct FsLook {  // what full screen must give back exactly
+    RECT rect = {};
+    LONG style = 0;
+    bool zoomed = false;
+    int width = 0, height = 0, viewX = 0, toolbarH = 0, leftW = 0, inspectorW = 0, tab = 0;
+    std::vector<bool> shown;
+};
+FsLook fsLook() {
+    FsLook l;
+    GetWindowRect(app.hwnd, &l.rect);
+    l.style = GetWindowLongA(app.hwnd, GWL_STYLE);
+    l.zoomed = IsZoomed(app.hwnd) != FALSE;
+    l.width = app.width; l.height = app.height; l.viewX = app.viewX; l.toolbarH = app.toolbarH; l.leftW = app.leftW;
+    l.inspectorW = app.inspectorW;
+    l.tab = app.leftTabs ? TabCtrl_GetCurSel(app.leftTabs) : 0;
+    for (HWND c : {app.menubar, app.toolbar, app.leftTabs, app.scenePanel, pl.panel, it.panel, app.inspector}) l.shown.push_back(c && IsWindowVisible(c));
+    return l;
+}
+std::string fsDiff(const FsLook& a, const FsLook& b) {
+    std::string d;
+    if (!EqualRect(&a.rect, &b.rect)) d += " window rectangle";
+    if (a.style != b.style) d += " style";
+    if (a.zoomed != b.zoomed) d += " maximised";
+    if (a.width != b.width || a.height != b.height || a.viewX != b.viewX || a.toolbarH != b.toolbarH) d += " 3D view layout";
+    if (a.leftW != b.leftW || a.inspectorW != b.inspectorW) d += " panel widths";
+    if (a.tab != b.tab) d += " left tab";
+    if (a.shown != b.shown) d += " panel visibility";
+    return d;
+}
+
+void stFullScreenCheck(SelfTest& t, const std::string& where) {
+    MONITORINFO mi = {sizeof mi};
+    GetMonitorInfoA(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT r, cr;
+    GetWindowRect(app.hwnd, &r);
+    GetClientRect(app.hwnd, &cr);
+    const LONG style = GetWindowLongA(app.hwnd, GWL_STYLE);
+    ST_CHECK(t, fullScr.on, where + ": full screen is on");
+    ST_CHECK(t, EqualRect(&r, &mi.rcMonitor), where + ": the window covers the whole monitor");
+    ST_CHECK(t, (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION && !(style & WS_THICKFRAME), where + ": no title bar or frame");
+    for (HWND c : {app.menubar, app.toolbar, app.leftTabs, app.scenePanel, pl.panel, it.panel, app.inspector})
+        ST_CHECK(t, !c || !IsWindowVisible(c), where + ": every toolbar and panel is hidden");
+    ST_CHECK(t, app.viewX == 0 && app.toolbarH == 0 && app.width == cr.right && app.height == cr.bottom,
+             where + ": the 3D view is the whole window (" + std::to_string(app.width) + " x " + std::to_string(app.height) + ")");
+}
+
+void runFullScreenSelfTest(SelfTest& t) {
+    std::printf("full screen self-test\n");
+    std::fflush(stdout);
+    ShowWindow(app.hwnd, SW_RESTORE);
+    const FsLook before = fsLook();
+    ST_CHECK(t, !fullScr.on && before.toolbarH > 0 && before.leftW > 0, "starts in the normal window");
+    leaveFullScreen(app.hwnd);
+    ST_CHECK(t, fsDiff(before, fsLook()).empty(), "leaving when not full screen changes nothing:" + fsDiff(before, fsLook()));
+
+    // the four ways out (MEd's help: double-click, Enter, Esc, F11), each from a different left tab
+    struct Way { const char* name; UINT msg; WPARAM w; };
+    const Way ways[] = {{"double-click", WM_LBUTTONDBLCLK, 0}, {"Enter", WM_KEYDOWN, VK_RETURN}, {"Esc", WM_KEYDOWN, VK_ESCAPE}, {"F11", WM_KEYDOWN, VK_F11}};
+    int tab = 0;
+    for (const Way& way : ways) {
+        showLeftTab(tab = (tab + 1) % 3);
+        const FsLook look = fsLook();
+        if (!app.instances.empty()) app.selected.assign(1, 0);
+        const std::vector<int> sel = app.selected;
+        const std::string map = stMapState();
+        ST_CHECK(t, enterFullScreen(app.hwnd, false), std::string("enter (") + way.name + ")");
+        stFullScreenCheck(t, std::string("entered before ") + way.name);
+        ST_CHECK(t, enterFullScreen(app.hwnd, false) && fullScr.on, "entering again while full screen is harmless");
+        stFullScreenCheck(t, "entered twice");
+        // editing is off: Delete and a right-click do nothing to the map
+        SendMessageA(app.hwnd, WM_KEYDOWN, VK_DELETE, 0);
+        SendMessageA(app.hwnd, WM_KEYUP, VK_DELETE, 0);
+        SendMessageA(app.hwnd, WM_RBUTTONDOWN, 0, MAKELPARAM(app.width / 2, app.height / 2));
+        ST_CHECK(t, stMapState() == map && app.selected == sel, std::string("no edit while full screen (") + way.name + ")");
+        ST_CHECK(t, fullScr.on, "Delete and right-click do not leave full screen");
+        SendMessageA(app.hwnd, way.msg, way.w, MAKELPARAM(app.width / 2, app.height / 2));
+        if (way.msg == WM_KEYDOWN) SendMessageA(app.hwnd, WM_KEYUP, way.w, 0);
+        ST_CHECK(t, !fullScr.on, std::string(way.name) + " leaves full screen");
+        ST_CHECK(t, fsDiff(look, fsLook()).empty(), std::string("after ") + way.name + " the window is as before:" + fsDiff(look, fsLook()));
+        ST_CHECK(t, stMapState() == map && app.selected == sel, std::string("leaving with ") + way.name + " does not select or change anything");
+    }
+    app.selected.clear();
+
+    // a maximised window comes back maximised
+    ShowWindow(app.hwnd, SW_MAXIMIZE);
+    const FsLook maxi = fsLook();
+    enterFullScreen(app.hwnd, false);
+    stFullScreenCheck(t, "from maximised");
+    leaveFullScreen(app.hwnd);
+    ST_CHECK(t, fsDiff(maxi, fsLook()).empty() && IsZoomed(app.hwnd), "a maximised window comes back maximised:" + fsDiff(maxi, fsLook()));
+    ShowWindow(app.hwnd, SW_RESTORE);
+
+    // the road strip closes on the way in
+    for (size_t i = 0; i < app.instances.size(); ++i)
+        if (isRoadPiece(int(i))) {
+            app.selected.assign(1, int(i));
+            openRoadStrip(int(i), 0);
+            break;
+        }
+    ST_CHECK(t, roadStripOpen(), "the test opened a road strip");
+    enterFullScreen(app.hwnd, false);
+    ST_CHECK(t, !roadStripOpen(), "the road strip is closed in full screen");
+    leaveFullScreen(app.hwnd);
+    app.selected.clear();
+
+    // random sequence: tabs, size changes, in and out
+    FsLook expect = fsLook();
+    unsigned seed = 4242;
+    auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return int((seed >> 8) % unsigned(n)); };
+    for (int step = 0; step < 80; ++step) {
+        const int op = rnd(5);
+        const std::string where = "random step " + std::to_string(step);
+        if (fullScr.on) {
+            const WPARAM keys[3] = {VK_ESCAPE, VK_RETURN, VK_F11};
+            if (op == 0) SendMessageA(app.hwnd, WM_LBUTTONDBLCLK, 0, MAKELPARAM(rnd(app.width), rnd(app.height)));
+            else if (op < 4) { SendMessageA(app.hwnd, WM_KEYDOWN, keys[op - 1], 0); SendMessageA(app.hwnd, WM_KEYUP, keys[op - 1], 0); }
+            else { SendMessageA(app.hwnd, WM_KEYDOWN, 'W', 0); SendMessageA(app.hwnd, WM_KEYUP, 'W', 0); }  // a camera key does not leave
+            if (op == 4) stFullScreenCheck(t, where + " (camera key)");
+            else ST_CHECK(t, !fullScr.on && fsDiff(expect, fsLook()).empty(), where + " left as before:" + fsDiff(expect, fsLook()));
+        } else if (op <= 1) {
+            expect = fsLook();
+            enterFullScreen(app.hwnd, false);
+            stFullScreenCheck(t, where + " (enter)");
+        } else if (op == 2) {
+            showLeftTab(rnd(3));
+        } else {
+            RECT r;
+            GetWindowRect(app.hwnd, &r);
+            MoveWindow(app.hwnd, r.left, r.top, 900 + rnd(400), 650 + rnd(300), TRUE);
+        }
+    }
+    leaveFullScreen(app.hwnd);
+    MoveWindow(app.hwnd, before.rect.left, before.rect.top, before.rect.right - before.rect.left, before.rect.bottom - before.rect.top, TRUE);
+    showLeftTab(before.tab);
+    ST_CHECK(t, fsDiff(before, fsLook()).empty(), "the window ends as it started:" + fsDiff(before, fsLook()));
+}
+
+// ---- Item Definition Entry: med_viewer <game copy> --selftest (MED_SELFTEST_ONLY=ide) ------------------------------
+IdeObject stIdeDisk(int id) {  // the definition as saved on disk
+    bool ok;
+    IdeEntryLoc loc;
+    const std::string text = slurp(app.root + "/" + app.defs[id].ideRel, ok);
+    if (ok) findIdeEntry(text, id, loc);
+    return loc.object;
+}
+IdeObject stIdeNow(int id) {
+    IdeObject o;
+    std::string key, text;
+    ideCurrent(id, o, key, text);
+    return o;
+}
+bool stSameDef(const IdeObject& a, const IdeObject& b) {
+    return a.id == b.id && a.model == b.model && a.txd == b.txd && a.drawDistances == b.drawDistances && a.flags == b.flags && a.timed == b.timed &&
+           (!a.timed || (a.timeOn == b.timeOn && a.timeOff == b.timeOff));
+}
+void stIeType(HWND field, const std::string& text) { SendMessageA(field, WM_SETTEXT, 0, (LPARAM)text.c_str()); }  // EN_CHANGE follows
+void stIeCombo(HWND combo, int index) {
+    SendMessageA(combo, CB_SETCURSEL, index, 0);
+    SendMessageA(ie.wnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(combo), CBN_SELCHANGE), (LPARAM)combo);
+}
+void stIeButton(int id) { SendMessageA(ie.wnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)GetDlgItem(ie.wnd, id)); }
+std::string stWinText(HWND h) { char b[512] = ""; GetWindowTextA(h, b, sizeof b); return b; }
+
+// Everything that must hold after any step: the editor's model table follows the definitions, a file is pending exactly
+// when it differs from disk, every pending file parses cleanly and differs from disk only in the models touched, and the
+// open window's boxes, type line and title agree with what it shows.
+void stIdeInvariants(SelfTest& t, const std::set<int>& touched, const std::string& where) {
+    for (int id : touched) {
+        const IdeObject now = stIdeNow(id);
+        const ModelDef& d = app.defs[id];
+        const double dd = now.drawDistances.empty() ? 300 : *std::max_element(now.drawDistances.begin(), now.drawDistances.end());
+        ST_CHECK(t, d.txd == toLower(now.txd) && d.drawDistance == dd && d.timed == now.timed && d.farModel == isFarModel(d.model, dd) && d.ideLine == formatIdeEntry(now),
+                 where + ": the editor's table follows the definition of " + d.name);
+    }
+    for (const auto& kv : app.ideText) {
+        bool ok;
+        const std::string disk = slurp(app.root + "/" + app.ideRelOf[kv.first], ok);
+        ST_CHECK(t, ok && disk != kv.second, where + ": " + kv.first + " is pending only while it differs from disk");
+        const IdeFile a = parseIde(disk, GameVersion::GTA3), b = parseIde(kv.second, GameVersion::GTA3);
+        ST_CHECK(t, b.warnings.empty() && a.objects.size() == b.objects.size() && a.otherSections.size() == b.otherSections.size(),
+                 where + ": " + kv.first + " still parses cleanly with the same entries");
+        for (const IdeObject& o : b.objects) {
+            if (touched.count(o.id)) continue;
+            bool same = false;
+            for (const IdeObject& q : a.objects) same = same || (q.id == o.id && stSameDef(q, o));
+            ST_CHECK(t, same, where + ": untouched definition " + std::to_string(o.id) + " is unchanged in " + kv.first);
+        }
+    }
+    for (int id : touched) {  // a touched file that is not pending is identical to disk
+        const std::string key = toLower(app.defs[id].ideRel);
+        if (!app.ideText.count(key)) ST_CHECK(t, stSameDef(stIdeNow(id), stIdeDisk(id)), where + ": " + app.defs[id].name + " is back to the saved definition");
+    }
+    if (ie.wnd) {
+        char* end = nullptr;
+        const std::string ft = stWinText(ie.flags);
+        const long v = std::strtol(ft.c_str(), &end, 10);
+        if (!ft.empty() && !*end)
+            for (int i = 0; i < kIdeFlagCount; ++i)
+                ST_CHECK(t, (SendMessageA(ie.box[i], BM_GETCHECK, 0, 0) == BST_CHECKED) == ((v & ideFlag(i).bit) != 0), where + ": flag box " + std::to_string(i) + " follows the number");
+        const IdeObject now = stIdeNow(ie.id);
+        ST_CHECK(t, stWinText(ie.type).find(now.timed ? "tobj" : "objs") != std::string::npos, where + ": the type line says objs or tobj");
+        const bool pending = app.ideText.count(toLower(app.defs[ie.id].ideRel)) > 0;
+        const std::string title = stWinText(ie.wnd);
+        ST_CHECK(t, (title.find(" *") != std::string::npos) == pending, where + ": the title's * shows unsaved changes");
+        ST_CHECK(t, stWinText(ie.idBox) == std::to_string(ie.id) && stWinText(ie.model) == now.model, where + ": ID and model shown");
+    }
+}
+
+void runIdeEditSelfTest(SelfTest& t) {
+    std::printf("Item Definition Entry self-test\n");
+    std::fflush(stdout);
+    ie.quiet = true;
+    insp.quiet = true;
+    auto idOf = [](const std::string& name) {
+        for (const auto& kv : app.defs) if (kv.second.model == toLower(name)) return kv.first;
+        return -1;
+    };
+    const int hosp = idOf("hospitaland"), cone = idOf("trafficcone");
+    int timedId = -1, twoId = -1, sameFile = -1;
+    for (const auto& kv : app.defs) {
+        const IdeObject o = stIdeDisk(kv.first);
+        if (timedId < 0 && o.timed) timedId = kv.first;
+        if (twoId < 0 && o.drawDistances.size() > 1) twoId = kv.first;
+        if (sameFile < 0 && kv.first != hosp && kv.second.ideRel == app.defs[hosp].ideRel) sameFile = kv.first;
+    }
+    ST_CHECK(t, hosp >= 0 && cone >= 0 && timedId >= 0 && sameFile >= 0, "the test needs hospitaland, trafficcone, a tobj and a second model of hospitaland's file");
+    if (hosp < 0 || cone < 0 || timedId < 0 || sameFile < 0) return;
+    std::printf("  models: hospitaland %d, trafficcone %d, tobj %d (%s), two distances %d\n", hosp, cone, timedId, app.defs[timedId].name.c_str(), twoId);
+    const std::string hospKey = toLower(app.defs[hosp].ideRel);
+    std::set<int> touched = {hosp, cone, timedId, sameFile};
+    if (twoId >= 0) touched.insert(twoId);
+    const IdeObject hospDisk = stIdeDisk(hosp);
+    bool ok;
+    const std::string hospFileDisk = slurp(app.root + "/" + app.defs[hosp].ideRel, ok);
+    const std::string mapBefore = stMapState();
+    const int checkErrorsBefore = runCheck().count(Severity::Error);  // the test copy leaves some of default.dat's files out
+
+    // 1. opening shows the definition
+    ST_CHECK(t, !openIdeEditor(app.hwnd, 99999) && !ie.wnd && !ie.lastMessage.empty(), "an unknown id is refused and opens nothing");
+    ST_CHECK(t, openIdeEditor(app.hwnd, hosp) && ie.wnd, "the window opens on hospitaland");
+    ST_CHECK(t, stWinText(ie.txd) == hospDisk.txd && stWinText(ie.count) == std::to_string(hospDisk.drawDistances.size()) &&
+                    stWinText(ie.dist[0]) == ieNum(hospDisk.drawDistances[0]) && stWinText(ie.flags) == std::to_string(hospDisk.flags),
+             "the fields show hospitaland's definition");
+    ST_CHECK(t, SendMessageA(ie.on, CB_GETCURSEL, 0, 0) == 0 && SendMessageA(ie.off, CB_GETCURSEL, 0, 0) == 0, "an objs entry shows 00:00 / 00:00");
+    ST_CHECK(t, !IsWindowEnabled(ie.dist[1]) && !IsWindowEnabled(ie.dist[2]), "one draw distance: the other two boxes are off");
+    ST_CHECK(t, (GetWindowLongA(ie.idBox, GWL_STYLE) & ES_READONLY) && (GetWindowLongA(ie.model, GWL_STYLE) & ES_READONLY) && (GetWindowLongA(ie.count, GWL_STYLE) & ES_READONLY),
+             "ID, model name and object count are read-only");
+    ST_CHECK(t, app.ideText.empty(), "opening changes nothing");
+    stIdeInvariants(t, touched, "opened");
+
+    // 2. a draw distance: applied at once, only that line changes
+    stIeType(ie.dist[0], "250.5");
+    ST_CHECK(t, ie.lastMessage.empty() && stIdeNow(hosp).drawDistances[0] == 250.5 && app.defs[hosp].drawDistance == 250.5, "draw distance 250.5 applies at once");
+    ST_CHECK(t, app.ideText.count(hospKey) == 1, "the IDE file is pending");
+    {
+        IdeObject expect = hospDisk;
+        expect.drawDistances[0] = 250.5;
+        std::string text = hospFileDisk, why;
+        setIdeEntry(text, expect, why);
+        ST_CHECK(t, app.ideText[hospKey] == text, "the pending file is the disk file with exactly that line changed");
+    }
+    stIdeInvariants(t, touched, "distance");
+    for (const char* bad : {"abc", "", "-5", "10001", "1e999", "5,5", "nan"}) {
+        stIeType(ie.dist[0], bad);
+        ST_CHECK(t, !ie.lastMessage.empty() && stIdeNow(hosp).drawDistances[0] == 250.5, std::string("distance '") + bad + "' is refused and changes nothing");
+        ST_CHECK(t, stWinText(ie.status).find("Not applied") == 0, "the window says why");
+    }
+    stIeType(ie.dist[0], "0");
+    ST_CHECK(t, ie.lastMessage.empty() && stIdeNow(hosp).drawDistances[0] == 0, "0 is accepted (Rockstar ships one)");
+    stIeType(ie.dist[0], "152.25");
+    ST_CHECK(t, stIdeNow(hosp).drawDistances[0] == 152.25 && app.ideText[hospKey].find(", 152.25, ") != std::string::npos, "decimals are kept (MEd lost them)");
+
+    // 3. flags: boxes and number in step
+    stIeType(ie.flags, "68");
+    ST_CHECK(t, stIdeNow(hosp).flags == 68, "typed flags 68 apply");
+    for (int i = 0; i < kIdeFlagCount; ++i)
+        ST_CHECK(t, (SendMessageA(ie.box[i], BM_GETCHECK, 0, 0) == BST_CHECKED) == (i == 2 || i == 6), "68 ticks the 4 and 64 boxes only");
+    SendMessageA(ie.box[0], BM_CLICK, 0, 0);
+    ST_CHECK(t, stWinText(ie.flags) == "69" && stIdeNow(hosp).flags == 69, "ticking box 1 makes 69");
+    SendMessageA(ie.box[6], BM_CLICK, 0, 0);
+    ST_CHECK(t, stWinText(ie.flags) == "5" && stIdeNow(hosp).flags == 5, "unticking box 64 makes 5");
+    SendMessageA(ie.box[10], BM_CLICK, 0, 0);
+    ST_CHECK(t, stIdeNow(hosp).flags == 1029, "box 1024 (not used by GTA III) is still kept in the file, as MEd does");
+    stIeType(ie.flags, "2048");
+    ST_CHECK(t, !ie.lastMessage.empty() && stIdeNow(hosp).flags == 1029, "2048 is refused");
+    stIeType(ie.flags, "x");
+    ST_CHECK(t, !ie.lastMessage.empty() && stIdeNow(hosp).flags == 1029, "a word is refused");
+    stIeType(ie.txd, "nosuch");
+    ST_CHECK(t, !ie.lastMessage.empty() && ie.lastMessage.find("Parameters") != std::string::npos, "while one field is wrong nothing else applies, and it says which");
+    stIeType(ie.flags, "1029");
+    ST_CHECK(t, ie.lastMessage.find("texture dictionary") != std::string::npos, "with the number fixed the other wrong field is reported");
+    stIeType(ie.txd, hospDisk.txd);
+    ST_CHECK(t, ie.lastMessage.empty() && stIdeNow(hosp).flags == 1029, "all fields right again: applied");
+    stIdeInvariants(t, touched, "flags");
+
+    // 4. texture dictionary: must exist in gta3.img; the model is built again with it
+    const std::string otherTxd = app.defs[cone].txd;
+    stIeType(ie.txd, "nosuchdictionary");
+    ST_CHECK(t, !ie.lastMessage.empty() && app.defs[hosp].txd == toLower(hospDisk.txd), "a texture dictionary missing from gta3.img is refused");
+    stIeType(ie.txd, "two words");
+    ST_CHECK(t, !ie.lastMessage.empty(), "a name with a space is refused");
+    getModel(app.defs[hosp].model, app.defs[hosp].txd);
+    stIeType(ie.txd, otherTxd);
+    ST_CHECK(t, ie.lastMessage.empty() && app.defs[hosp].txd == otherTxd && !app.models.count(app.defs[hosp].model), "another dictionary applies and the model is rebuilt [" + ie.lastMessage + "]");
+    stIeType(ie.txd, hospDisk.txd);
+    stIdeInvariants(t, touched, "txd");
+
+    // 5. hours: objs <-> tobj, as MEd decides it
+    stIeCombo(ie.on, 20);
+    ST_CHECK(t, stIdeNow(hosp).timed && stIdeNow(hosp).timeOn == 20 && stIdeNow(hosp).timeOff == 0 && app.defs[hosp].timed, "Time On 20:00 makes it a tobj entry [" + ie.lastMessage + "]");
+    ST_CHECK(t, parseIde(app.ideText[hospKey], GameVersion::GTA3).warnings.empty(), "the moved line leaves a clean file");
+    stIeCombo(ie.off, 20);
+    ST_CHECK(t, !ie.lastMessage.empty() && stIdeNow(hosp).timeOff == 0, "on and off at the same hour is refused");
+    stIeCombo(ie.off, 6);
+    ST_CHECK(t, ie.lastMessage.empty() && stIdeNow(hosp).timeOff == 6, "20:00 to 06:00 applies [" + ie.lastMessage + "]");
+    stIdeInvariants(t, touched, "hours");
+    stIeCombo(ie.on, 0);
+    stIeCombo(ie.off, 0);
+    ST_CHECK(t, !stIdeNow(hosp).timed && !app.defs[hosp].timed, "both 00:00: objs again");
+
+    // 6. Undo: back to what the window opened with, and the file is no longer pending
+    stIeButton(ID_IE_UNDO);
+    ST_CHECK(t, stSameDef(stIdeNow(hosp), hospDisk) && !app.ideText.count(hospKey), "Undo gives the opened definition back, nothing pending");
+    ST_CHECK(t, stWinText(ie.dist[0]) == ieNum(hospDisk.drawDistances[0]) && stWinText(ie.flags) == std::to_string(hospDisk.flags), "Undo shows it again");
+    stIdeInvariants(t, touched, "undo");
+
+    // 7. Cancel undoes and closes; Save keeps and closes; Esc / Enter do the same; the X is Cancel
+    stIeType(ie.dist[0], "77");
+    stIeButton(ID_IE_CANCEL);
+    ST_CHECK(t, !ie.wnd && stSameDef(stIdeNow(hosp), hospDisk) && app.ideText.empty(), "Cancel undoes and closes");
+    openIdeEditor(app.hwnd, hosp);
+    stIeType(ie.dist[0], "77");
+    stIeButton(ID_IE_SAVE);
+    ST_CHECK(t, !ie.wnd && stIdeNow(hosp).drawDistances[0] == 77 && app.ideText.count(hospKey), "Save keeps it (pending) and closes");
+    openIdeEditor(app.hwnd, hosp);
+    ST_CHECK(t, stWinText(ie.dist[0]) == "77", "reopening shows the kept value");
+    stIeType(ie.dist[0], "88");
+    {
+        MSG m = {};
+        m.hwnd = ie.dist[0];
+        m.message = WM_KEYDOWN;
+        m.wParam = VK_ESCAPE;
+        ST_CHECK(t, ieHandleKey(m) && !ie.wnd && stIdeNow(hosp).drawDistances[0] == 77, "Esc cancels back to the opened 77");
+        openIdeEditor(app.hwnd, hosp);
+        stIeType(ie.dist[0], "99");
+        m.hwnd = ie.dist[0];
+        m.wParam = VK_RETURN;
+        ST_CHECK(t, ieHandleKey(m) && !ie.wnd && stIdeNow(hosp).drawDistances[0] == 99, "Enter saves");
+        m.hwnd = app.hwnd;
+        ST_CHECK(t, !ieHandleKey(m), "keys outside the window are not taken");
+    }
+    openIdeEditor(app.hwnd, hosp);
+    stIeType(ie.dist[0], "111");
+    SendMessageA(ie.wnd, WM_CLOSE, 0, 0);
+    ST_CHECK(t, !ie.wnd && stIdeNow(hosp).drawDistances[0] == 99, "the X closes like Cancel");
+    openIdeEditor(app.hwnd, hosp);
+    stIeType(ie.dist[0], "123");
+    openIdeEditor(app.hwnd, sameFile);  // switching models keeps the first one's change
+    ST_CHECK(t, ie.id == sameFile && stIdeNow(hosp).drawDistances[0] == 123, "opening another model keeps the change of the first");
+    stIeType(ie.dist[0], "44");
+    ST_CHECK(t, stIdeNow(sameFile).drawDistances[0] == 44 && stIdeNow(hosp).drawDistances[0] == 123, "two models of the same file both pending");
+    stIdeInvariants(t, touched, "two in one file");
+
+    // 8. a tobj entry and a two-distance model
+    openIdeEditor(app.hwnd, timedId);
+    {
+        const IdeObject td = stIdeDisk(timedId);
+        ST_CHECK(t, SendMessageA(ie.on, CB_GETCURSEL, 0, 0) == td.timeOn && SendMessageA(ie.off, CB_GETCURSEL, 0, 0) == td.timeOff, "a tobj entry shows its hours");
+        stIeCombo(ie.on, 0);
+        stIeCombo(ie.off, 0);
+        ST_CHECK(t, !stIdeNow(timedId).timed, "a tobj can become objs");
+        stIeButton(ID_IE_UNDO);
+        ST_CHECK(t, stSameDef(stIdeNow(timedId), td), "and Undo makes it the same tobj again");
+    }
+    if (twoId >= 0) {
+        openIdeEditor(app.hwnd, twoId);
+        ST_CHECK(t, IsWindowEnabled(ie.dist[1]), "a model with two draw distances shows two boxes");
+        stIeType(ie.dist[1], "321.5");
+        ST_CHECK(t, stIdeNow(twoId).drawDistances[1] == 321.5, "the second distance applies");
+    }
+    stIdeInvariants(t, touched, "tobj and two distances");
+
+    // 9. Check Map sees the unsaved definitions; then Save All in place, Save as Mod into another folder
+    {
+        const CheckResult cr = runCheck();
+        ST_CHECK(t, cr.count(Severity::Error) == checkErrorsBefore, "Check Map on the unsaved definitions finds no new errors");
+    }
+    if (ie.wnd) stIeButton(ID_IE_SAVE);
+    std::map<std::string, std::string> pending = app.ideText;
+    std::map<std::string, std::string> diskBefore;
+    for (const auto& kv : pending) diskBefore[kv.first] = slurp(app.root + "/" + app.ideRelOf[kv.first], ok);
+    const fs::path modDir = fs::path(app.root).parent_path() / ("ide_mod_test_" + std::to_string(GetCurrentProcessId()));
+    {
+        const std::string oldRoot = app.saveRoot;
+        const bool oldInPlace = app.saveInPlace;
+        const std::set<int> mapEdits = app.dirty;  // earlier sections' unsaved map edits: not this test's to save
+        if (!mapEdits.empty()) {  // but they must save cleanly too (into a scratch folder)
+            const auto ideKeep = app.ideText;
+            const auto editsKeep = app.ideEdits;
+            app.ideText.clear();
+            app.ideEdits.clear();
+            app.saveRoot = (modDir / "map_only").string();
+            app.saveInPlace = false;
+            bool mapOk;
+            const std::string r = saveAll(&mapOk);
+            ST_CHECK(t, mapOk, "the earlier sections' map edits save cleanly");
+            if (!mapOk) std::printf("  map save report: %s", r.c_str());
+            app.ideText = ideKeep;
+            app.ideEdits = editsKeep;
+        }
+        app.dirty.clear();
+        app.saveRoot = modDir.string();
+        app.saveInPlace = false;
+        bool allOk;
+        { const std::string r = saveAll(&allOk); if (!allOk) std::printf("  save report: %s", r.c_str()); }
+        ST_CHECK(t, allOk && app.ideText.empty(), "Save as Mod writes the IDE files and nothing stays pending");
+        for (const auto& kv : pending) {
+            ST_CHECK(t, slurp((modDir / app.ideRelOf[kv.first]).string(), ok) == kv.second, "the mod folder holds " + kv.first + " as edited");
+            ST_CHECK(t, slurp(app.root + "/" + app.ideRelOf[kv.first], ok) == diskBefore[kv.first], "the game folder's " + kv.first + " is untouched by Save as Mod");
+        }
+        // in place
+        app.ideText = pending;
+        app.saveInPlace = true;
+        { const std::string r = saveAll(&allOk); if (!allOk) std::printf("  save report: %s", r.c_str()); }
+        ST_CHECK(t, allOk && app.ideText.empty(), "Save All writes the IDE files in place");
+        for (const auto& kv : pending) {
+            const std::string path = app.root + "/" + app.ideRelOf[kv.first];
+            ST_CHECK(t, slurp(path, ok) == kv.second && slurp(path + ".med-backup", ok) == diskBefore[kv.first], kv.first + " written, original kept as .med-backup");
+        }
+        stIdeInvariants(t, touched, "saved");
+        // put the game copy back
+        for (const auto& kv : pending) {
+            const std::string path = app.root + "/" + app.ideRelOf[kv.first];
+            std::ofstream(path, std::ios::binary | std::ios::trunc) << diskBefore[kv.first];
+            DeleteFileA((path + ".med-backup").c_str());
+        }
+        app.saveRoot = oldRoot;
+        app.saveInPlace = oldInPlace;
+        std::error_code ec;
+        fs::remove_all(modDir, ec);
+        app.dirty = mapEdits;
+    }
+    // the editor still has the edited values; going back to the disk definitions empties the pending list
+    for (int id : touched) {
+        std::string why;
+        applyIdeEdit(id, stIdeDisk(id), why);
+    }
+    ST_CHECK(t, app.ideText.empty(), "back to the saved definitions: nothing pending");
+    stIdeInvariants(t, touched, "restored");
+
+    // 10. random steps through the window
+    unsigned seed = 9090;
+    if (const char* s = std::getenv("MED_SELFTEST_SEED")) seed += unsigned(std::atoi(s));
+    auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return int((seed >> 8) % unsigned(n)); };
+    std::vector<int> ids(touched.begin(), touched.end());
+    std::vector<std::string> txds = {"nosuch", "", "a b"};
+    for (int id : ids) txds.push_back(app.defs[id].txd);
+    const char* dists[] = {"0", "12.5", "300", "301", "abc", "-1", "9999.75", "10000", "10000.01", "", "1e3", "152.25"};
+    for (int step = 0; step < 600; ++step) {
+        std::string what;
+        if (!ie.wnd || rnd(12) == 0) { what = "open"; openIdeEditor(app.hwnd, ids[size_t(rnd(int(ids.size())))]); }
+        else switch (rnd(10)) {
+            case 0: what = "distance"; stIeType(ie.dist[rnd(3)], dists[rnd(12)]); break;
+            case 1: what = "flags number"; stIeType(ie.flags, std::to_string(rnd(2300) - 50)); break;
+            case 2: case 3: what = "flag box"; SendMessageA(ie.box[rnd(kIdeFlagCount)], BM_CLICK, 0, 0); break;
+            case 4: what = "time on"; stIeCombo(ie.on, rnd(24)); break;
+            case 5: what = "time off"; stIeCombo(ie.off, rnd(24)); break;
+            case 6: what = "txd"; stIeType(ie.txd, txds[size_t(rnd(int(txds.size())))]); break;
+            case 7: what = "undo"; stIeButton(ID_IE_UNDO); break;
+            case 8: what = "save"; stIeButton(ID_IE_SAVE); break;
+            case 9: what = "cancel"; { const IdeObject opened = ie.original; const int id = ie.id; stIeButton(ID_IE_CANCEL); ST_CHECK(t, stSameDef(stIdeNow(id), opened), "random cancel restores the opened definition"); } break;
+        }
+        const int before = t.failures;
+        stIdeInvariants(t, touched, "random step " + std::to_string(step) + " (" + what + ")");
+        if (t.failures > before + 10) break;
+    }
+    if (ie.wnd) stIeButton(ID_IE_CANCEL);
+    for (int id : touched) {
+        std::string why;
+        applyIdeEdit(id, stIdeDisk(id), why);
+    }
+    ST_CHECK(t, app.ideText.empty(), "the end: nothing pending");
+    for (int id : touched) if (!stSameDef(stIdeNow(id), stIdeDisk(id))) std::printf("  still edited: %s [%s] vs disk [%s]\n", app.defs[id].name.c_str(), formatIdeEntry(stIdeNow(id)).c_str(), formatIdeEntry(stIdeDisk(id)).c_str());
+    ST_CHECK(t, slurp(app.root + "/" + app.defs[hosp].ideRel, ok) == hospFileDisk, "hospitaland's IDE file on disk is as at the start");
+    ST_CHECK(t, stMapState() == mapBefore, "the map itself was never changed");
+    ie.quiet = false;
+    insp.quiet = false;
+}
+
+// ---- Image Archive: med_viewer <game copy> --selftest (MED_SELFTEST_ONLY=imgtool) -----------------------------------
+std::string stFileBytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+// After every step: the rows are exactly the entries passing the filter (computed here on its own), names are unique,
+// the list view has that many rows, the status line and title say whether there are changes, and the archive on disk
+// is untouched (nothing is written before Rebuild).
+void stImgInvariants(SelfTest& t, const std::string& where, uint64_t diskSize, const std::string& dirBytes) {
+    if (!imgt.wnd || imgt.current < 0) return;
+    const int show = int(SendMessageA(imgt.show, CB_GETCURSEL, 0, 0));
+    static const char* const kTypes[] = {"", "3D Model", "Texture Dictionary", "Collision File", "Binary IPL File"};
+    char b[128] = "";
+    GetWindowTextA(imgt.find, b, sizeof b);
+    const std::string needle = toLower(trim(b));
+    std::multiset<int> expect, got(imgt.rows.begin(), imgt.rows.end());
+    std::set<std::string> names;
+    const auto& es = imgt.edit.entries();
+    for (size_t i = 0; i < es.size(); ++i) {
+        names.insert(toLower(es[i].name));
+        if (show > 0 && std::string(imgFileType(es[i].name)) != kTypes[show]) continue;
+        if (!needle.empty() && toLower(es[i].name).find(needle) == std::string::npos) continue;
+        expect.insert(int(i));
+    }
+    ST_CHECK(t, expect == got, where + ": the rows are the entries that pass Show and Find (" + std::to_string(got.size()) + " vs " + std::to_string(expect.size()) + ")");
+    ST_CHECK(t, names.size() == es.size(), where + ": every name in the archive is different");
+    ST_CHECK(t, ListView_GetItemCount(imgt.list) == int(imgt.rows.size()), where + ": the list shows that many rows");
+    char st[256] = "", title[600] = "";
+    GetWindowTextA(imgt.status, st, sizeof st);
+    GetWindowTextA(imgt.wnd, title, sizeof title);
+    ST_CHECK(t, (std::string(st).find("Please Rebuild Archive!") != std::string::npos) == imgt.edit.changed(), where + ": the status line says when to rebuild");
+    ST_CHECK(t, (std::string(title).find(" *") != std::string::npos) == imgt.edit.changed(), where + ": the title's * shows changes");
+    ST_CHECK(t, std::string(st).find(std::to_string(es.size()) + " Files") != std::string::npos, where + ": the status line counts the files");
+    std::error_code ec;
+    ST_CHECK(t, fs::file_size(app.img.path(), ec) == diskSize && stFileBytes(fs::path(app.img.path()).replace_extension(".dir").string()) == dirBytes,
+             where + ": nothing is written to the archive before Rebuild");
+}
+
+void runImgToolSelfTest(SelfTest& t) {
+    std::printf("Image Archive self-test\n");
+    std::fflush(stdout);
+    imgt.quiet = true;
+    const std::string imgPath = app.img.path(), dirPath = fs::path(imgPath).replace_extension(".dir").string();
+    std::error_code ec;
+    const uint64_t sizeBefore = fs::file_size(imgPath, ec);
+    const std::string dirBefore = stFileBytes(dirPath);
+    const size_t n0 = app.img.entries().size();
+    ST_CHECK(t, !fs::exists(imgPath + ".med-backup", ec), "no backup from an earlier run is in the way");
+    const fs::path work = fs::temp_directory_path() / ("med_imgtool_test_" + std::to_string(GetCurrentProcessId()));
+    fs::remove_all(work, ec);
+    fs::create_directories(work / "in", ec);
+    fs::create_directories(work / "out", ec);
+    std::string err;
+    std::vector<unsigned char> hospBytes, boxBytes, coneBytes;
+    ST_CHECK(t, app.img.extract("hospitaland.dff", hospBytes, err) && app.img.extract("cardboardbox4.dff", boxBytes, err) && app.img.extract("trafficcone.dff", coneBytes, err),
+             "the test's models are in gta3.img");
+    auto writeBytes = [](const fs::path& p, const std::string& s) { std::ofstream f(p, std::ios::binary | std::ios::trunc); f << s; };
+    writeBytes(work / "in" / "medtestbox.dff", std::string(boxBytes.begin(), boxBytes.begin() + 3000));
+    writeBytes(work / "in" / "cardboardbox4.dff", std::string(hospBytes.begin(), hospBytes.end()));
+    const std::string newBox = stFileBytes((work / "in" / "medtestbox.dff").string()), replacement = stFileBytes((work / "in" / "cardboardbox4.dff").string());
+    std::function<void(const std::string&)> inv = [&](const std::string& where) { stImgInvariants(t, where, sizeBefore, dirBefore); };
+
+    // 1. opening: the game's archive, every file listed
+    showImgTool(app.hwnd);
+    ST_CHECK(t, imgt.wnd && imgt.current == 0 && !imgt.paths.empty() && igSamePath(imgt.paths[0], imgPath), "the tool opens on the game's gta3.img");
+    ST_CHECK(t, imgt.rows.size() == n0 && !imgt.edit.changed(), "every file is listed (" + std::to_string(imgt.rows.size()) + ")");
+    inv("opened");
+    {  // the types add up, and each filter shows only its type
+        size_t sum = 0;
+        for (int s = 1; s <= 4; ++s) {
+            SendMessageA(imgt.show, CB_SETCURSEL, s, 0);
+            SendMessageA(imgt.wnd, WM_COMMAND, MAKEWPARAM(ID_IG_SHOW, CBN_SELCHANGE), (LPARAM)imgt.show);
+            sum += imgt.rows.size();
+            inv("show " + std::to_string(s));
+        }
+        size_t unknown = 0;
+        for (const ImgEditEntry& e : imgt.edit.entries()) unknown += std::string(imgFileType(e.name)) == "Unknown";
+        ST_CHECK(t, sum + unknown == n0, "models + dictionaries + collision + binary IPL + the rest = every file");
+        SendMessageA(imgt.show, CB_SETCURSEL, 1, 0);
+        SendMessageA(imgt.wnd, WM_COMMAND, MAKEWPARAM(ID_IG_SHOW, CBN_SELCHANGE), (LPARAM)imgt.show);
+        SendMessageA(imgt.find, WM_SETTEXT, 0, (LPARAM)"HOSPITAL");
+        ST_CHECK(t, !imgt.rows.empty(), "Find + Show: hospital models");
+        inv("find");
+        SendMessageA(imgt.find, WM_SETTEXT, 0, (LPARAM)"no such file anywhere");
+        ST_CHECK(t, imgt.rows.empty(), "Find with no match shows nothing");
+        inv("find nothing");
+        SendMessageA(imgt.find, WM_SETTEXT, 0, (LPARAM)"");
+        SendMessageA(imgt.show, CB_SETCURSEL, 0, 0);
+        SendMessageA(imgt.wnd, WM_COMMAND, MAKEWPARAM(ID_IG_SHOW, CBN_SELCHANGE), (LPARAM)imgt.show);
+    }
+    {  // sorting by a column header, both ways
+        NMLISTVIEW nm = {};
+        nm.hdr.hwndFrom = imgt.list;
+        nm.hdr.code = LVN_COLUMNCLICK;
+        for (int c : {0, 2}) for (int k = 0; k < 2; ++k) {
+            nm.iSubItem = c;
+            SendMessageA(imgt.wnd, WM_NOTIFY, 0, (LPARAM)&nm);
+            bool sorted = true;
+            for (size_t r = 1; r < imgt.rows.size(); ++r) {
+                const ImgEditEntry& a = imgt.edit.entries()[size_t(imgt.rows[r - 1])];
+                const ImgEditEntry& bb = imgt.edit.entries()[size_t(imgt.rows[r])];
+                const bool ok = c == 0 ? (imgt.sortDescending ? toLower(a.name) >= toLower(bb.name) : toLower(a.name) <= toLower(bb.name))
+                                       : (imgt.sortDescending ? a.size >= bb.size : a.size <= bb.size);
+                sorted = sorted && ok;
+            }
+            ST_CHECK(t, sorted && imgt.sortDescending == (k == 1), "column " + std::to_string(c) + (k ? " descending" : " ascending"));
+            inv("sort");
+        }
+        imgt.sortColumn = -1;
+        igRefill();
+    }
+
+    // 2. delete: asks, names the users, nothing on disk
+    ST_CHECK(t, !igDelete({}) && !imgt.edit.changed(), "Delete with nothing selected does nothing");
+    igSelectNames({"trafficcone.dff"});
+    imgt.answer = IDNO;
+    igCommand(ID_IG_DELETE);
+    ST_CHECK(t, imgt.edit.find("trafficcone.dff") >= 0 && !imgt.edit.changed(), "answering No keeps it");
+    ST_CHECK(t, imgt.lastMessage.find("trafficcone (ID 1360, placed") != std::string::npos, "the question names the definition that uses it: " + imgt.lastMessage.substr(0, 120));
+    imgt.answer = IDYES;
+    igSelectNames({"trafficcone.dff"});
+    igCommand(ID_IG_DELETE);
+    ST_CHECK(t, imgt.edit.find("trafficcone.dff") < 0 && imgt.edit.changed() && imgt.edit.entries().size() == n0 - 1, "Yes deletes it (staged)");
+    ST_CHECK(t, app.img.find("trafficcone.dff") >= 0, "the editor's own archive still has it");
+    inv("deleted");
+
+    // 3. rename
+    ST_CHECK(t, !igRename("hospitaland.dff", "bar_barrier10.dff") && imgt.edit.find("hospitaland.dff") >= 0, "renaming onto another file's name is refused");
+    ST_CHECK(t, !igRename("hospitaland.dff", "a_name_that_is_far_too_long.dff"), "a name over 23 characters is refused");
+    ST_CHECK(t, !igRename("hospitaland.dff", "two words.dff"), "a name with a space is refused");
+    ST_CHECK(t, igRename("hospitaland.dff", "hosp_test.dff") && imgt.edit.find("hosp_test.dff") >= 0 && imgt.edit.find("hospitaland.dff") < 0, "renamed");
+    ST_CHECK(t, imgt.lastMessage.find("hospitaland (ID") != std::string::npos, "it warns that the definition looks for the old name");
+    ST_CHECK(t, ImgEdit::status(imgt.edit.entries()[size_t(imgt.edit.find("hosp_test.dff"))]) == "renamed from hospitaland.dff", "the list says renamed from");
+    inv("renamed");
+
+    // 4. add: a new file, a name that exists (No / Yes / Cancel)
+    ST_CHECK(t, igAdd({(work / "in" / "medtestbox.dff").string()}) == 1 && imgt.edit.find("medtestbox.dff") >= 0, "a new file is added");
+    imgt.answer = IDNO;
+    ST_CHECK(t, igAdd({(work / "in" / "medtestbox.dff").string()}) == 0, "the same name again, No: left out");
+    imgt.answer = IDCANCEL;
+    ST_CHECK(t, igAdd({(work / "in" / "cardboardbox4.dff").string(), (work / "in" / "medtestbox.dff").string()}) == 0, "Cancel stops the whole add");
+    imgt.answer = IDYES;
+    ST_CHECK(t, igAdd({(work / "in" / "cardboardbox4.dff").string()}) == 1 &&
+                    ImgEdit::status(imgt.edit.entries()[size_t(imgt.edit.find("cardboardbox4.dff"))]) == "replaced", "Yes replaces cardboardbox4.dff");
+    ST_CHECK(t, imgt.edit.entries().size() == n0, "one deleted, one added, one replaced: the same count");
+    inv("added");
+
+    // 5. extract: a file from the archive, a renamed one and an added one
+    {
+        const int n = igExtract({"bar_barrier10.dff", "hosp_test.dff", "medtestbox.dff"}, (work / "out").string());
+        std::vector<unsigned char> bb;
+        app.img.extract("bar_barrier10.dff", bb, err);
+        ST_CHECK(t, n == 3, "three files extracted");
+        ST_CHECK(t, stFileBytes((work / "out" / "bar_barrier10.dff").string()) == std::string(bb.begin(), bb.end()), "an archive file comes out byte for byte");
+        ST_CHECK(t, stFileBytes((work / "out" / "hosp_test.dff").string()) == std::string(hospBytes.begin(), hospBytes.end()), "a renamed file comes out with its new name");
+        ST_CHECK(t, stFileBytes((work / "out" / "medtestbox.dff").string()) == newBox, "an added file comes out as it was added");
+        imgt.answer = IDNO;
+        ST_CHECK(t, igExtract({"bar_barrier10.dff"}, (work / "out").string()) == 0 && imgt.lastMessage.find("already") != std::string::npos, "it asks before replacing files in the folder");
+        imgt.answer = IDYES;
+        ST_CHECK(t, igExtract({}, (work / "out").string()) == 0, "nothing selected: nothing extracted");
+    }
+    // 6. Open File: the viewers
+    {
+        const size_t before = viewers.size();
+        ST_CHECK(t, igPreview("hosp_test.dff") && viewers.size() == before + 1, "Open File shows the (renamed) model in a viewer");
+        ST_CHECK(t, !igPreview("no_such_file.ifp"), "a file that is not a model, dictionary or collision is not opened");
+        for (size_t i = before; i < viewers.size(); ++i) SendMessageA(viewers[i]->wnd, WM_CLOSE, 0, 0);
+        updateViewers();  // closed viewers are dropped here
+        ST_CHECK(t, viewers.size() == before, "the preview viewer closes");
+    }
+    inv("extract and preview");
+
+    // 7. leaving with changes: Cancel stays, No forgets
+    const fs::path other = work / "other.img";
+    {
+        ImgArchive o;
+        ImgArchive::create(other.string(), 1, o, err);
+        o.add("x.dff", std::vector<unsigned char>(100, 7), err);
+        o.save(err);
+    }
+    imgt.answer = IDCANCEL;
+    ST_CHECK(t, !igLeave() && imgt.edit.changed(), "Cancel keeps the changes and the archive");
+    imgt.answer = IDNO;
+    ST_CHECK(t, igLeave(), "No lets go");
+    ST_CHECK(t, igOpenArchive(other.string()) && imgt.current == 1 && imgt.rows.size() == 1, "another archive opens and joins the list");
+    ST_CHECK(t, igSelectArchive(0) && imgt.current == 0 && !imgt.edit.changed() && imgt.edit.find("trafficcone.dff") >= 0, "back on gta3.img: the changes were forgotten");
+    inv("forgotten");
+
+    // 8. the rebuild
+    imgt.answer = IDYES;
+    igSelectNames({"trafficcone.dff"});
+    igCommand(ID_IG_DELETE);
+    igRename("hospitaland.dff", "hosp_test.dff");
+    igAdd({(work / "in" / "medtestbox.dff").string(), (work / "in" / "cardboardbox4.dff").string()});
+    for (const auto& kv : app.defs) if (kv.second.model == "hospitaland") getModel(kv.second.model, kv.second.txd);
+    const int errorsBefore = runCheck().count(Severity::Error);
+    imgt.answer = IDNO;
+    igCommand(ID_IG_REBUILD);
+    ST_CHECK(t, imgt.edit.changed() && fs::file_size(imgPath, ec) == sizeBefore, "Rebuild answered No does nothing");
+    const fs::path importLog = fs::path(imgPath).parent_path() / "med-imports.txt";
+    writeBytes(importLog, "2026-10-12 10:00:00  imported test.dff (id 3153, region upstate); to undo: ... cut gta3.img back to 1 bytes ...\n");
+    imgt.answer = IDYES;
+    igCommand(ID_IG_REBUILD);
+    ST_CHECK(t, !imgt.edit.changed() && imgt.lastMessage.find("Rebuilt") == 0, "Rebuild: " + imgt.lastMessage.substr(0, 160));
+    {
+        const std::string log = stFileBytes(importLog.string());
+        ST_CHECK(t, log.find("cut gta3.img back to 1 bytes") != std::string::npos && log.find("no longer apply") != std::string::npos &&
+                        log.find("gta3.img.med-backup") != std::string::npos, "the import log is told that its undo notes no longer apply");
+        fs::remove(importLog, ec);
+    }
+    {
+        std::vector<unsigned char> d;
+        ST_CHECK(t, app.img.entries().size() == n0 && app.img.find("trafficcone.dff") < 0, "the editor reads the new archive");
+        ST_CHECK(t, app.img.extract("hosp_test.dff", d, err) && d == hospBytes, "the renamed file holds the same bytes");
+        ST_CHECK(t, app.img.extract("medtestbox.dff", d, err) && std::string(d.begin(), d.begin() + long(newBox.size())) == newBox && d.size() % 2048 == 0 &&
+                        std::all_of(d.begin() + long(newBox.size()), d.end(), [](unsigned char c) { return c == 0; }), "the added file is in, padded with zeros");
+        ST_CHECK(t, app.img.extract("cardboardbox4.dff", d, err) && std::string(d.begin(), d.begin() + long(replacement.size())) == replacement, "the replaced file holds the new bytes");
+        // every untouched file is byte for byte what it was (read through the backup, the archive as it was)
+        ImgArchive old;
+        const std::string backupImg = imgPath + ".med-backup", backupDir = dirPath + ".med-backup";
+        std::error_code e2;
+        fs::copy_file(backupDir, (work / "check.dir").string(), fs::copy_options::overwrite_existing, e2);
+        fs::create_hard_link(backupImg, work / "check.img", e2);
+        ST_CHECK(t, ImgArchive::open((work / "check.img").string(), old, err) && old.entries().size() == n0, "the backup is the archive as it was");
+        int same = 0, differ = 0;
+        std::vector<unsigned char> a, b2;
+        for (const ImgEntry& e : app.img.entries()) {
+            if (e.name == "hosp_test.dff" || e.name == "medtestbox.dff" || e.name == "cardboardbox4.dff") continue;
+            if (app.img.extract(e.name, a, err) && old.extract(e.name, b2, err) && a == b2) ++same; else ++differ;
+        }
+        ST_CHECK(t, differ == 0 && same == int(n0) - 3, "every other file is unchanged (" + std::to_string(same) + " same, " + std::to_string(differ) + " differ)");
+        fs::remove(work / "check.img", e2);
+        ST_CHECK(t, stFileBytes(backupDir) == dirBefore && fs::file_size(backupImg, e2) == sizeBefore, "gta3.img.med-backup and gta3.dir.med-backup are the old files");
+    }
+    ST_CHECK(t, !app.models.count("hospitaland") && !app.models.count("cardboardbox4") && !app.models.count("trafficcone"), "the changed models are loaded again when drawn");
+    {
+        const CheckResult cr = runCheck();
+        bool coneReported = false;
+        for (const CheckIssue& i : cr.issues) coneReported = coneReported || (i.code == "model-dff-missing" && i.message.find("trafficcone") != std::string::npos);
+        ST_CHECK(t, cr.count(Severity::Error) > errorsBefore && coneReported, "Check Map reports the placed trafficcone whose model is gone");
+    }
+    inv = [&](const std::string& where) { stImgInvariants(t, where, fs::file_size(imgPath), stFileBytes(dirPath)); };
+    inv("rebuilt");
+
+    // 9. random staged steps on the new archive, then all forgotten
+    {
+        unsigned seed = 5150;
+        if (const char* s = std::getenv("MED_SELFTEST_SEED")) seed += unsigned(std::atoi(s));
+        auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return int((seed >> 8) % unsigned(n)); };
+        for (int i = 0; i < 6; ++i) writeBytes(work / "in" / ("rnd" + std::to_string(i) + ".txd"), std::string(size_t(100 + i * 1500), char('a' + i)));
+        const char* finds[] = {"", "lod", "hosp", "zzz", ".txd", "rnd"};
+        for (int step = 0; step < 300; ++step) {
+            const auto& es = imgt.edit.entries();
+            const std::string some = es.empty() ? "" : es[size_t(rnd(int(es.size())))].name;
+            std::string what;
+            imgt.answer = rnd(4) == 0 ? IDNO : IDYES;
+            switch (rnd(7)) {
+                case 0: what = "delete"; igDelete({some}); break;
+                case 1: what = "rename"; igRename(some, "r" + std::to_string(rnd(30)) + (rnd(2) ? ".dff" : ".txd")); break;
+                case 2: what = "add"; igAdd({(work / "in" / ("rnd" + std::to_string(rnd(6)) + ".txd")).string()}); break;
+                case 3: what = "show"; SendMessageA(imgt.show, CB_SETCURSEL, rnd(5), 0); igRefill(); break;
+                case 4: what = "find"; SendMessageA(imgt.find, WM_SETTEXT, 0, (LPARAM)finds[rnd(6)]); break;
+                case 5: what = "sort"; imgt.sortColumn = rnd(6) - 1; imgt.sortDescending = rnd(2); igRefill(); break;
+                case 6: what = "select"; igSelectNames({some}); break;
+            }
+            const int before = t.failures;
+            inv("random step " + std::to_string(step) + " (" + what + ")");
+            if (t.failures > before + 10) break;
+        }
+        imgt.answer = IDNO;
+        igClose();
+        ST_CHECK(t, !imgt.wnd, "closing with changes, No: closed and forgotten");
+    }
+
+    // put the test copy back: the original archive (renamed back, so it is the hard link to the clean game again)
+    {
+        std::error_code e2;
+        fs::remove(imgPath, e2);
+        fs::remove(dirPath, e2);
+        fs::rename(imgPath + ".med-backup", imgPath, e2);
+        fs::rename(dirPath + ".med-backup", dirPath, e2);
+        ImgArchive back;
+        ST_CHECK(t, ImgArchive::open(imgPath, back, err) && back.entries().size() == n0 && stFileBytes(dirPath) == dirBefore && fs::file_size(imgPath, e2) == sizeBefore,
+                 "the test copy's archive is back as it was");
+        igReloadGameArchive(back, {"hospitaland", "cardboardbox4", "trafficcone", "hosp_test", "medtestbox"});
+        fs::remove_all(work, e2);
+    }
+    imgt.quiet = false;
+    imgt.answer = IDYES;
+}
+
 int runPlacementsSelfTest() {
     SelfTest t;
     std::printf("Placements tab self-test on %s (%zu placements, %zu regions)\n", app.root.c_str(), app.instances.size(), regions.size());
-    if (const char* only = std::getenv("MED_SELFTEST_ONLY"); only && (std::string(only) == "import" || std::string(only) == "coledit")) {  // one section, for quick runs
-        if (std::string(only) == "import") runImportSelfTest(t);
-        else runColEditSelfTest(t);
+    if (const char* only = std::getenv("MED_SELFTEST_ONLY"); only && *only) {  // one section, for quick runs
+        const std::string o = only;
+        if (o == "import") runImportSelfTest(t);
+        else if (o == "coledit") runColEditSelfTest(t);
+        else if (o == "fullscreen") runFullScreenSelfTest(t);
+        else if (o == "ide") runIdeEditSelfTest(t);
+        else if (o == "imgtool") runImgToolSelfTest(t);
+        else { std::printf("MED_SELFTEST_ONLY: unknown section %s\n", only); ++t.failures; }
         std::printf("self-test: %d checks, %d failures\n", t.checks, t.failures);
         std::fflush(stdout);
         return t.failures == 0 ? 0 : 1;
@@ -10307,6 +12134,9 @@ int runPlacementsSelfTest() {
     runImportSelfTest(t);
     // the collision editor (saves into a region it makes, put back afterwards)
     runColEditSelfTest(t);
+    runFullScreenSelfTest(t);
+    runIdeEditSelfTest(t);
+    runImgToolSelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -10394,10 +12224,15 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_COMMAND:
             if (std::getenv("MED_DEBUG")) { std::printf("WM_COMMAND id %d code %d from %p\n", int(LOWORD(w)), int(HIWORD(w)), (void*)l); std::fflush(stdout); }
-            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_VIEWPATHS) doCommand(h, LOWORD(w));
+            if (LOWORD(w) >= ID_TB_SAVE && LOWORD(w) <= ID_TB_LAST) doCommand(h, LOWORD(w));
             return 0;
         case WM_KEYDOWN:
             if (w < 256) app.keys[w] = true;
+            if (fullScr.on) {  // full screen: only the camera keys work; Enter, Esc and F11 leave (MEd)
+                if (w == VK_ESCAPE || w == VK_RETURN || w == VK_F11) leaveFullScreen(h);
+                return 0;
+            }
+            if (w == VK_F11) { enterFullScreen(h, true); return 0; }
             if (w == VK_DELETE) {
                 if (GetKeyState(VK_SHIFT) & 0x8000) deleteSelected();  // really remove from the file
                 else sinkSelected();                                    // move below the map
@@ -10480,9 +12315,11 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         }
         case WM_RBUTTONDOWN:
             SetFocus(h);
+            if (fullScr.on) return 0;  // no editing while full screen
             showObjectMenu(h, int(short(LOWORD(l))), int(short(HIWORD(l))));  // client coordinates, converted inside
             return 0;
         case WM_LBUTTONDBLCLK:
+            if (fullScr.on) { leaveFullScreen(h); return 0; }  // MEd: a double-click leaves full screen first
             doubleClickSelect(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
             return 0;
         case WM_KEYUP:
@@ -10495,7 +12332,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             app.downMouse = app.lastMouse;
             SetCapture(h);
             // Alt + left button with a selection drags the selected objects over the plane z - h.
-            app.movingObjects = (GetKeyState(VK_MENU) & 0x8000) && !app.selected.empty() &&
+            app.movingObjects = !fullScr.on && (GetKeyState(VK_MENU) & 0x8000) && !app.selected.empty() &&
                                 unprojectToPlane(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH, app.lastPick);
             return 0;
         case WM_LBUTTONUP: {
@@ -10503,7 +12340,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             POINT up;
             GetCursorPos(&up);
             const bool click = std::abs(up.x - app.downMouse.x) <= 3 && std::abs(up.y - app.downMouse.y) <= 3;
-            if (click && !app.movingObjects) roadClick(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH);  // a road node opens the piece strip
+            if (click && !app.movingObjects && !fullScr.on) roadClick(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH);  // a road node opens the piece strip
             if (app.movingObjects) plRefreshAfterEdit();
             app.movingObjects = false;
             ReleaseCapture();
@@ -10596,7 +12433,7 @@ void updateCamera() {
     k.alt = down(VK_MENU);
     for (int i = 0; i < ticks; ++i) {
         cameraKeyboardTick(app.cam, k);
-        if (!app.selected.empty()) {
+        if (!app.selected.empty() && !fullScr.on) {  // Alt + keys move the selection, not while full screen
             ObjectMove m = objectKeyboardTick(app.cam, k);
             if (m.any()) moveSelected(m.dx, m.dy, m.dz);
         }
@@ -10669,7 +12506,8 @@ int main(int argc, char** argv) {
     bool deleteAfter = false, duplicateAfter = false, sinkAfter = false, centreAfter = false, checkAfter = false;
     std::string onlyRegions;
     int benchmark = 0;
-    std::string selectModel, pickTestModel, openDffAtStart, openColAtStart, openTxdAtStart;
+    std::string selectModel, pickTestModel, openDffAtStart, openColAtStart, openTxdAtStart, ideEditAtStart;
+    bool imgToolAtStart = false;
     bool colEditAtStart = false;  // --col-edit: the collision window opened by --open-col starts on its Edit tab
     std::vector<std::string> openFilesAtStart;  // --open-file path (repeatable): loose files in the viewers
     bool addedOnly = false;
@@ -10702,6 +12540,8 @@ int main(int argc, char** argv) {
         else if (a == "--added-only") addedOnly = true;
         else if (a == "--select-added") selectAdded = true;
         else if (a == "--open-dff" && i + 1 < argc) openDffAtStart = argv[++i];
+        else if (a == "--ide-edit" && i + 1 < argc) ideEditAtStart = argv[++i];
+        else if (a == "--img-tool") imgToolAtStart = true;
         else if (a == "--open-col" && i + 1 < argc) openColAtStart = argv[++i];
         else if (a == "--col-edit") colEditAtStart = true;
         else if (a == "--open-txd" && i + 1 < argc) openTxdAtStart = argv[++i];
@@ -11095,6 +12935,10 @@ int main(int argc, char** argv) {
                 if (cv && colEditAtStart) { ceShowTab(*cv, true); viewerLayout(*cv); }
                 break;
             }
+    if (!ideEditAtStart.empty())  // tests: open the Item Definition Entry window on this model
+        for (const auto& kv : app.defs)
+            if (kv.second.model == toLower(ideEditAtStart)) { openIdeEditor(app.hwnd, kv.first); break; }
+    if (imgToolAtStart) showImgTool(app.hwnd);  // tests: open the Image Archive tool
     if (!openDffAtStart.empty())  // tests: open DFF Properties for this model
         for (const auto& kv : app.defs)
             if (kv.second.model == toLower(openDffAtStart)) { openDffViewer(app.hwnd, kv.first); break; }
@@ -11106,6 +12950,8 @@ int main(int argc, char** argv) {
             if (msg.message == WM_QUIT) running = false;
             if (plHandleKey(msg)) continue;  // F3 / Enter / Esc of the Placements tab
             if (inspHandleKey(msg)) continue;  // Enter / Esc in the properties boxes
+            if (ieHandleKey(msg)) continue;    // Enter / Esc in the Item Definition Entry window
+            if (igHandleKey(msg)) continue;    // Del / F2 / Enter in the Image Archive's file list
             if (itHandleKey(msg)) continue;    // Enter / Esc in the Item tab
             if (bmHandleKey(msg)) continue;    // Enter / Delete in the Bookmarks window
             TranslateMessage(&msg);
@@ -11131,7 +12977,7 @@ int main(int argc, char** argv) {
         char title[400];
         std::snprintf(title, sizeof title, "%s  -  MEd 3D viewer  |  %.2f : %.2f : %.2f : %.2f : %.1f : %.1f  |  %d objects  |  undo %zu redo %zu%s%s%s", folderLabel.c_str(), app.cam.x,
                       app.cam.y, app.cam.z, app.cam.h, app.cam.yaw, app.cam.pitch, app.drawn,
-                      app.history.undoCount(), app.history.redoCount(), app.dirty.empty() ? "" : "  |  UNSAVED (Ctrl+S)",
+                      app.history.undoCount(), app.history.redoCount(), anyUnsaved() ? "  |  UNSAVED (Ctrl+S)" : "",
                       app.selected.empty() ? "" : ("  |  " + selectionTitle()).c_str(),
                       app.lodViewText.empty() ? "" : ("  |  " + app.lodViewText).c_str());
         // undo/redo depth is shown too: see the status text below

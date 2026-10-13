@@ -15,6 +15,7 @@
 #include "../src/core/mapcheck.h"
 #include "../src/core/original.h"
 #include "../src/core/importer.h"
+#include "../src/core/ideedit.h"
 #include <cstring>
 #include <set>
 #include "../src/core/textutil.h"
@@ -234,6 +235,7 @@ int main(int argc, char** argv) {
             if (iok) collectIdeIds(t, modelIds);
         }
     }
+    int ideEditSame = 0, ideEditFormatted = 0, ideEditBad = 0;
     int ideFiles = 0, iplFiles = 0, objs = 0, tobj = 0, insts = 0, warnings = 0, missing = 0, roundTripBad = 0;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -281,6 +283,16 @@ int main(int argc, char** argv) {
             for (const std::string& w : f.warnings) std::printf("  %s: %s\n", path.c_str(), w.c_str());
             IdeFile g = parseIde(writeIde(f), GameVersion::GTA3);
             if (g.objects.size() != f.objects.size() || !g.warnings.empty()) { ++roundTripBad; std::printf("  round trip differs: %s\n", path.c_str()); }
+            // the IDE entry editor: every definition is found, and writing it back unchanged changes at most how its line
+            // is spelled
+            for (const IdeObject& o : f.objects) {
+                IdeEntryLoc loc;
+                std::string t = text, why;
+                if (!findIdeEntry(text, o.id, loc) || !setIdeEntry(t, loc.object, why)) { ++ideEditBad; std::printf("  IDE edit: %s id %d not editable: %s\n", path.c_str(), o.id, why.c_str()); continue; }
+                if (t == text) ++ideEditSame;
+                else if (++ideEditFormatted <= 5)
+                    std::printf("  IDE edit: %s line written differently: [%s] -> [%s]\n", path.c_str(), text.substr(loc.begin, loc.end - loc.begin).c_str(), formatIdeEntry(loc.object).c_str());
+            }
         } else {
             IplFile f = parseTextIpl(text, GameVersion::GTA3);
             ++iplFiles;
@@ -323,6 +335,8 @@ int main(int argc, char** argv) {
     std::printf("model ids: %zu used (every IDE section), highest %d, first free from %d: %d\n", modelIds.size(), modelIds.empty() ? -1 : *modelIds.rbegin(),
                 kGta3FirstFreeId, proposeModelId(modelIds));
     std::printf("IDE: %d files, %d objs, %d tobj\n", ideFiles, objs, tobj);
+    std::printf("IDE EDIT: %d definitions written back byte-identical, %d spelled differently, %d not editable\n", ideEditSame, ideEditFormatted, ideEditBad);
+    problems += ideEditBad;
     std::printf("IPL: %d files, %d inst\n", iplFiles, insts);
     {
         int lods = 0, lodsPaired = 0, hdPaired = 0, orphanPairs = 0;

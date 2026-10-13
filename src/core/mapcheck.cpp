@@ -193,8 +193,11 @@ CheckResult checkMap(const CheckInput& in) {
     std::set<std::string> lodModelTails;  // tails of LOD models that exist in the IDE
     std::map<int, PathModelData> pathData;  // the IDE "path" blocks (traffic and pedestrian paths)
     for (const Listed& l : ides) {
-        bool ok;
-        std::string text = readFile(root + "/" + l.path, ok);
+        bool ok = true;
+        std::string text;
+        auto ov = in.ideText.find(toLower(l.path));
+        if (ov != in.ideText.end()) text = ov->second;
+        else text = readFile(root + "/" + l.path, ok);
         if (!ok) continue;
         IdeFile f = parseIde(text, GameVersion::GTA3);
         collectPathModelIds(f, pathIds);

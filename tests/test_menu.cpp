@@ -36,7 +36,7 @@ int main() {
     CHECK(find(single, kCmdExtract) && find(single, kCmdExtract)->enabled);  // Extract Object is live
     CHECK(find(single, kCmdDuplicate) && find(single, kCmdDuplicate)->enabled);
     CHECK(find(single, kCmdReplace) && find(single, kCmdReplace)->enabled);  // Replace Object is live
-    CHECK(find(single, kCmdProperties) && !find(single, kCmdProperties)->enabled);
+    CHECK(find(single, kCmdProperties) && find(single, kCmdProperties)->enabled);
     // the multiple-objects menu is the "Selected Items" one and has no per-object entries
     CHECK(find(single, kCmdDffView) && find(single, kCmdDffView)->enabled);  // DFF Properties (MEd's CDFFView)
     CHECK(find(single, kCmdColView) && find(single, kCmdColView)->enabled);  // Collision Object Properties (MEd's CColView)

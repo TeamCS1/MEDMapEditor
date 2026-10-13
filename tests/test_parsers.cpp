@@ -179,8 +179,20 @@ int main() {
         // LF files stay LF
         CHECK(replaceIplInstSection("inst\n1, a, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1\nend\n", f.instances, GameVersion::GTA3, out, err));
         CHECK(out.find('\r') == std::string::npos);
-        // a file without an inst block is refused, not mangled
-        CHECK(!replaceIplInstSection("cull\n1\nend\n", f.instances, GameVersion::GTA3, out, err));
+        // a file without an inst block (GTA3.ZON: a zone block only): unchanged when it has no placements, and with
+        // placements an inst block at the top, its own lines kept after it, in its own line endings
+        CHECK(replaceIplInstSection("zone\r\nz1, 0, 1, 2, 3, 4, 5, 6\r\nend\r\n", {}, GameVersion::GTA3, out, err) && out == "zone\r\nz1, 0, 1, 2, 3, 4, 5, 6\r\nend\r\n");
+        CHECK(replaceIplInstSection("zone\r\nz1, 0, 1, 2, 3, 4, 5, 6\r\nend\r\n", f.instances, GameVersion::GTA3, out, err));
+        CHECK(out == "inst\r\n" + formatIplInstanceLine(f.instances[0], GameVersion::GTA3) + "\r\nend\r\nzone\r\nz1, 0, 1, 2, 3, 4, 5, 6\r\nend\r\n");
+        {
+            IplFile back = parseTextIpl(out, GameVersion::GTA3);
+            CHECK(back.instances.size() == 1 && back.instances[0].model == f.instances[0].model && back.warnings.empty());
+            std::string again;  // and saving that again finds the new block
+            CHECK(replaceIplInstSection(out, back.instances, GameVersion::GTA3, again, err) && again == out);
+        }
+        CHECK(replaceIplInstSection("cull\n1\nend\n", f.instances, GameVersion::GTA3, out, err) && out.find("inst\n") == 0 && out.find('\r') == std::string::npos);
+        // an inst block without its end line is still refused, not mangled
+        CHECK(!replaceIplInstSection("inst\n1, a, 0, 0, 0, 1, 1, 1, 0, 0, 0, 1\n", f.instances, GameVersion::GTA3, out, err));
         // numbers use 12 significant digits like QString::number(x, 'g', 12)
         IplInstance prec;
         prec.id = 5;

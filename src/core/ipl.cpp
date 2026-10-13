@@ -250,8 +250,21 @@ bool replaceIplInstSection(const std::string& text, const std::vector<IplInstanc
         pos = lineEnd;
     }
     if (instEnd == std::string::npos) {
-        error = "no inst section in the file";
-        return false;
+        // A file listed as IPL that has no inst block yet (GTA III's GTA3.ZON holds only a zone block): nothing to do
+        // without placements; with placements an inst block goes at the top, where CULL.IPL has its own. The game's
+        // scene loader (CFileLoader_LoadScene_ipl 0x00478370) reads inst in any IPL-listed file.
+        if (instances.empty()) {
+            result = text;
+            return true;
+        }
+        const size_t nl = text.find('\n');
+        if (nl != std::string::npos && nl > 0 && text[nl - 1] == '\r') eol = "\r\n";
+        else if (nl == std::string::npos) eol = "\r\n";
+        std::string out = "inst" + eol;
+        for (const IplInstance& i : instances) out += formatIplInstanceLine(i, version) + eol;
+        out += "end" + eol + text;
+        result = std::move(out);
+        return true;
     }
     if (endStart == std::string::npos) {
         error = "the inst section has no end line";
