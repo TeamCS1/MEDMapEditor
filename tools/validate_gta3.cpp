@@ -235,7 +235,7 @@ int main(int argc, char** argv) {
             if (iok) collectIdeIds(t, modelIds);
         }
     }
-    int ideEditSame = 0, ideEditFormatted = 0, ideEditBad = 0;
+    int ideEditSame = 0, ideEditFormatted = 0, ideEditBad = 0, fxLights = 0;
     int ideFiles = 0, iplFiles = 0, objs = 0, tobj = 0, insts = 0, warnings = 0, missing = 0, roundTripBad = 0;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -279,6 +279,7 @@ int main(int argc, char** argv) {
             IdeFile f = parseIde(text, GameVersion::GTA3);
             ++ideFiles;
             for (const IdeObject& o : f.objects) (o.timed ? tobj : objs)++;
+            fxLights += int(ide2dfxLights(f).size());
             warnings += static_cast<int>(f.warnings.size());
             for (const std::string& w : f.warnings) std::printf("  %s: %s\n", path.c_str(), w.c_str());
             IdeFile g = parseIde(writeIde(f), GameVersion::GTA3);
@@ -337,6 +338,7 @@ int main(int argc, char** argv) {
     std::printf("IDE: %d files, %d objs, %d tobj\n", ideFiles, objs, tobj);
     std::printf("IDE EDIT: %d definitions written back byte-identical, %d spelled differently, %d not editable\n", ideEditSame, ideEditFormatted, ideEditBad);
     problems += ideEditBad;
+    std::printf("2DFX: %d lights (2dfx lines with more than 16 fields)\n", fxLights);
     std::printf("IPL: %d files, %d inst\n", iplFiles, insts);
     {
         int lods = 0, lodsPaired = 0, hdPaired = 0, orphanPairs = 0;

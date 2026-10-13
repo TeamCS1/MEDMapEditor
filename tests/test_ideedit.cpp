@@ -158,6 +158,29 @@ int main() {
         o = good; o.id = 4444; o.model = "nothing"; { std::string t = ide, why; CHECK(!setIdeEntry(t, o, why) && t == ide); }
     }
 
+    // ---- 2dfx lights, read as MEd reads them ----
+    {
+        const IdeFile f = parseIde(
+            "2dfx\r\n"
+            "2082, -33.7737, -15.3476, -0.129492, 117, 118, 119, 200, 0, \"coronastar\", \"shad_exp\", 100, 0, 2, 0, 40, 1, 0, 0, 0\r\n"
+            "1887, 59.9111, 9.28214, -14.94, 255, 0, 10, 200, 0, \"coronastar\", \"shad_exp\", 100, 5, 1.5, 2, 40, 12, 0, 0, 0\r\n"
+            "1887, 1, 2, 3, 255, 255, 255, 200, 1, 5, 0, 0, 1, 2.5\r\n"  // a particle: 14 fields, not a light
+            "end\r\n", GameVersion::GTA3);
+        const std::vector<Ide2dfxLight> l = ide2dfxLights(f);
+        CHECK(l.size() == 2);
+        if (l.size() == 2) {
+            CHECK(l[0].id == 2082 && std::fabs(l[0].x + 33.7737f) < 1e-4f && std::fabs(l[0].z + 0.129492f) < 1e-6f && l[0].r == 117 && l[0].g == 118 && l[0].b == 119);
+            CHECK(l[0].size == 2 && l[0].flash == 1);
+            CHECK(l[1].id == 1887 && l[1].size == 1.5f && l[1].flash == 12 && l[1].r == 255 && l[1].g == 0 && l[1].b == 10);
+        }
+        // MEd's rule (0x00416a70): even types before 21:00, odd ones after 19:00, 12 always
+        for (int hour = 0; hour < 24; ++hour) {
+            CHECK(ide2dfxLightShown(0, hour) == (hour <= 20) && ide2dfxLightShown(10, hour) == (hour <= 20));
+            CHECK(ide2dfxLightShown(1, hour) == (hour >= 20) && ide2dfxLightShown(11, hour) == (hour >= 20));
+            CHECK(ide2dfxLightShown(12, hour) && !ide2dfxLightShown(13, hour) && !ide2dfxLightShown(-1, hour));
+        }
+    }
+
     // ---- the flag table ----
     for (int i = 0; i < kIdeFlagCount; ++i) {
         CHECK(ideFlag(i).bit == 1 << i);

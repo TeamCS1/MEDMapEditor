@@ -103,6 +103,34 @@ IdeFile parseIde(const std::string& text, GameVersion version) {
     return ide;
 }
 
+std::vector<Ide2dfxLight> ide2dfxLights(const IdeFile& ide) {
+    std::vector<Ide2dfxLight> out;
+    for (const IdeRawSection& sec : ide.otherSections) {
+        if (sec.name != "2dfx") continue;
+        for (const std::string& line : sec.lines) {
+            const std::vector<std::string> f = splitFields(line);
+            if (f.size() <= 16) continue;  // particles and other effects have fewer fields
+            Ide2dfxLight l;
+            int v[3];
+            double xyz[3], size;
+            if (!toInt(f[0], l.id) || !toDouble(f[1], xyz[0]) || !toDouble(f[2], xyz[1]) || !toDouble(f[3], xyz[2]) || !toInt(f[4], v[0]) || !toInt(f[5], v[1]) ||
+                !toInt(f[6], v[2]) || !toDouble(f[13], size) || !toInt(f[16], l.flash))
+                continue;
+            l.x = float(xyz[0]); l.y = float(xyz[1]); l.z = float(xyz[2]);
+            l.r = static_cast<unsigned char>(v[0]); l.g = static_cast<unsigned char>(v[1]); l.b = static_cast<unsigned char>(v[2]);
+            l.size = float(size);
+            out.push_back(l);
+        }
+    }
+    return out;
+}
+
+bool ide2dfxLightShown(int flash, int hour) {
+    if (flash == 12) return true;
+    if (flash < 0 || flash > 11) return false;
+    return (flash % 2 == 0) ? hour < 21 : hour > 19;
+}
+
 std::string writeIde(const IdeFile& ide) {
     std::ostringstream out;
     for (int timed = 0; timed < 2; ++timed) {

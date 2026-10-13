@@ -111,6 +111,60 @@ bool addIplRegion(const std::string& gameRoot, const std::string& name, std::str
     return true;
 }
 
+bool removeIplRegion(const std::string& gameRoot, const std::string& rel, std::string& error) {
+    bool added = false;
+    for (const std::string& r : regionsAddedSinceBackup(gameRoot)) added = added || normalised(r) == normalised(rel);
+    if (!added) {
+        error = "Only a region you added with New region... can be deleted; " + rel + " belongs to the game.";
+        return false;
+    }
+    const fs::path game(gameRoot), datPath = game / "data" / "gta3.dat";
+    bool ok;
+    const std::string dat = readAll(datPath, ok);
+    if (!ok) {
+        error = "Cannot read data/gta3.dat.";
+        return false;
+    }
+    std::string out;
+    size_t pos = 0, removed = 0;
+    while (pos < dat.size()) {  // copy every line but the region's, byte for byte
+        size_t nl = dat.find('\n', pos);
+        const size_t next = nl == std::string::npos ? dat.size() : nl + 1;
+        const std::string l = trim(dat.substr(pos, next - pos));
+        if (l.size() > 4 && toLower(l.substr(0, 4)) == "ipl " && normalised(l.substr(4)) == normalised(rel)) ++removed;
+        else out += dat.substr(pos, next - pos);
+        pos = next;
+    }
+    if (removed == 0) {
+        error = rel + " is not listed in gta3.dat.";
+        return false;
+    }
+    {
+        std::ofstream f(datPath, std::ios::binary | std::ios::trunc);
+        f << out;
+        if (!f) {
+            error = "Cannot write data/gta3.dat (read-only?). Nothing was changed.";
+            std::ofstream back(datPath, std::ios::binary | std::ios::trunc);
+            back << dat;
+            return false;
+        }
+    }
+    std::string relFs = rel;
+    for (char& c : relFs) if (c == char(92)) c = '/';
+    std::error_code ec;
+    fs::path ipl = game / relFs;
+    if (!fs::exists(ipl, ec)) {  // the file on disk may be spelled in lower case
+        for (const auto& e : fs::directory_iterator(game / fs::path(relFs).parent_path(), ec))
+            if (toLower(e.path().filename().string()) == toLower(ipl.filename().string())) ipl = e.path();
+    }
+    if (fs::exists(ipl, ec)) {
+        const fs::path to = ipl.string() + ".med-deleted";
+        fs::remove(to, ec);
+        fs::rename(ipl, to, ec);
+    }
+    return true;
+}
+
 std::vector<std::string> regionsAddedSinceBackup(const std::string& gameRoot) {
     std::vector<std::string> added;
     const fs::path dat = fs::path(gameRoot) / "data" / "gta3.dat", backup = dat.string() + ".med-backup";

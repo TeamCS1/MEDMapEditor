@@ -50,8 +50,8 @@ Everything below was checked against the real GTA III files and the game's own c
 +-----------------+--------------------------------------+---------------------+
 ```
 
-- **Top row (files and checks):** **File** drops down Open..., Save All (Ctrl+S), Save as Mod..., View a DFF / TXD / COL file..., Import Model... and **Image Archive...** (see below); **Save All** is also a button of its own; **Reference** drops down Pools and Check Map (F7); **View** drops down **Show hidden regions**, **Show traffic paths** and **Full Screen** (F11) (see below); **Bookmarks** opens the bookmarks list. Save All is greyed out until something has changed.
-- **Editor toolbar (second row):** Undo (back arrow), Redo (forward arrow), New Object..., Centre on Object, Duplicate, Delete and the LOD view toggle. Buttons are greyed out until they can do something (Undo only after an edit, Delete, Duplicate and Centre only with a selection).
+- **Top row (files and checks):** **File** drops down Open..., Save All (Ctrl+S), Save as Mod..., View a DFF / TXD / COL file..., Import Model... and **Image Archive...** (see below); **Save All** is also a button of its own; **Reference** drops down Pools and Check Map (F7); **View** drops down **Show hidden regions**, **Show traffic paths**, **Wireframe Models**, **2DFX Lighting**, **Top down view**, **Reset View** and **Full Screen** (F11) (see below); **Bookmarks** opens the bookmarks list; **Help** has MEd's **Keyboard and Mouse Controls** and **About MEd**. Save All is greyed out until something has changed.
+- **Editor toolbar (second row):** Undo (back arrow), Redo (forward arrow), New Object..., Copy, Paste, Centre on Object, Duplicate, Delete, the LOD view toggle, then MEd's **Top down** (camera straight down from high up), **Reset Angle** (the selected object's rotation back to none) and the **Selection Mode** toggle (see "Moving around"). Buttons are greyed out until they can do something (Undo only after an edit, Delete, Duplicate and Centre only with a selection).
 - **Left column, three tabs:** **Scene** (which regions are drawn, plus the LOD controls), **Placements** (find, list and pick placed objects) and **Item** (every object definition; see below).
 - **3D view (middle):** the map.
 - **Properties panel (right):** what the selected object is (texture, file, LOD partner), its **Model ID** (with **Choose...**), **Position** and **Rotation** boxes with `<<` `<` `>` `>>` buttons, **Rotate -90 / +90**, **Reset**, **Apply typed values**, **Centre on Object** and the two deletes. See "Properties panel" below.
@@ -65,11 +65,11 @@ It starts at the first of MEd's own bookmarks (Portland Hospital).
 
 | Do this | To |
 |---|---|
-| **W / S** or **Up / Down** | Move forward / back |
+| **W / S**, **Up / Down** or **Numpad + / -** | Move forward / back |
 | **A / D** or **Left / Right** | Move left / right |
 | **Ctrl + W/S**, **Page Up / Page Down**, **R / F** | Move up / down |
 | **Shift** (while moving) | Move faster |
-| **Left mouse button, drag** | Look around |
+| **Left mouse button, drag** | Look around (with **Selection Mode** on and an object selected: move the object) |
 | **Ctrl + left mouse button, drag** | Slide the camera |
 | **Mouse wheel** | Forward / back (Shift = faster) |
 | **Space** | Centre the camera on the selected object |
@@ -148,6 +148,15 @@ The **Item** tab (MEd's name for it) lists every object definition from the IDE 
 - **Edit Definition (draw distance, flags, times)...**: the Item Definition Entry window (see below).
 - Selecting an object in the 3D view highlights its definition here.
 
+### View options and camera buttons (from MEd)
+
+- **View > Wireframe Models**: the map's models as lines, to see through buildings and find what is hidden inside or behind them. Again to switch off.
+- **View > 2DFX Lighting**: the lights the game's IDE files give models (street lamps, lit windows, neon, traffic lights) glow in their colour. Which ones depends on **Time in scene** at the bottom of the Scene tab: lights that are always on show until 20:00, night lights from 20:00 (at 20:00 both, MEd's rule), traffic lights always. The title says how many are drawn. The glows stand upright in the model's own direction (as in MEd), so from straight above they cannot be seen.
+- **Top down** (toolbar, or View > Top down view): the camera goes up to height 1560 and looks straight down, where it is. **View > Reset View** puts the camera back at the centre of the map (0, 0, 0).
+- **Reset Angle** (toolbar): the selected object (and its LOD stand-in) loses its rotation. One undo step.
+- **Selection Mode** (toolbar toggle): normally **Alt + left drag** moves the selected objects and a plain drag turns the camera. With Selection Mode on it is the other way round: a **plain left drag moves the selected objects** and **Alt + drag** turns the camera. Ctrl + drag always moves the camera.
+- **Scene tab, bottom:** **Mouse speed** (1 to 99, MEd's default 20: how fast the mouse turns the camera) and **Shift multiplier** (1x to 10x: how much faster Shift makes the keys). Both are remembered for the next start, as in MEd.
+
 ### Full screen (View > Full Screen, or F11)
 
 The 3D view fills the whole screen, without toolbars or panels. As in MEd it asks first; answer **Yes**. While it is on you can only look around (the mouse and the movement keys work); nothing can be selected, moved or deleted. To get back: **double-click**, or press **Enter**, **Esc** or **F11**. The window comes back exactly as it was (also when it was maximised).
@@ -179,6 +188,7 @@ The **Item Definition Entry** window (MEd's name) changes a model's line in its 
 - **Open File** (or Enter, or double-click): shows a model, texture dictionary or collision file in the viewers.
 - **Nothing is written until you press Rebuild Archive.** The status line says "Please Rebuild Archive!" and the title shows `*` while there are changes. Switching archives or closing asks: **Yes** rebuild now, **No** forget the changes, **Cancel** stay.
 - **Rebuild Archive** writes a new archive next to the old one, checks that every file reads back exactly, and only then puts it in place. The archive as it was is kept as `gta3.img.med-backup` and `gta3.dir.med-backup` (the first time; later rebuilds keep that first backup). If anything goes wrong (for example the game has the archive open) the old archive stays exactly as it was. Close the game and the Mod Manager before rebuilding. The editor uses the new archive at once.
+- **New...** makes an empty archive (an `.img` and its `.dir`) and opens it. An archive that already exists is never replaced.
 - **Removing an imported model:** delete its `.dff` (and its `.txd` if nothing else uses it) here and rebuild. Then remove its definition line and collision as `models/med-imports.txt` describes. After a rebuild that file gets a note that its "cut gta3.img back" steps no longer apply: do not follow those any more.
 
 ### Replace Object (swap a placed object for another model)
@@ -473,6 +483,8 @@ This is from reading the game's code, not from testing a modified game.
 
 ### How do I create a new region?
 In the **Scene panel** (left), press **New region...**, type a name (letters, digits, `_` and `-`) and OK. The editor makes an empty IPL file `data/maps/<name>/<name>.ipl` in the folder you opened and adds the line `IPL DATA\MAPS\<name>\<name>.IPL` to `data/gta3.dat` (the original `gta3.dat` is kept once as `gta3.dat.med-backup`). The new region appears in the list straight away, selected, with a **check box like every other region**: untick it to hide it and its objects, tick it to show them again.
+
+**Delete region...** (next to New region) removes a region you made, after asking: its line goes out of `gta3.dat` and its file is renamed to `<name>.ipl.med-deleted` (so nothing is lost, and the name can be used again). It only works on your own regions (never the game's), and only when the region is empty: move its objects to another region or delete them first. Deleting a region cannot be undone with Undo, so the undo list is cleared.
 
 To put objects into it: double-click the objects in the 3D view, click the new region in the list, press **Move selected objects here** (a building and its LOD stand-in move together), then **Save**. Both files (the one the objects came from and the new one) are rewritten. One undo step.
 

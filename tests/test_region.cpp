@@ -49,6 +49,28 @@ int main() {
     CHECK(added.size() == 2 && added[0] == "DATA/MAPS/upstate/upstate.IPL" && added[1] == "DATA/MAPS/second/second.IPL");
     CHECK(regionsAddedSinceBackup((root / "nothing").string()).empty());
 
+    // deleting a region again (MEd's Delete File): only added ones; the line goes, the file is renamed
+    {
+        const std::string datBefore = get(root / "data/gta3.dat");
+        std::vector<std::string> originalIpls;
+        originalIpls.push_back("DATA/MAPS/a/a.IPL");  // listed in the original gta3.dat
+        CHECK(!removeIplRegion(root.string(), originalIpls[0], err) && !err.empty() && get(root / "data/gta3.dat") == datBefore);  // the game's own
+        CHECK(!removeIplRegion(root.string(), "DATA/MAPS/never/never.IPL", err) && get(root / "data/gta3.dat") == datBefore);
+        CHECK(removeIplRegion(root.string(), "DATA/MAPS/upstate/upstate.IPL", err));
+        const std::string after = get(root / "data/gta3.dat");
+        std::string expect = datBefore;
+        const std::string line = std::string("IPL DATA") + char(92) + "MAPS" + char(92) + "upstate" + char(92) + "upstate.IPL\r\n";
+        CHECK(expect.find(line) != std::string::npos);
+        expect.erase(expect.find(line), line.size());
+        CHECK(after == expect);  // exactly that line, everything else byte for byte
+        CHECK(!fs::exists(root / "data/maps/upstate/upstate.ipl") && fs::exists(root / "data/maps/upstate/upstate.ipl.med-deleted"));
+        CHECK(regionsAddedSinceBackup(root.string()).size() == 1);
+        CHECK(!removeIplRegion(root.string(), "DATA/MAPS/upstate/upstate.IPL", err));  // already gone
+        CHECK(addIplRegion(root.string(), "upstate", rel, err));                         // the name can be used again
+        CHECK(removeIplRegion(root.string(), "data\\maps\\UPSTATE\\upstate.ipl", err));  // slashes and case do not matter
+        CHECK(get(root / "data/gta3.dat.med-backup") == original);
+    }
+
     fs::remove_all(root);
     if (failures == 0) std::printf("all region tests passed\n");
     return failures ? 1 : 0;

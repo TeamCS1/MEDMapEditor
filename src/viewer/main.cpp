@@ -198,6 +198,14 @@ struct App {
     std::vector<char> regionHideable;  // per IPL file: empty when the map was loaded (GTA3.ZON, CULL.IPL): hidden from the lists unless View > Show hidden regions
     bool showEmptyRegions = false;     // View > Show hidden regions (off at start)
     bool showPaths = false;            // View > Show traffic paths (--paths)
+    bool mapWireframe = false;         // View > Wireframe Models (MEd CMapView::toggleWireFrame 0x00459240)
+    bool show2dfx = false;             // View > 2DFX Lighting (CMapView::toggle2dfx 0x0045e470)
+    int sceneHour = 20;                // the Scene tab's "Time in scene": which 2DFX lights are lit (0x00416a70)
+    int fxDrawn = 0;                   // 2DFX lights drawn in the last frame (tests)
+    bool selectionMode = false;        // Toggle Selection Mode (CMapView::lockdrag 0x00459120)
+    bool keepControlSettings = false;  // the Scene tab's mouse speed and shift multiplier go into med_viewer.ini (not in test runs)
+    std::map<int, std::vector<Ide2dfxLight>> fxLights;  // the 2dfx lights of each model id
+    std::set<int> deletedRegions;      // regions removed with Delete region... (kept in iplPaths so file numbers stay)
     bool showLod = true;                 // draw the far stand-ins at all
     std::vector<IplInstance> clipboard;  // Copy: the copied placements
     size_t clipboardAnchor = 0;          // the one that lands on the mouse point when pasting (the last copied selected placement)
@@ -292,6 +300,7 @@ bool loadGameData() {
         IdeFile f = parseIde(text, GameVersion::GTA3);
         collectPathModelIds(f, pathIds);
         collectIdePaths(text, app.pathData);
+        for (const Ide2dfxLight& l : ide2dfxLights(f)) app.fxLights[l.id].push_back(l);
         for (const IdeObject& o : f.objects) {
             ModelDef d;
             d.model = toLower(o.model);
@@ -1254,6 +1263,7 @@ std::string saveAll(bool* allOk) {
     }
     if (!app.saveInPlace) { app.ideText.clear(); app.ideEdits.clear(); }  // written elsewhere (a mod folder): nothing left to save, as for IPL files
     for (int fileIndex : std::set<int>(app.dirty)) {
+        if (app.deletedRegions.count(fileIndex)) { app.dirty.erase(fileIndex); continue; }  // no longer in gta3.dat
         const std::string& rel = app.iplPaths[fileIndex];
         const std::string source = app.root + "/" + rel;
         bool readOk;
@@ -1336,6 +1346,8 @@ void drawSelectionHighlight(const std::string& modelName) {
 void drawRoadOverlay();
 void drawPathOverlay();
 
+void draw2dfx();  // the 2DFX lights (MEd's View > 2DFX Lighting)
+
 void render() {
     glViewport(app.viewX, 0, app.width, app.height);
     glClearColor(0, 0, 0, 0);  // MEd clears to black
@@ -1389,6 +1401,7 @@ void render() {
     collectVisible();
     QueryPerformanceCounter(&q1);
     app.drawn = int(app.visible.size());
+    if (app.mapWireframe) glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);  // MEd: View > Wireframe Models
     for (int idx : app.visible) {
         const IplInstance& inst = app.instances[idx];
         const ModelDef& def = app.defs.find(inst.id)->second;
@@ -1399,6 +1412,9 @@ void render() {
         drawModel(gm);
         glPopMatrix();
     }
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    if (app.show2dfx) draw2dfx();
+    else app.fxDrawn = 0;
     QueryPerformanceCounter(&q2);
     app.msCollect += 1000.0 * double(q1.QuadPart - q0.QuadPart) / double(qf.QuadPart);
     app.msSubmit += 1000.0 * double(q2.QuadPart - q1.QuadPart) / double(qf.QuadPart);
@@ -1835,7 +1851,7 @@ void showPoolsWindow(HWND owner) {
 
 // ---- toolbar -----------------------------------------------------------------------------------
 
-enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT, ID_TB_VIEWPATHS, ID_TB_FULLSCREEN, ID_TB_IMGTOOL, ID_TB_LAST = ID_TB_IMGTOOL };
+enum { ID_TB_SAVE = 1001, ID_TB_UNDO, ID_TB_REDO, ID_TB_CENTRE, ID_TB_DELETE, ID_TB_CHECK, ID_TB_POOLS, ID_TB_SAVEMOD, ID_TB_DUPLICATE, ID_TB_OPEN, ID_TB_LODVIEW, ID_TB_NEWOBJ, ID_TB_FILEMENU, ID_TB_REFMENU, ID_TB_COPY, ID_TB_PASTE, ID_TB_BOOKMARKS, ID_TB_VIEWMENU, ID_TB_VIEWEMPTY, ID_TB_ROADATTACH, ID_TB_VIEWFILE, ID_TB_IMPORT, ID_TB_VIEWPATHS, ID_TB_FULLSCREEN, ID_TB_IMGTOOL, ID_TB_WIREFRAME, ID_TB_2DFX, ID_TB_TOPDOWN, ID_TB_RESETVIEW, ID_TB_RESETANGLE, ID_TB_SELMODE, ID_TB_HELPMENU, ID_TB_HELP, ID_TB_ABOUT, ID_TB_LAST = ID_TB_ABOUT };
 
 // Two small arrow icons for Undo (points back) and Redo (points forward), drawn here so no image files are needed.
 HIMAGELIST makeArrowIcons() {
@@ -1901,11 +1917,13 @@ void createToolbar(HWND parent) {
     INITCOMMONCONTROLSEX ic = {sizeof ic, ICC_BAR_CLASSES};
     InitCommonControlsEx(&ic);
     OleInitialize(nullptr);  // the folder picker of Save as Mod needs COM
-    app.menubar = makeToolbar(parent, 100, {{ID_TB_FILEMENU, "File", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_SAVE, "Save All", -1, BTNS_BUTTON}, {ID_TB_REFMENU, "Reference", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_VIEWMENU, "View", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_BOOKMARKS, "Bookmarks", -1, BTNS_BUTTON}});
+    app.menubar = makeToolbar(parent, 100, {{ID_TB_FILEMENU, "File", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_SAVE, "Save All", -1, BTNS_BUTTON}, {ID_TB_REFMENU, "Reference", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_VIEWMENU, "View", -1, BTNS_WHOLEDROPDOWN}, {ID_TB_BOOKMARKS, "Bookmarks", -1, BTNS_BUTTON}, {ID_TB_HELPMENU, "Help", -1, BTNS_WHOLEDROPDOWN}});
     app.toolbar = makeToolbar(parent, 101, {{ID_TB_UNDO, "Undo", 0, BTNS_BUTTON}, {ID_TB_REDO, "Redo", 1, BTNS_BUTTON}, {0, nullptr, -1, 0},
                                             {ID_TB_NEWOBJ, "New Object...", -1, BTNS_BUTTON}, {ID_TB_COPY, "Copy", -1, BTNS_BUTTON}, {ID_TB_PASTE, "Paste", -1, BTNS_BUTTON}, {ID_TB_CENTRE, "Centre on Object", -1, BTNS_BUTTON},
                                             {ID_TB_DUPLICATE, "Duplicate", -1, BTNS_BUTTON}, {ID_TB_DELETE, "Delete", -1, BTNS_BUTTON}, {0, nullptr, -1, 0},
-                                            {ID_TB_LODVIEW, "LOD view", -1, BTNS_CHECK}});  // LOD view is a toggle
+                                            {ID_TB_LODVIEW, "LOD view", -1, BTNS_CHECK}, {0, nullptr, -1, 0},  // LOD view is a toggle
+                                            {ID_TB_TOPDOWN, "Top down", -1, BTNS_BUTTON}, {ID_TB_RESETANGLE, "Reset Angle", -1, BTNS_BUTTON},
+                                            {ID_TB_SELMODE, "Selection Mode", -1, BTNS_CHECK}});  // MEd's toolbar buttons
     SendMessageA(app.toolbar, TB_SETIMAGELIST, 0, (LPARAM)makeArrowIcons());
     auto rowHeight = [](HWND tb) { return int(HIWORD(SendMessageA(tb, TB_GETBUTTONSIZE, 0, 0))) + 6; };
     app.menubarH = rowHeight(app.menubar);
@@ -1924,9 +1942,13 @@ void updateToolbarState() {
                           {app.toolbar, ID_TB_DELETE, !app.selected.empty()},
                           {app.toolbar, ID_TB_DUPLICATE, !app.selected.empty()},
                           {app.toolbar, ID_TB_COPY, !app.selected.empty()},
-                          {app.toolbar, ID_TB_PASTE, !app.clipboard.empty()}};
-    static int last[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
-    for (int i = 0; i < 8; ++i) {
+                          {app.toolbar, ID_TB_PASTE, !app.clipboard.empty()},
+                          {app.toolbar, ID_TB_RESETANGLE, !app.selected.empty()}};
+    constexpr int kCount = int(sizeof items / sizeof items[0]);
+    static int last[kCount];
+    static bool started = false;
+    if (!started) { std::fill(last, last + kCount, -1); started = true; }
+    for (int i = 0; i < kCount; ++i) {
         if (last[i] == items[i].enabled) continue;
         SendMessageA(items[i].bar, TB_ENABLEBUTTON, items[i].id, MAKELONG(items[i].enabled ? TRUE : FALSE, 0));
         last[i] = items[i].enabled;
@@ -1954,7 +1976,9 @@ int CALLBACK startFolderProc(HWND w, UINT msg, LPARAM, LPARAM data) {
 }
 
 void saveAsMod(HWND owner) {
-    if (!anyUnsaved() && regionsAddedSinceBackup(app.root).empty()) {
+    bool datA = false, datB = false;
+    const bool datDiffers = slurp(app.root + "/data/gta3.dat", datA) != slurp(app.root + "/data/gta3.dat.med-backup", datB) && datA && datB;
+    if (!anyUnsaved() && regionsAddedSinceBackup(app.root).empty() && !datDiffers) {
         MessageBoxA(owner, "Nothing to save: no file has been changed.", "Save as Mod", MB_ICONINFORMATION);
         return;
     }
@@ -1987,7 +2011,13 @@ void saveAsMod(HWND owner) {
     // Regions made with New region... are part of the mod too: the gta3.dat that lists them, and their IPL files (those
     // with changed objects were written by saveAll just now; an empty one is copied as it is).
     const std::vector<std::string> addedRegions = regionsAddedSinceBackup(app.root);
-    if (!addedRegions.empty()) {
+    bool datChanged = false;
+    {
+        bool a = false, b = false;
+        const std::string now = slurp(app.root + "/data/gta3.dat", a), before = slurp(app.root + "/data/gta3.dat.med-backup", b);
+        datChanged = a && b && now != before;
+    }
+    if (!addedRegions.empty() || datChanged) {
         std::error_code ec;
         const fs::path target(path);
         fs::create_directories(target / "data", ec);
@@ -2090,6 +2120,11 @@ const char* const kFullScreenQuestion =
     "- Press \"Enter\",\"Esc\",\"F11\" or \"Return\" on your keyboard";
 
 bool enterFullScreen(HWND h, bool ask);
+void setTopDownView();
+void resetMapView();
+void setSelectionMode(bool on);
+HWND showHelpWindow(HWND owner, int which);
+void resetRotation();
 void showImgTool(HWND owner);  // Image Archive
 void leaveFullScreen(HWND h);
 
@@ -2097,6 +2132,14 @@ void doCommand(HWND h, int id) {
     switch (id) {
         case ID_TB_FULLSCREEN: enterFullScreen(h, true); return;
         case ID_TB_IMGTOOL: showImgTool(h); return;
+        case ID_TB_WIREFRAME: app.mapWireframe = !app.mapWireframe; break;
+        case ID_TB_2DFX: app.show2dfx = !app.show2dfx; break;
+        case ID_TB_TOPDOWN: setTopDownView(); break;
+        case ID_TB_RESETVIEW: resetMapView(); break;
+        case ID_TB_RESETANGLE: resetRotation(); break;
+        case ID_TB_SELMODE: setSelectionMode(SendMessageA(app.toolbar, TB_ISBUTTONCHECKED, ID_TB_SELMODE, 0) != 0); break;
+        case ID_TB_HELP: showHelpWindow(h, 0); return;
+        case ID_TB_ABOUT: showHelpWindow(h, 1); return;
         case ID_TB_OPEN: openGameFolder(h); return;
         case ID_TB_BOOKMARKS: showBookmarksWindow(h); return;  // the window keeps the focus
         case ID_TB_VIEWEMPTY: setShowEmptyRegions(!app.showEmptyRegions); break;
@@ -2136,7 +2179,15 @@ void showToolbarMenu(HWND owner, int buttonId) {
         AppendMenuA(menu, MF_STRING | (app.showEmptyRegions ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWEMPTY, "Show hidden regions");
         AppendMenuA(menu, MF_STRING | (app.showPaths ? MF_CHECKED : MF_UNCHECKED), ID_TB_VIEWPATHS, "Show traffic paths (cars orange, pedestrians blue, dead ends red)");
         AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(menu, MF_STRING | (app.mapWireframe ? MF_CHECKED : MF_UNCHECKED), ID_TB_WIREFRAME, "Wireframe Models");
+        AppendMenuA(menu, MF_STRING | (app.show2dfx ? MF_CHECKED : MF_UNCHECKED), ID_TB_2DFX, "2DFX Lighting (lights of the time set in the Scene tab)");
+        AppendMenuA(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuA(menu, MF_STRING, ID_TB_TOPDOWN, "Top down view");
+        AppendMenuA(menu, MF_STRING, ID_TB_RESETVIEW, "Reset View (central co-ordinates)");
         AppendMenuA(menu, MF_STRING, ID_TB_FULLSCREEN, "Full Screen" "\tF11");
+    } else if (buttonId == ID_TB_HELPMENU) {
+        AppendMenuA(menu, MF_STRING, ID_TB_HELP, "Keyboard and Mouse Controls");
+        AppendMenuA(menu, MF_STRING, ID_TB_ABOUT, "About MEd");
     } else {
         AppendMenuA(menu, MF_STRING, ID_TB_POOLS, "Pools");
         AppendMenuA(menu, MF_STRING, ID_TB_CHECK, "Check Map" "\tF7");
@@ -2771,7 +2822,10 @@ std::vector<Region> regions;
 // New region..., or one emptied by moving its objects away, is always listed.
 bool regionListed(int file) { return app.showEmptyRegions || file < 0 || file >= int(app.regionHideable.size()) || !app.regionHideable[file]; }
 
-enum { ID_SC_LIST = 4001, ID_SC_ALL, ID_SC_NONE, ID_SC_ONLY, ID_SC_INFO, ID_SC_LODSHOW, ID_SC_LODLABEL, ID_SC_LODSLIDER, ID_SC_NEW, ID_SC_MOVE };
+enum { ID_SC_LIST = 4001, ID_SC_ALL, ID_SC_NONE, ID_SC_ONLY, ID_SC_INFO, ID_SC_LODSHOW, ID_SC_LODLABEL, ID_SC_LODSLIDER, ID_SC_NEW, ID_SC_MOVE, ID_SC_DELETE,
+       ID_SC_MOUSE, ID_SC_MOUSEUD, ID_SC_SHIFT, ID_SC_HOUR, ID_SC_LBL_MOUSE, ID_SC_LBL_SHIFT, ID_SC_LBL_HOUR };
+void deleteRegionUi(HWND owner);
+void saveControlSettings();
 
 struct SceneUi {
     HWND list = nullptr, info = nullptr;
@@ -2835,6 +2889,7 @@ void initRegions() {
     for (size_t i = 0; i < old.size() && i < app.regionOn.size(); ++i) app.regionOn[i] = old[i];
     regions.clear();
     for (size_t f = 0; f < app.iplPaths.size(); ++f) {
+        if (app.deletedRegions.count(int(f))) continue;  // Delete region...
         Region r;
         r.file = int(f);
         const std::string& path = app.iplPaths[f];
@@ -3243,6 +3298,25 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             make("BUTTON", "Deselect all", BS_PUSHBUTTON, 0, ID_SC_NONE);
             make("BUTTON", "Only the selected row", BS_PUSHBUTTON, 0, ID_SC_ONLY);
             make("BUTTON", "New region...", BS_PUSHBUTTON, 0, ID_SC_NEW);
+            make("BUTTON", "Delete region...", BS_PUSHBUTTON, 0, ID_SC_DELETE);
+            make("STATIC", "Mouse speed:", SS_LEFT, 0, ID_SC_LBL_MOUSE);
+            HWND mouse = make("EDIT", std::to_string(int(app.cam.mouseSpeed)).c_str(), ES_NUMBER | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE, ID_SC_MOUSE);
+            HWND ud = make(UPDOWN_CLASSA, "", UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS, 0, ID_SC_MOUSEUD);
+            SendMessageA(ud, UDM_SETBUDDY, (WPARAM)mouse, 0);
+            SendMessageA(ud, UDM_SETRANGE32, 1, 99);
+            SendMessageA(ud, UDM_SETPOS32, 0, int(app.cam.mouseSpeed));
+            make("STATIC", "Shift multiplier:", SS_LEFT, 0, ID_SC_LBL_SHIFT);
+            HWND shift = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_SC_SHIFT);
+            for (int i = 1; i <= 10; ++i) SendMessageA(shift, CB_ADDSTRING, 0, (LPARAM)(std::to_string(i) + "x").c_str());
+            SendMessageA(shift, CB_SETCURSEL, std::clamp(app.cam.shiftMultiplier, 1, 10) - 1, 0);
+            make("STATIC", "Time in scene (2DFX lights):", SS_LEFT, 0, ID_SC_LBL_HOUR);
+            HWND hour = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, 0, ID_SC_HOUR);
+            for (int h = 0; h < 24; ++h) {
+                char b[8];
+                std::snprintf(b, sizeof b, "%02d:00", h);
+                SendMessageA(hour, CB_ADDSTRING, 0, (LPARAM)b);
+            }
+            SendMessageA(hour, CB_SETCURSEL, app.sceneHour, 0);
             make("BUTTON", "Move selected objects here", BS_PUSHBUTTON, 0, ID_SC_MOVE);
             scene.info = make("STATIC", "", SS_LEFT, 0, ID_SC_INFO);
             HWND show = make("BUTTON", "Show LOD models (far stand-ins)", BS_AUTOCHECKBOX, 0, ID_SC_LODSHOW);
@@ -3256,7 +3330,7 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_SIZE: {
             const int cw = LOWORD(lp), ch = HIWORD(lp), m = 6;
-            const int below = 6 * 28 + 44 + 96;
+            const int below = 8 * 28 + 44 + 96;
             MoveWindow(scene.list, m, m, cw - 2 * m, std::max(80, ch - below - m), TRUE);
             int y = ch - below + 4;
             const int hb = (cw - 2 * m - 4) / 2;
@@ -3265,7 +3339,8 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             y += 28;
             MoveWindow(GetDlgItem(w, ID_SC_ONLY), m, y, cw - 2 * m, 24, TRUE);
             y += 28;
-            MoveWindow(GetDlgItem(w, ID_SC_NEW), m, y, cw - 2 * m, 24, TRUE);
+            MoveWindow(GetDlgItem(w, ID_SC_NEW), m, y, hb, 24, TRUE);
+            MoveWindow(GetDlgItem(w, ID_SC_DELETE), m + hb + 4, y, hb, 24, TRUE);
             y += 28;
             MoveWindow(GetDlgItem(w, ID_SC_MOVE), m, y, cw - 2 * m, 24, TRUE);
             y += 32;
@@ -3276,6 +3351,15 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             MoveWindow(GetDlgItem(w, ID_SC_LODLABEL), m, y, cw - 2 * m, 16, TRUE);
             y += 18;
             MoveWindow(GetDlgItem(w, ID_SC_LODSLIDER), m, y, cw - 2 * m, 30, TRUE);
+            y += 32;
+            MoveWindow(GetDlgItem(w, ID_SC_LBL_MOUSE), m, y + 4, 74, 16, TRUE);
+            MoveWindow(GetDlgItem(w, ID_SC_MOUSE), m + 76, y, 46, 22, TRUE);
+            SendMessageA(GetDlgItem(w, ID_SC_MOUSEUD), UDM_SETBUDDY, (WPARAM)GetDlgItem(w, ID_SC_MOUSE), 0);
+            MoveWindow(GetDlgItem(w, ID_SC_LBL_SHIFT), m + 134, y + 4, 90, 16, TRUE);
+            MoveWindow(GetDlgItem(w, ID_SC_SHIFT), m + 226, y, std::max(50, cw - m - 226 - m), 300, TRUE);
+            y += 28;
+            MoveWindow(GetDlgItem(w, ID_SC_LBL_HOUR), m, y + 4, 160, 16, TRUE);
+            MoveWindow(GetDlgItem(w, ID_SC_HOUR), m + 162, y, 70, 400, TRUE);
             return 0;
         }
         case WM_HSCROLL:
@@ -3287,6 +3371,24 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_COMMAND:
+            if (LOWORD(wp) == ID_SC_MOUSE && HIWORD(wp) == EN_CHANGE) {  // MEd: Mouse speed -> changeMouse
+                char b[16] = "";
+                GetWindowTextA((HWND)lp, b, sizeof b);
+                const int v = std::atoi(b);
+                if (v >= 1 && v <= 99) { app.cam.mouseSpeed = float(v); saveControlSettings(); }
+                return 0;
+            }
+            if (LOWORD(wp) == ID_SC_SHIFT && HIWORD(wp) == CBN_SELCHANGE) {  // MEd: Shift multiplier -> speedChanged (index + 1)
+                app.cam.shiftMultiplier = int(SendMessageA((HWND)lp, CB_GETCURSEL, 0, 0)) + 1;
+                saveControlSettings();
+                SetFocus(GetParent(w));
+                return 0;
+            }
+            if (LOWORD(wp) == ID_SC_HOUR && HIWORD(wp) == CBN_SELCHANGE) {
+                app.sceneHour = int(SendMessageA((HWND)lp, CB_GETCURSEL, 0, 0));
+                SetFocus(GetParent(w));
+                return 0;
+            }
             if (LOWORD(wp) == ID_SC_LODSHOW && HIWORD(wp) == BN_CLICKED) {
                 app.showLod = SendMessageA((HWND)lp, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 SetFocus(GetParent(w));
@@ -3296,6 +3398,7 @@ LRESULT CALLBACK sceneProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 if (LOWORD(wp) == ID_SC_ALL) setAllRegions(true);
                 else if (LOWORD(wp) == ID_SC_NONE) setAllRegions(false);
                 else if (LOWORD(wp) == ID_SC_NEW) createRegionUi(w);
+                else if (LOWORD(wp) == ID_SC_DELETE) deleteRegionUi(w);
                 else if (LOWORD(wp) == ID_SC_MOVE) {
                     const int sel = sceneRowRegion(ListView_GetNextItem(scene.list, -1, LVNI_SELECTED));
                     if (sel < 0) MessageBoxA(w, "Click a region in the list first (the one the objects should go into).", "Move selected objects", MB_ICONINFORMATION);
@@ -7592,7 +7695,7 @@ bool ieHandleKey(const MSG& m) {
 // appends to the .img at once), adding a name that exists asks to replace it (MEd makes a second entry of the same
 // name), Delete names the definitions that use the file, and Rebuild never writes into the old archive (core/imgedit.h):
 // the old one is kept as <file>.med-backup the first time.
-enum { ID_IG_OPEN = 9701, ID_IG_ADD, ID_IG_EXTRACT, ID_IG_DELETE, ID_IG_RENAME, ID_IG_PREVIEW, ID_IG_REBUILD, ID_IG_CLOSE, ID_IG_ARCHIVES, ID_IG_LIST,
+enum { ID_IG_NEW = 9700, ID_IG_OPEN = 9701, ID_IG_ADD, ID_IG_EXTRACT, ID_IG_DELETE, ID_IG_RENAME, ID_IG_PREVIEW, ID_IG_REBUILD, ID_IG_CLOSE, ID_IG_ARCHIVES, ID_IG_LIST,
        ID_IG_SHOW, ID_IG_FIND, ID_IG_STATUS, ID_IG_LBL_SHOW, ID_IG_LBL_FIND };
 
 struct ImgToolUi {
@@ -7989,9 +8092,38 @@ void igClose() {
     if (app.hwnd) SetFocus(app.hwnd);
 }
 
+// New... (MEd: CIMGTool::newFile 0x00440090, "Create New Archive"): an empty archive (version 1, an empty .img and
+// .dir, as CIMG's create 0x0041cce0 makes them), opened in the tool. An archive that is already there is not replaced.
+bool igNewArchive(const std::string& path) {
+    std::error_code ec;
+    std::string p = path;
+    if (toLower(fs::path(p).extension().string()) != ".img") p += ".img";
+    if (fs::exists(p, ec)) { igTell(p + " already exists. Choose another name (an archive is never replaced here).", MB_ICONWARNING); return false; }
+    if (!igLeave()) return false;
+    ImgArchive a;
+    std::string err;
+    if (!ImgArchive::create(p, 1, a, err)) { igTell("Could not create the archive: " + err, MB_ICONWARNING); return false; }
+    return igOpenArchive(p);
+}
+
 void igCommand(int id) {
     const std::vector<std::string> sel = igSelectedNames();
     switch (id) {
+        case ID_IG_NEW: {
+            char name[MAX_PATH] = "";
+            const std::string dir = app.root + "\\models";
+            OPENFILENAMEA o = {sizeof o};
+            o.hwndOwner = imgt.wnd;
+            o.lpstrFilter = "Image File (*.img)\0*.img\0";
+            o.lpstrFile = name;
+            o.nMaxFile = MAX_PATH;
+            o.lpstrInitialDir = dir.c_str();
+            o.lpstrDefExt = "img";
+            o.lpstrTitle = "Create New Archive";
+            o.Flags = OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            if (GetSaveFileNameA(&o)) igNewArchive(name);
+            break;
+        }
         case ID_IG_OPEN: {
             char name[MAX_PATH] = "";
             OPENFILENAMEA o = {sizeof o};
@@ -8030,8 +8162,8 @@ LRESULT CALLBACK imgToolProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
                 return c;
             };
-            const char* buttons[] = {"Open...", "Import File(s)...", "Extract File(s)...", "Delete File(s)", "Rename File...", "Open File", "Rebuild Archive", "Close"};
-            for (int i = 0; i < 8; ++i) make("BUTTON", buttons[i], BS_PUSHBUTTON | WS_TABSTOP, 0, ID_IG_OPEN + i);
+            const char* buttons[] = {"New...", "Open...", "Import File(s)...", "Extract File(s)...", "Delete File(s)", "Rename File...", "Open File", "Rebuild Archive", "Close"};
+            for (int i = 0; i < 9; ++i) make("BUTTON", buttons[i], BS_PUSHBUTTON | WS_TABSTOP, 0, ID_IG_NEW + i);
             make("STATIC", "Show:", SS_LEFT, 0, ID_IG_LBL_SHOW);
             imgt.show = make("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, ID_IG_SHOW);
             for (const char* s : {"Everything", "Only 3D Models", "Only Texture Dictionary Files", "Only Collision Files", "Only Binary IPL Files"})
@@ -8057,8 +8189,8 @@ LRESULT CALLBACK imgToolProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_SIZE: {
             const int cw = LOWORD(lp), ch = HIWORD(lp), m = 8;
-            const int bw = (cw - 2 * m - 7 * 4) / 8;
-            for (int i = 0; i < 8; ++i) MoveWindow(GetDlgItem(w, ID_IG_OPEN + i), m + i * (bw + 4), m, bw, 26, TRUE);
+            const int bw = (cw - 2 * m - 8 * 4) / 9;
+            for (int i = 0; i < 9; ++i) MoveWindow(GetDlgItem(w, ID_IG_NEW + i), m + i * (bw + 4), m, bw, 26, TRUE);
             int y = m + 32;
             MoveWindow(GetDlgItem(w, ID_IG_LBL_SHOW), m + 200, y + 4, 36, 16, TRUE);
             MoveWindow(imgt.show, m + 238, y, 200, 300, TRUE);
@@ -8072,7 +8204,7 @@ LRESULT CALLBACK imgToolProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_COMMAND: {
             const int id = LOWORD(wp), code = HIWORD(wp);
-            if (id >= ID_IG_OPEN && id <= ID_IG_CLOSE && code == BN_CLICKED) igCommand(id);
+            if (id >= ID_IG_NEW && id <= ID_IG_CLOSE && code == BN_CLICKED) igCommand(id);
             else if (id == ID_IG_SHOW && code == CBN_SELCHANGE) igRefill();
             else if (id == ID_IG_FIND && code == EN_CHANGE) igRefill();
             else if (id == ID_IG_ARCHIVES && code == LBN_SELCHANGE) igSelectArchive(int(SendMessageA(imgt.archives, LB_GETCURSEL, 0, 0)));
@@ -8160,6 +8292,291 @@ bool igHandleKey(const MSG& m) {
     if (m.wParam == VK_F2) { igCommand(ID_IG_RENAME); return true; }
     if (m.wParam == VK_RETURN) { igCommand(ID_IG_PREVIEW); return true; }
     return false;
+}
+
+// ---- MEd's view options and camera buttons ----------------------------------------------------------------------------
+// From MEd's View menu and toolbar (MainWindow, CMapView; read 2026-10-13, names in re/names.tsv):
+//  - Wireframe Models: CMapView::toggleWireFrame (0x00459240) = glPolygonMode(GL_FRONT_AND_BACK, GL_LINE / GL_FILL).
+//  - 2DFX Lighting: CMapView::toggle2dfx (0x0045e470) sets a flag and rebuilds the display lists; with it every visible
+//    placement draws its model's 2dfx lights (0x00416fe0 -> 0x00416a70): at the light's position in the model's frame,
+//    in the light's colour, a quad of +-size in the model's X-Z plane, textured with a corona, additive (GL_SRC_ALPHA,
+//    GL_ONE) without depth writes; which lights show depends on the Scene tab's "Time in scene" (ide2dfxLightShown);
+//    flash type 12 (traffic light) is drawn dim red or dim green (90). Deliberate differences: MEd's corona picture is in
+//    its resources, a soft round glow is drawn here instead; lighting is off for the glow so it is not shaded; a
+//    traffic light keeps its colour (MEd picks it again at random whenever the display lists are rebuilt).
+//  - Top down view: MainWindow::setTopDown (0x0044f870): camera z 1560, yaw 0, pitch 90 (x, y and h stay).
+//  - Reset View ("Reset the map to central co-ordinates"): CMapView::resetView (0x0045e4b0): x, y, z from the reset
+//    point (always 0, 0, 0: MainWindow::mapChange 0x00456e10 sets it), yaw, pitch and h 0.
+//  - Reset Angle: CIPLViewer::resetAngle (0x0044b920): the object's rotation becomes (0, 0, 0, 1) (resetRotation, which
+//    also turns the LOD partner and makes one undo step).
+//  - Toggle Selection Mode: CMapView::lockdrag(bool) (0x00459120, +0xbc), read in mouseMoveEvent (0x00462130): normally
+//    Alt + left drag moves the selected objects; with the mode on a plain left drag moves them and Alt + drag moves the
+//    camera (MEd's help says so too). Ctrl + drag always moves the camera.
+//  - Mouse speed and the Shift multiplier: the Scene tab's "Mouse speed:" (MainWindow::changeMouse 0x0044fc00 ->
+//    CMapView +0x98, default 20) and "Shift multiplier:" 1x to 10x (CMapView::speedChanged 0x00458e80 -> +0xa4 = index +
+//    1), kept in MEd's settings as controls/mousesens and controls/speed; here in med_viewer.ini [Controls].
+
+bool dragMovesObjects(bool alt, bool ctrl) { return !ctrl && (alt != app.selectionMode); }
+
+void setTopDownView() {
+    app.cam.z = 1560;
+    app.cam.yaw = 0;
+    app.cam.pitch = 90;
+}
+
+void resetMapView() {
+    app.cam.x = app.cam.y = app.cam.z = 0;
+    app.cam.yaw = app.cam.pitch = 0;
+    app.cam.h = 0;
+}
+
+void setSelectionMode(bool on) {
+    app.selectionMode = on;
+    if (app.toolbar) SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(on ? TRUE : FALSE, 0));
+}
+
+// A soft round glow (white, alpha falling off to the edge) for the 2DFX lights.
+GLuint glowTexture() {
+    static GLuint tex = 0;
+    if (tex) return tex;
+    const int n = 64;
+    std::vector<unsigned char> px(size_t(n) * n * 4);
+    for (int y = 0; y < n; ++y)
+        for (int x = 0; x < n; ++x) {
+            const double dx = (x + 0.5) / n * 2 - 1, dy = (y + 0.5) / n * 2 - 1;
+            const double r = std::sqrt(dx * dx + dy * dy);
+            const double a = r >= 1 ? 0 : (1 - r) * (1 - r);
+            unsigned char* p = &px[(size_t(y) * n + x) * 4];
+            p[0] = p[1] = p[2] = 255;
+            p[3] = static_cast<unsigned char>(a * 255);
+        }
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, n, n, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    return tex;
+}
+
+void draw2dfx() {
+    app.fxDrawn = 0;
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_POLYGON_BIT);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+    glDisable(GL_LIGHTING);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_BLEND);
+    glBindTexture(GL_TEXTURE_2D, glowTexture());
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+    glDepthMask(GL_FALSE);
+    for (int idx : app.visible) {
+        const IplInstance& inst = app.instances[idx];
+        auto f = app.fxLights.find(inst.id);
+        if (f == app.fxLights.end()) continue;
+        glPushMatrix();
+        applyPlacement(inst);
+        int k = 0;
+        for (const Ide2dfxLight& l : f->second) {
+            ++k;
+            if (!ide2dfxLightShown(l.flash, app.sceneHour)) continue;
+            if (l.flash == 12) {  // a traffic light: dim red or dim green, as MEd picks them
+                if (((unsigned(idx) * 2654435761u) ^ unsigned(k)) & 1u) glColor3ub(90, 0, 0);
+                else glColor3ub(0, 90, 0);
+            } else {
+                glColor3ub(l.r, l.g, l.b);
+            }
+            const float s = l.size;
+            glPushMatrix();
+            glTranslatef(l.x, l.y, l.z);
+            glBegin(GL_QUADS);
+            glTexCoord2f(0, 0); glVertex3f(-s, 0, -s);
+            glTexCoord2f(1, 0); glVertex3f(s, 0, -s);
+            glTexCoord2f(1, 1); glVertex3f(s, 0, s);
+            glTexCoord2f(0, 1); glVertex3f(-s, 0, s);
+            glEnd();
+            glPopMatrix();
+            ++app.fxDrawn;
+        }
+        glPopMatrix();
+    }
+    glPopAttrib();
+    glDepthMask(GL_TRUE);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// The Scene tab's controls are kept between runs, as MEd keeps controls/mousesens and controls/speed.
+void saveControlSettings() {
+    if (!app.keepControlSettings) return;
+    WritePrivateProfileStringA("Controls", "mousesens", std::to_string(int(app.cam.mouseSpeed)).c_str(), modIniPath().c_str());
+    WritePrivateProfileStringA("Controls", "speed", std::to_string(app.cam.shiftMultiplier).c_str(), modIniPath().c_str());
+}
+void loadControlSettings() {
+    app.keepControlSettings = true;
+    app.cam.mouseSpeed = float(std::clamp(int(GetPrivateProfileIntA("Controls", "mousesens", 20, modIniPath().c_str())), 1, 99));
+    app.cam.shiftMultiplier = std::clamp(int(GetPrivateProfileIntA("Controls", "speed", 1, modIniPath().c_str())), 1, 10);
+}
+
+// ---- Delete region (MEd's IPL tab "Delete File") -----------------------------------------------------------------------
+// Only a region added with New region... (core removeIplRegion refuses the game's own), and only when it holds no
+// placements any more (move or delete them first, which can be undone). Deliberate differences from MEd
+// (CIPLTree::delFile 0x004287c0, which takes an undo snapshot and drops the file with its placements): the file is renamed
+// to .med-deleted instead of left as it is, and the undo history is cleared, because undoing could bring placements back
+// into a file the game no longer loads.
+bool deleteRegionNamed(int file, std::string& why, bool ask, HWND owner) {
+    if (file < 0 || file >= int(app.iplPaths.size()) || app.deletedRegions.count(file)) { why = "Click a region in the list first."; return false; }
+    const std::string rel = app.iplPaths[size_t(file)];
+    bool added = false;
+    for (const std::string& r : regionsAddedSinceBackup(app.root)) added = added || toLower(r) == toLower(rel);
+    const std::string name = rel.substr(rel.find_last_of('/') + 1);
+    if (!added) { why = name + " is part of the game. Only a region you added with New region... can be deleted."; return false; }
+    size_t count = 0;
+    for (int f : app.instFile) count += f == file;
+    if (count) {
+        why = name + " still holds " + std::to_string(count) + " placement(s). Move them to another region (Move selected objects here) or delete them first.";
+        return false;
+    }
+    if (ask && MessageBoxA(owner, ("Are you sure you want to delete " + name + "?\n\nIts line is taken out of data/gta3.dat and the file is renamed to " + name +
+                                   ".med-deleted. The undo history is cleared.").c_str(),
+                           "Delete region", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        why.clear();
+        return false;
+    }
+    if (!removeIplRegion(app.root, rel, why)) return false;
+    app.deletedRegions.insert(file);
+    app.dirty.erase(file);
+    if (file < int(app.regionOn.size())) app.regionOn[size_t(file)] = 0;
+    app.history.clear();
+    if (pl.region == file) pl.region = -1;
+    initRegions();
+    fillRegionList();
+    plRefreshAfterEdit();
+    why.clear();
+    return true;
+}
+
+void deleteRegionUi(HWND owner) {
+    const int sel = sceneRowRegion(ListView_GetNextItem(scene.list, -1, LVNI_SELECTED));
+    std::string why;
+    if (!deleteRegionNamed(sel < 0 ? -1 : regions[size_t(sel)].file, why, true, owner) && !why.empty())
+        MessageBoxA(owner, why.c_str(), "Delete region", MB_ICONINFORMATION);
+}
+
+// ---- Help and About (MEd: MainWindow::helpClick 0x00450000, showAbout 0x00450260) -----------------------------------
+// MEd's help is a table of the controls (its strings, kept in its order and words); the About text is MEd's own, then a
+// line about this rebuild. Shown as plain text in a window of its own.
+const char* const kMedHelpText =
+    "Keyboard and Mouse Controls\r\n"
+    "\r\n"
+    "Moving the Camera\r\n"
+    "  Left Button                                   Rotate Camera\r\n"
+    "  Ctrl+Left Button                              Move Camera\r\n"
+    "  W,S,A,D or Cursor Keys                        Move Camera\r\n"
+    "  ScrollWheel or Numpad +/-                     Move Camera Forwards/Backwards\r\n"
+    "  CTRL+Cursor or CTRL+W/S or PGUP/PGDOWN        Move Camera Up and Down\r\n"
+    "\r\n"
+    "Moving and Selecting Objects\r\n"
+    "  Double-Click                                  Select/Deselect Object\r\n"
+    "  Shift-Double-Click                            Select/Deselect Multiple Objects\r\n"
+    "  Right-Click                                   Object Menu\r\n"
+    "  Shift & Right-Click                           Multiple Objects Context Menu\r\n"
+    "  Alt+Cursor Keys                               Move Selected Object\r\n"
+    "  Alt+CTRL+Cursor or Alt+PGUP/PGDOWN            Move Object Up and Down\r\n"
+    "  Alt+Left-Btn                                  Move Object\r\n"
+    "\r\n"
+    "Miscellaneous Controls\r\n"
+    "  Shift                                         Move Faster\r\n"
+    "  Esc                                           Exit Full-Screen Mode/Cancel Selection\r\n"
+    "  Space                                         Centre on Selected Object\r\n"
+    "  Del                                           Delete Selected Object\r\n"
+    "\r\n"
+    "The Toggle Selection Mode option will change the behaviour of the left-click mouse button. When selected, holding down "
+    "Alt whilst an object is selected will move the camera as opposed to the default where Alt is used to move an object.\r\n"
+    "\r\n"
+    "Also in this editor (not in MEd)\r\n"
+    "  Del                                           Delete Object: moves it below the map (z -200), with its LOD\r\n"
+    "  Shift+Del                                     Delete Object permanently (removes it from the file)\r\n"
+    "  Ctrl+Z / Ctrl+Y                               Undo / Redo (20 steps)\r\n"
+    "  Ctrl+S                                        Save All\r\n"
+    "  Ctrl+C / Ctrl+V / Ctrl+D                      Copy / Paste / Duplicate\r\n"
+    "  Ctrl+F                                        Find (the Placements tab)\r\n"
+    "  Ctrl+B                                        Bookmarks\r\n"
+    "  Ctrl+L                                        LOD view\r\n"
+    "  Ctrl+R                                        Attach a road piece\r\n"
+    "  F7                                            Check Map\r\n"
+    "  F11                                           Full Screen (and back)\r\n"
+    "  R / F                                         Move Camera Up and Down (MEd reads these too)\r\n"
+    "\r\n"
+    "The full guide is GUIDE.md next to the program's source.";
+
+const char* const kMedAboutText =
+    "MEd v0.32 - For GTA III, Vice City and San Andreas\r\n"
+    "\r\n"
+    "Designed and Written by Tony Wroblewski\r\n"
+    "Hosted by gtanet.com.\r\n"
+    "Thanks to Steve-M and Kam for helping with the COLL/COL3 file format, Ben 'Cerbera' Miller for helping with the "
+    "interface and KCow/Delfi for MooMapper/KEd.\r\n"
+    "\r\n"
+    "Remember! Always perform a backup before using this tool.\r\n"
+    "\r\n"
+    "For support, questions, bug reports and comments please discuss in the Modding > Editing > Maps section of "
+    "www.gtaforums.com\r\n"
+    "\r\n"
+    "(c) 2005-2006 Tony Wroblewski\r\n"
+    "\r\n"
+    "--------------------------------------------------------------------------------\r\n"
+    "This program is a rebuild of MEd v0.32, recovered from MEd.exe under the licence in its readme, with GTA III "
+    "first. The recovered behaviour and every deliberate difference are written down in CLAUDE.md and GUIDE.md.";
+
+HWND helpWnd = nullptr;
+LRESULT CALLBACK helpProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_SIZE: {
+            RECT r;
+            GetClientRect(w, &r);
+            MoveWindow(GetDlgItem(w, 1), 8, 8, r.right - 16, r.bottom - 50, TRUE);
+            MoveWindow(GetDlgItem(w, 2), r.right - 100, r.bottom - 36, 92, 28, TRUE);
+            return 0;
+        }
+        case WM_COMMAND:
+            if (LOWORD(wp) == 2) DestroyWindow(w);
+            return 0;
+        case WM_CLOSE: DestroyWindow(w); return 0;
+        case WM_DESTROY: if (helpWnd == w) helpWnd = nullptr; return 0;
+    }
+    return DefWindowProcA(w, msg, wp, lp);
+}
+
+// which: 0 = Keyboard and Mouse Controls, 1 = About.
+HWND showHelpWindow(HWND owner, int which) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = helpProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = "MEdHelp";
+        RegisterClassA(&wc);
+        registered = true;
+    }
+    if (helpWnd) DestroyWindow(helpWnd);
+    RECT r;
+    GetWindowRect(owner, &r);
+    const bool about = which == 1;
+    helpWnd = CreateWindowExA(WS_EX_TOOLWINDOW, "MEdHelp", about ? "About MEd" : "MEd - Keyboard and Mouse Controls",
+                              WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE, r.left + 100, r.top + 80, about ? 560 : 760, about ? 400 : 640,
+                              owner, nullptr, GetModuleHandle(nullptr), nullptr);
+    HWND text = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", about ? kMedAboutText : kMedHelpText,
+                                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, 0, 0, 10, 10, helpWnd, (HMENU)1,
+                                GetModuleHandle(nullptr), nullptr);
+    SendMessageA(text, WM_SETFONT, (WPARAM)GetStockObject(about ? DEFAULT_GUI_FONT : ANSI_FIXED_FONT), TRUE);
+    HWND ok = CreateWindowExA(0, "BUTTON", "Close", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 0, 0, 10, 10, helpWnd, (HMENU)2, GetModuleHandle(nullptr), nullptr);
+    SendMessageA(ok, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+    RECT cr;
+    GetClientRect(helpWnd, &cr);
+    SendMessageA(helpWnd, WM_SIZE, 0, MAKELPARAM(cr.right, cr.bottom));
+    SetFocus(ok);
+    return helpWnd;
 }
 
 // The tabs at the top of the left column: Scene (which regions are shown), Placements and Item.
@@ -11870,6 +12287,478 @@ void runImgToolSelfTest(SelfTest& t) {
     imgt.answer = IDYES;
 }
 
+// ---- MEd's view options, camera buttons, Scene tab controls, Delete region, IMG New, Help / About:
+//      med_viewer <game copy> --selftest (MED_SELFTEST_ONLY=parity) ------------------------------------------------------
+CameraKeys cameraKeysFrom(bool (*isDown)(int));
+
+static int stFakeKey = 0;
+bool stFakeDown(int vk) { return vk == stFakeKey; }
+
+// Render one frame into the back buffer and count the pixels that are not the black background.
+long stLitPixels() {
+    render();
+    glFinish();
+    std::vector<unsigned char> px(size_t(app.width) * app.height * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(app.viewX, 0, app.width, app.height, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+    long n = 0;
+    for (size_t i = 0; i < px.size(); i += 3) n += (px[i] | px[i + 1] | px[i + 2]) != 0;
+    return n;
+}
+long stBrightness() {
+    render();
+    glFinish();
+    std::vector<unsigned char> px(size_t(app.width) * app.height * 3);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadBuffer(GL_BACK);
+    glReadPixels(app.viewX, 0, app.width, app.height, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+    long n = 0;
+    for (unsigned char c : px) n += c;
+    return n;
+}
+std::string stHelpText() {
+    if (!helpWnd) return "";
+    HWND e = GetDlgItem(helpWnd, 1);
+    std::vector<char> b(size_t(GetWindowTextLengthA(e)) + 1);
+    GetWindowTextA(e, b.data(), int(b.size()));
+    return b.data();
+}
+
+void runParitySelfTest(SelfTest& t) {
+    std::printf("view options / camera buttons / Scene controls / Delete region / IMG New / Help self-test\n");
+    std::fflush(stdout);
+    auto cmd = [](int id) { SendMessageA(app.hwnd, WM_COMMAND, MAKEWPARAM(id, 0), 0); };
+    const MedCamera camBefore = app.cam;
+    const std::string mapBefore = stMapState();
+
+    // 1. Wireframe Models: the map in lines, the polygon mode back to fill afterwards
+    app.cam.x = 1145.68f; app.cam.y = -576.02f; app.cam.z = 13.53f; app.cam.h = 15.63f; app.cam.yaw = 204.8f; app.cam.pitch = 358.4f;
+    ST_CHECK(t, !app.mapWireframe, "wireframe is off at start");
+    const long filled = stLitPixels();
+    cmd(ID_TB_WIREFRAME);
+    ST_CHECK(t, app.mapWireframe, "View > Wireframe Models switches it on");
+    const long lines = stLitPixels();
+    GLint mode[2] = {0, 0};
+    glGetIntegerv(GL_POLYGON_MODE, mode);
+    ST_CHECK(t, lines > 0 && lines < filled * 3 / 4, "wireframe draws far fewer pixels than solid (" + std::to_string(lines) + " of " + std::to_string(filled) + ")");
+    ST_CHECK(t, mode[0] == GL_FILL, "the polygon mode is back to fill after the map (the overlays stay solid)");
+    cmd(ID_TB_WIREFRAME);
+    ST_CHECK(t, !app.mapWireframe && stLitPixels() == filled, "switched off: the same picture as before");
+
+    // 2. 2DFX Lighting
+    size_t lightTotal = 0;
+    for (const auto& kv : app.fxLights) lightTotal += kv.second.size();
+    ST_CHECK(t, lightTotal == 1131, "GTA III's 1131 2dfx lights are read (" + std::to_string(lightTotal) + ")");
+    int lit = -1;
+    for (size_t i = 0; i < app.instances.size() && lit < 0; ++i) {
+        auto f = app.fxLights.find(app.instances[i].id);
+        if (f == app.fxLights.end() || app.instances[i].z < -100 || !app.regionOn[size_t(app.instFile[i])]) continue;
+        for (const Ide2dfxLight& l : f->second) if (l.flash == 0 || l.flash == 1) { lit = int(i); break; }
+    }
+    ST_CHECK(t, lit >= 0, "a placement with lights");
+    if (lit >= 0) {
+        centreOnObject(lit);
+        auto expected = [](int hour) {
+            int n = 0;
+            for (int idx : app.visible) {
+                auto f = app.fxLights.find(app.instances[size_t(idx)].id);
+                if (f != app.fxLights.end()) for (const Ide2dfxLight& l : f->second) n += ide2dfxLightShown(l.flash, hour);
+            }
+            return n;
+        };
+        const long dark = stBrightness();
+        ST_CHECK(t, app.fxDrawn == 0, "no lights while 2DFX Lighting is off");
+        cmd(ID_TB_2DFX);
+        ST_CHECK(t, app.show2dfx, "View > 2DFX Lighting switches it on");
+        for (int hour : {20, 12, 22, 0, 23}) {
+            HWND hourBox = GetDlgItem(app.scenePanel, ID_SC_HOUR);
+            SendMessageA(hourBox, CB_SETCURSEL, hour, 0);
+            SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_HOUR, CBN_SELCHANGE), (LPARAM)hourBox);
+            ST_CHECK(t, app.sceneHour == hour, "Time in scene " + std::to_string(hour));
+            const long bright = stBrightness();
+            ST_CHECK(t, app.fxDrawn == expected(hour), "at " + std::to_string(hour) + ":00 the lights MEd shows are drawn (" + std::to_string(app.fxDrawn) + " of " + std::to_string(expected(hour)) + ")");
+            if (app.fxDrawn > 0) ST_CHECK(t, bright >= dark, "the lights never darken the picture");
+            if (app.fxDrawn > 0) std::printf("  %02d:00: %d lights, brightness %ld -> %ld\n", hour, app.fxDrawn, dark, bright);
+        }
+        // one light on its own, straight in front of the camera: drawn in its colour at the hours MEd shows it, else nothing
+        for (int wantFlash : {0, 1, 12}) {
+            int model = -1;
+            Ide2dfxLight light;
+            for (const auto& kv : app.fxLights) {
+                if (!app.defs.count(kv.first) || model >= 0) continue;
+                for (const Ide2dfxLight& l : kv.second)
+                    if (l.flash == wantFlash && l.size >= 1 && (wantFlash == 12 || (l.r > 200 && l.g > 200 && l.b > 200))) { model = kv.first; light = l; break; }
+            }
+            const std::vector<Ide2dfxLight> allLights = model >= 0 ? app.fxLights[model] : std::vector<Ide2dfxLight>();
+            if (model >= 0) app.fxLights[model] = {light};  // just this one light for the check
+            ST_CHECK(t, model >= 0, "a model with one flash " + std::to_string(wantFlash) + " light");
+            if (model < 0) continue;
+            IplInstance fake;
+            fake.id = model;
+            fake.model = app.defs[model].model;
+            fake.x = 0; fake.y = 0; fake.z = 900;  // far above the city: nothing else in the way
+            app.instances.push_back(fake);
+            app.instFile.push_back(app.instFile[0]);
+            const MedCamera keep = app.cam;
+            app.cam.x = light.x; app.cam.y = light.y - 10; app.cam.z = 900 + light.z; app.cam.h = 20; app.cam.yaw = 0; app.cam.pitch = 0;  // eye 30 units south
+            for (int hour = 0; hour < 24; ++hour) {
+                app.sceneHour = hour;
+                render();  // sets the matrices; then only the light is drawn, on black
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                app.visible.assign(1, int(app.instances.size()) - 1);
+                draw2dfx();
+                glFinish();
+                std::vector<unsigned char> px(size_t(app.width) * app.height * 3);
+                glReadPixels(app.viewX, 0, app.width, app.height, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+                long litPx = 0, r = 0, g = 0, b = 0;
+                for (size_t i = 0; i < px.size(); i += 3)
+                    if (px[i] | px[i + 1] | px[i + 2]) { ++litPx; r += px[i]; g += px[i + 1]; b += px[i + 2]; }
+                const bool shown = ide2dfxLightShown(light.flash, hour);
+                const std::string w = "flash " + std::to_string(light.flash) + " at " + std::to_string(hour) + ":00";
+                ST_CHECK(t, (litPx > 50) == shown && app.fxDrawn == (shown ? 1 : 0), w + (shown ? ": the light shows" : ": the light is not drawn") + " (" + std::to_string(litPx) + " pixels)");
+                if (shown && litPx > 0) {
+                    if (wantFlash == 12) ST_CHECK(t, b == 0 && ((r > 0) != (g > 0)), w + ": a traffic light is red or green");
+                    else ST_CHECK(t, std::labs(r - g) < r / 10 + 1 && std::labs(g - b) < g / 10 + 1, w + ": in the light's colour (white)");
+                }
+            }
+            app.cam = keep;
+            app.instances.pop_back();
+            app.instFile.pop_back();
+            app.fxLights[model] = allLights;
+        }
+        cmd(ID_TB_2DFX);
+        ST_CHECK(t, !app.show2dfx && stBrightness() == dark && app.fxDrawn == 0, "off again: the picture as before");
+    }
+
+    // 3. Top down view, Reset View
+    app.cam.x = 123; app.cam.y = -456; app.cam.z = 7; app.cam.h = 3; app.cam.yaw = 77; app.cam.pitch = 12;
+    cmd(ID_TB_TOPDOWN);
+    ST_CHECK(t, app.cam.z == 1560 && app.cam.yaw == 0 && app.cam.pitch == 90 && app.cam.x == 123 && app.cam.y == -456 && app.cam.h == 3,
+             "Top down view: z 1560, yaw 0, pitch 90, x / y / h kept (MEd 0x0044f870)");
+    ST_CHECK(t, stLitPixels() > 0, "the city is in view from above");
+    cmd(ID_TB_RESETVIEW);
+    ST_CHECK(t, app.cam.x == 0 && app.cam.y == 0 && app.cam.z == 0 && app.cam.h == 0 && app.cam.yaw == 0 && app.cam.pitch == 0, "Reset View: everything 0 (MEd 0x0045e4b0)");
+
+    // 4. Reset Angle (toolbar): the selection's rotation becomes identity, one undo step
+    {
+        int turned = -1;
+        for (size_t i = 0; i < app.instances.size() && turned < 0; ++i)
+            if (std::fabs(app.instances[i].rotW) < 0.99 && app.instances[i].z > -100 && app.regionOn[size_t(app.instFile[i])]) turned = int(i);
+        app.selected.clear();
+        updateToolbarState();
+        ST_CHECK(t, !SendMessageA(app.toolbar, TB_ISBUTTONENABLED, ID_TB_RESETANGLE, 0), "Reset Angle is greyed out with nothing selected");
+        if (turned >= 0) {
+            app.selected.assign(1, turned);
+            updateToolbarState();
+            ST_CHECK(t, SendMessageA(app.toolbar, TB_ISBUTTONENABLED, ID_TB_RESETANGLE, 0) != 0, "Reset Angle is enabled with a selection");
+            const IplInstance before = app.instances[size_t(turned)];
+            const size_t undo = app.history.undoCount();
+            cmd(ID_TB_RESETANGLE);
+            const IplInstance& o = app.instances[size_t(turned)];
+            ST_CHECK(t, o.rotX == 0 && o.rotY == 0 && o.rotZ == 0 && o.rotW == 1 && o.x == before.x && o.z == before.z, "Reset Angle: rotation (0, 0, 0, 1), position kept");
+            ST_CHECK(t, app.history.undoCount() == undo + 1, "one undo step");
+            undoAction();
+            ST_CHECK(t, app.instances[size_t(turned)].rotW == before.rotW && app.instances[size_t(turned)].rotZ == before.rotZ, "undo gives the rotation back");
+        }
+        app.selected.clear();
+    }
+
+    // 5. Selection Mode: which drag moves the objects
+    ST_CHECK(t, !app.selectionMode, "Selection Mode is off at start");
+    ST_CHECK(t, dragMovesObjects(true, false) && !dragMovesObjects(false, false) && !dragMovesObjects(true, true) && !dragMovesObjects(false, true),
+             "off: Alt + drag moves the objects, a plain drag and Ctrl + drag move the camera");
+    SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(TRUE, 0));
+    cmd(ID_TB_SELMODE);
+    ST_CHECK(t, app.selectionMode, "the toolbar button switches Selection Mode on");
+    ST_CHECK(t, !dragMovesObjects(true, false) && dragMovesObjects(false, false) && !dragMovesObjects(false, true) && !dragMovesObjects(true, true),
+             "on: a plain drag moves the objects, Alt + drag and Ctrl + drag move the camera (MEd's help)");
+    SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(FALSE, 0));
+    cmd(ID_TB_SELMODE);
+    ST_CHECK(t, !app.selectionMode, "and off again");
+
+    // 6. Numpad + / - move forward and back like W / S
+    for (int vk : {int(VK_ADD), int(VK_SUBTRACT), int('W'), int('S'), int(VK_MULTIPLY)}) {
+        stFakeKey = vk;
+        const CameraKeys k = cameraKeysFrom(stFakeDown);
+        ST_CHECK(t, k.forward == (vk == VK_ADD || vk == 'W') && k.back == (vk == VK_SUBTRACT || vk == 'S'), "key " + std::to_string(vk) + ": forward / back as MEd reads it");
+        MedCamera c = app.cam;
+        c.yaw = 0;
+        c.pitch = 0;
+        const float y0 = c.y;
+        cameraKeyboardTick(c, k);
+        if (vk == VK_ADD) ST_CHECK(t, c.y > y0, "Numpad + moves the camera forward");
+        if (vk == VK_SUBTRACT) ST_CHECK(t, c.y < y0, "Numpad - moves the camera back");
+    }
+    stFakeKey = 0;
+
+    // 7. the Scene tab: mouse speed, shift multiplier (not saved in a test run)
+    {
+        char iniBefore[64] = "";
+        GetPrivateProfileStringA("Controls", "mousesens", "none", iniBefore, sizeof iniBefore, modIniPath().c_str());
+        HWND mouse = GetDlgItem(app.scenePanel, ID_SC_MOUSE);
+        ST_CHECK(t, app.cam.mouseSpeed == 20 && app.cam.shiftMultiplier == 1, "MEd's defaults: mouse speed 20, shift multiplier 1");
+        SendMessageA(mouse, WM_SETTEXT, 0, (LPARAM)"35");
+        ST_CHECK(t, app.cam.mouseSpeed == 35, "Mouse speed 35");
+        for (const char* bad : {"0", "100", ""}) {
+            SendMessageA(mouse, WM_SETTEXT, 0, (LPARAM)bad);
+            ST_CHECK(t, app.cam.mouseSpeed == 35, std::string("Mouse speed '") + bad + "' is not applied");
+        }
+        MedCamera c = app.cam;
+        cameraMouseRotate(c, 10, 0);
+        MedCamera d = app.cam;
+        d.mouseSpeed = 20;
+        cameraMouseRotate(d, 10, 0);
+        ST_CHECK(t, std::fabs(std::fmod(c.yaw - app.cam.yaw + 360, 360.0f) - 3.5f) < 1e-3f && std::fabs(std::fmod(d.yaw - app.cam.yaw + 360, 360.0f) - 2.0f) < 1e-3f,
+                 "the mouse turns 0.35 degrees per pixel at speed 35, 0.2 at 20 (speed x 0.01)");
+        SendMessageA(mouse, WM_SETTEXT, 0, (LPARAM)"20");
+        HWND shift = GetDlgItem(app.scenePanel, ID_SC_SHIFT);
+        ST_CHECK(t, SendMessageA(shift, CB_GETCOUNT, 0, 0) == 10, "Shift multiplier lists 1x to 10x");
+        SendMessageA(shift, CB_SETCURSEL, 4, 0);
+        SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_SHIFT, CBN_SELCHANGE), (LPARAM)shift);
+        ST_CHECK(t, app.cam.shiftMultiplier == 5, "5x: shift multiplier 5 (index + 1, as speedChanged)");
+        CameraKeys k;
+        k.forward = true;
+        k.shift = true;
+        MedCamera e = app.cam;
+        e.yaw = 0; e.pitch = 0;
+        const float y0 = e.y;
+        cameraKeyboardTick(e, k);
+        ST_CHECK(t, std::fabs((e.y - y0) - 15.0f) < 1e-3f, "Shift + forward moves 5 x 3.0 per tick");
+        SendMessageA(shift, CB_SETCURSEL, 0, 0);
+        SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_SHIFT, CBN_SELCHANGE), (LPARAM)shift);
+        char iniAfter[64] = "";
+        GetPrivateProfileStringA("Controls", "mousesens", "none", iniAfter, sizeof iniAfter, modIniPath().c_str());
+        ST_CHECK(t, std::string(iniBefore) == iniAfter, "a test run does not change the saved settings");
+    }
+
+    // 8. Delete region
+    {
+        bool ok;
+        const std::string datPath = app.root + "/data/gta3.dat";
+        const std::string datStart = slurp(datPath, ok);
+        std::string rel, err, why;
+        auto fileOfRel = [](const std::string& r) {  // the live one (a deleted region keeps its number, with the same path)
+            for (int f = int(app.iplPaths.size()) - 1; f >= 0; --f) if (toLower(app.iplPaths[size_t(f)]) == toLower(r) && !app.deletedRegions.count(f)) return f;
+            return -1;
+        };
+        auto listed = [](int file) {
+            bool inScene = false, inPicker = false;
+            for (int row = 0; row < int(sceneRows.size()); ++row) inScene = inScene || (sceneRowRegion(row) >= 0 && regions[size_t(sceneRowRegion(row))].file == file);
+            for (int i = 0; i < int(SendMessageA(pl.regionBox, CB_GETCOUNT, 0, 0)); ++i) inPicker = inPicker || int(SendMessageA(pl.regionBox, CB_GETITEMDATA, i, 0)) == file;
+            return inScene || inPicker;
+        };
+        int props = -1;
+        for (const Region& r : regions) if (toLower(r.name) == "props.ipl") props = r.file;
+        ST_CHECK(t, !deleteRegionNamed(props, why, false, app.hwnd) && why.find("part of the game") != std::string::npos, "a region of the game is refused: " + why);
+        ST_CHECK(t, slurp(datPath, ok) == datStart, "and gta3.dat is unchanged");
+        ST_CHECK(t, createRegionNamed("partest", rel, err), "a test region: " + err);
+        const int file = fileOfRel(rel);
+        ST_CHECK(t, file >= 0 && listed(file), "it is listed");
+        // with a placement in it: refused until it is moved out again
+        int some = -1;
+        for (size_t i = 0; i < app.instances.size() && some < 0; ++i) if (app.regionOn[size_t(app.instFile[i])] && app.instances[i].z > -100) some = int(i);
+        app.selected.assign(1, some);
+        const size_t moved = moveSelectedToRegion(file);
+        ST_CHECK(t, moved > 0 && !deleteRegionNamed(file, why, false, app.hwnd) && why.find("still holds") != std::string::npos, "a region with placements is refused: " + why);
+        undoAction();
+        app.selected.clear();
+        ST_CHECK(t, std::count(app.instFile.begin(), app.instFile.end(), file) == 0, "undo took them out again");
+        ST_CHECK(t, deleteRegionNamed(file, why, false, app.hwnd), "the empty test region is deleted: " + why);
+        ST_CHECK(t, slurp(datPath, ok) == datStart, "gta3.dat is exactly as before the region was made");
+        ST_CHECK(t, !listed(file), "it is gone from the Scene list and the Placements region picker");
+        ST_CHECK(t, !app.history.canUndo() && !app.history.canRedo(), "the undo history is cleared");
+        ST_CHECK(t, !fs::exists(app.root + "/data/maps/partest/partest.ipl") && fs::exists(app.root + "/data/maps/partest/partest.ipl.med-deleted"), "its file is renamed to .med-deleted");
+        ST_CHECK(t, !deleteRegionNamed(file, why, false, app.hwnd), "deleting it twice is refused");
+        app.dirty.insert(file);  // even if something marked it changed, Save never writes it
+        bool saveOk = false;
+        const std::string oldRoot = app.saveRoot;
+        const bool oldInPlace = app.saveInPlace;
+        app.saveInPlace = false;
+        app.saveRoot = (fs::path(app.root).parent_path() / ("parity_save_" + std::to_string(GetCurrentProcessId()))).string();
+        const std::set<int> dirtyKeep = app.dirty;
+        app.dirty = {file};
+        saveAll(&saveOk);
+        ST_CHECK(t, saveOk && app.dirty.empty() && !fs::exists(app.saveRoot + "/" + rel), "Save All skips a deleted region");
+        std::error_code ec;
+        fs::remove_all(app.saveRoot, ec);
+        app.saveRoot = oldRoot;
+        app.saveInPlace = oldInPlace;
+        app.dirty = dirtyKeep;
+        app.dirty.erase(file);
+        fs::remove_all(app.root + "/data/maps/partest", ec);
+        ST_CHECK(t, createRegionNamed("partest", rel, err), "the same name can be used again");
+        ST_CHECK(t, deleteRegionNamed(fileOfRel(rel), why, false, app.hwnd), "and deleted again");
+        fs::remove_all(app.root + "/data/maps/partest", ec);
+    }
+
+    // 9. Image Archive > New...
+    {
+        imgt.quiet = true;
+        imgt.answer = IDNO;
+        const fs::path dir = fs::temp_directory_path() / ("med_imgnew_" + std::to_string(GetCurrentProcessId()));
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        showImgTool(app.hwnd);
+        ST_CHECK(t, igNewArchive((dir / "mine").string()) && imgt.current >= 0 && imgt.edit.entries().empty(), "New... makes an empty archive and opens it (.img added to the name)");
+        ST_CHECK(t, fs::exists(dir / "mine.img") && fs::file_size(dir / "mine.img") == 0 && fs::exists(dir / "mine.dir") && fs::file_size(dir / "mine.dir") == 0,
+                 "an empty mine.img and mine.dir, as MEd's create makes a version 1 archive");
+        ST_CHECK(t, !igNewArchive((dir / "mine.img").string()) && imgt.lastMessage.find("already exists") != std::string::npos, "an existing archive is never replaced");
+        std::ofstream(dir / "x.dff", std::ios::binary) << std::string(3000, 'x');
+        ST_CHECK(t, igAdd({(dir / "x.dff").string()}) == 1 && igRebuild(false), "a file added to the new archive and rebuilt");
+        ImgArchive back;
+        std::string err;
+        ST_CHECK(t, ImgArchive::open((dir / "mine.img").string(), back, err) && back.entries().size() == 1 && back.find("x.dff") == 0, "the new archive holds it");
+        igClose();
+        fs::remove_all(dir, ec);
+        imgt.quiet = false;
+        imgt.answer = IDYES;
+    }
+
+    // 10. Help and About
+    cmd(ID_TB_HELP);
+    ST_CHECK(t, helpWnd && stHelpText().find("Numpad +/-") != std::string::npos && stHelpText().find("Toggle Selection Mode") != std::string::npos &&
+                    stHelpText().find("Alt+CTRL+Cursor or Alt+PGUP/PGDOWN") != std::string::npos,
+             "Help shows MEd's controls");
+    cmd(ID_TB_ABOUT);
+    ST_CHECK(t, helpWnd && stHelpText().find("Tony Wroblewski") != std::string::npos && stHelpText().find("MEd v0.32") != std::string::npos &&
+                    stHelpText().find("Always perform a backup") != std::string::npos,
+             "About shows MEd's credits");
+    SendMessageA(helpWnd, WM_COMMAND, 2, 0);
+    ST_CHECK(t, !helpWnd, "Close closes it");
+
+    // 11. random steps of all of it, with invariants after each
+    {
+        unsigned seed = 777;
+        if (const char* sd = std::getenv("MED_SELFTEST_SEED")) seed += unsigned(std::atoi(sd));
+        auto rnd = [&](int n) { seed = seed * 1103515245u + 12345u; return int((seed >> 8) % unsigned(n)); };
+        bool ok;
+        const std::string datPath = app.root + "/data/gta3.dat";
+        const std::string datStart = slurp(datPath, ok);
+        std::vector<int> liveTest;  // regions this sequence made and has not deleted
+        const char* speeds[] = {"1", "20", "99", "0", "100", "abc", "", "55", "-3", "007"};
+        float expectSpeed = app.cam.mouseSpeed;
+        int made = 0;
+        for (int step = 0; step < 400; ++step) {
+            std::string what;
+            const int op = rnd(13);
+            switch (op) {
+                case 0: what = "wireframe"; cmd(ID_TB_WIREFRAME); break;
+                case 1: what = "2dfx"; cmd(ID_TB_2DFX); break;
+                case 2: {
+                    what = "hour";
+                    HWND hb = GetDlgItem(app.scenePanel, ID_SC_HOUR);
+                    SendMessageA(hb, CB_SETCURSEL, rnd(24), 0);
+                    SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_HOUR, CBN_SELCHANGE), (LPARAM)hb);
+                    break;
+                }
+                case 3: what = "top down"; cmd(ID_TB_TOPDOWN); break;
+                case 4: what = "reset view"; cmd(ID_TB_RESETVIEW); break;
+                case 5: what = "selection mode"; SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(rnd(2), 0)); cmd(ID_TB_SELMODE); break;
+                case 6: {
+                    what = "mouse speed";
+                    const char* v = speeds[rnd(10)];
+                    SendMessageA(GetDlgItem(app.scenePanel, ID_SC_MOUSE), WM_SETTEXT, 0, (LPARAM)v);
+                    const int n = std::atoi(v);
+                    if (*v && n >= 1 && n <= 99) expectSpeed = float(n);
+                    break;
+                }
+                case 7: {
+                    what = "shift multiplier";
+                    HWND sb = GetDlgItem(app.scenePanel, ID_SC_SHIFT);
+                    SendMessageA(sb, CB_SETCURSEL, rnd(10), 0);
+                    SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_SHIFT, CBN_SELCHANGE), (LPARAM)sb);
+                    break;
+                }
+                case 8: {
+                    what = "reset angle";
+                    int some = rnd(int(app.instances.size()));
+                    if (app.regionOn[size_t(app.instFile[size_t(some)])]) app.selected.assign(1, some); else app.selected.clear();
+                    cmd(ID_TB_RESETANGLE);
+                    if (!app.selected.empty()) ST_CHECK(t, app.instances[size_t(some)].rotW == 1, "random reset angle");
+                    if (!app.selected.empty() && app.history.canUndo()) undoAction();
+                    app.selected.clear();
+                    break;
+                }
+                case 9: {
+                    what = "new region";
+                    std::string rel, err;
+                    if (liveTest.size() < 3 && createRegionNamed("partest" + std::to_string(made++), rel, err)) {
+                        for (int f = int(app.iplPaths.size()) - 1; f >= 0; --f) if (app.iplPaths[size_t(f)] == rel) { liveTest.push_back(f); break; }
+                    }
+                    break;
+                }
+                case 10: {
+                    what = "delete region";
+                    std::string why;
+                    if (!liveTest.empty()) {
+                        const size_t k = size_t(rnd(int(liveTest.size())));
+                        ST_CHECK(t, deleteRegionNamed(liveTest[k], why, false, app.hwnd), "random delete of an empty test region: " + why);
+                        liveTest.erase(liveTest.begin() + long(k));
+                    } else {
+                        std::vector<int> game;  // the game's own regions (earlier test sections add regions of their own, which may go)
+                        const std::vector<std::string> added = regionsAddedSinceBackup(app.root);
+                        for (const Region& r : regions) {
+                            bool isAdded = false;
+                            for (const std::string& a2 : added) isAdded = isAdded || toLower(a2) == toLower(app.iplPaths[size_t(r.file)]);
+                            if (!isAdded) game.push_back(r.file);
+                        }
+                        if (!game.empty()) ST_CHECK(t, !deleteRegionNamed(game[size_t(rnd(int(game.size())))], why, false, app.hwnd), "a game region is never deleted");
+                    }
+                    break;
+                }
+                case 11: what = "help"; cmd(rnd(2) ? ID_TB_HELP : ID_TB_ABOUT); break;
+                case 12: what = "close help"; if (helpWnd) SendMessageA(helpWnd, WM_COMMAND, 2, 0); break;
+            }
+            const std::string w = "parity random step " + std::to_string(step) + " (" + what + ")";
+            const int before = t.failures;
+            long px = stLitPixels();
+            (void)px;
+            GLint pm[2];
+            glGetIntegerv(GL_POLYGON_MODE, pm);
+            ST_CHECK(t, pm[0] == GL_FILL, w + ": the polygon mode is fill after a frame");
+            ST_CHECK(t, app.show2dfx || app.fxDrawn == 0, w + ": no lights while 2DFX is off");
+            ST_CHECK(t, app.selectionMode == (SendMessageA(app.toolbar, TB_ISBUTTONCHECKED, ID_TB_SELMODE, 0) != 0), w + ": Selection Mode matches its button");
+            ST_CHECK(t, app.cam.mouseSpeed == expectSpeed, w + ": mouse speed " + std::to_string(app.cam.mouseSpeed));
+            ST_CHECK(t, app.cam.shiftMultiplier == int(SendMessageA(GetDlgItem(app.scenePanel, ID_SC_SHIFT), CB_GETCURSEL, 0, 0)) + 1, w + ": shift multiplier = list + 1");
+            ST_CHECK(t, app.sceneHour == int(SendMessageA(GetDlgItem(app.scenePanel, ID_SC_HOUR), CB_GETCURSEL, 0, 0)), w + ": Time in scene = its list");
+            for (const Region& r : regions) ST_CHECK(t, !app.deletedRegions.count(r.file), w + ": no deleted region is listed");
+            {  // gta3.dat = the start plus one line per live test region, in order
+                std::string expect = datStart;
+                const std::string bs(1, char(92));
+                const size_t at = expect.rfind("IPL ");
+                size_t insertAt = expect.find('\n', at) + 1;
+                for (int f : liveTest) {
+                    std::string rel = app.iplPaths[size_t(f)];
+                    for (char& c : rel) if (c == '/') c = char(92);
+                    const std::string line = "IPL " + rel + "\r\n";
+                    expect.insert(insertAt, line);
+                    insertAt += line.size();
+                }
+                ST_CHECK(t, slurp(datPath, ok) == expect, w + ": gta3.dat lists exactly the start's regions and the live test regions");
+            }
+            if (t.failures > before + 10) break;
+        }
+        std::error_code ec;
+        std::string why;
+        for (int f : liveTest) deleteRegionNamed(f, why, false, app.hwnd);
+        for (int i = 0; i < made; ++i) fs::remove_all(app.root + "/data/maps/partest" + std::to_string(i), ec);
+        ST_CHECK(t, slurp(datPath, ok) == datStart, "the end: gta3.dat as at the start");
+        if (helpWnd) SendMessageA(helpWnd, WM_COMMAND, 2, 0);
+        if (app.mapWireframe) cmd(ID_TB_WIREFRAME);
+        if (app.show2dfx) cmd(ID_TB_2DFX);
+        SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(FALSE, 0));
+        cmd(ID_TB_SELMODE);
+        SendMessageA(GetDlgItem(app.scenePanel, ID_SC_MOUSE), WM_SETTEXT, 0, (LPARAM)"20");
+        HWND sb = GetDlgItem(app.scenePanel, ID_SC_SHIFT);
+        SendMessageA(sb, CB_SETCURSEL, 0, 0);
+        SendMessageA(app.scenePanel, WM_COMMAND, MAKEWPARAM(ID_SC_SHIFT, CBN_SELCHANGE), (LPARAM)sb);
+    }
+
+    app.cam = camBefore;
+    ST_CHECK(t, stMapState() == mapBefore, "the map is as it was");
+}
+
 int runPlacementsSelfTest() {
     SelfTest t;
     std::printf("Placements tab self-test on %s (%zu placements, %zu regions)\n", app.root.c_str(), app.instances.size(), regions.size());
@@ -11880,6 +12769,7 @@ int runPlacementsSelfTest() {
         else if (o == "fullscreen") runFullScreenSelfTest(t);
         else if (o == "ide") runIdeEditSelfTest(t);
         else if (o == "imgtool") runImgToolSelfTest(t);
+        else if (o == "parity") runParitySelfTest(t);
         else { std::printf("MED_SELFTEST_ONLY: unknown section %s\n", only); ++t.failures; }
         std::printf("self-test: %d checks, %d failures\n", t.checks, t.failures);
         std::fflush(stdout);
@@ -12137,6 +13027,7 @@ int runPlacementsSelfTest() {
     runFullScreenSelfTest(t);
     runIdeEditSelfTest(t);
     runImgToolSelfTest(t);
+    runParitySelfTest(t);
 
     // 13. a long random sequence of everything
     unsigned seed = std::getenv("MED_SELFTEST_SEED") ? unsigned(std::atoi(std::getenv("MED_SELFTEST_SEED"))) : 12345u;  // other random sequences
@@ -12147,7 +13038,7 @@ int runPlacementsSelfTest() {
     const int steps = std::getenv("MED_SELFTEST_STEPS") ? std::atoi(std::getenv("MED_SELFTEST_STEPS")) : 1500;
     std::printf("random sequence: seed %u, %d steps\n", seed, steps);
     for (int step = 0; step < steps; ++step) {
-        const int op = rnd(19);
+        const int op = rnd(24);
         const int rows = int(pl.rows.size());
         std::string what;
         switch (op) {
@@ -12177,6 +13068,17 @@ int runPlacementsSelfTest() {
                 break;
             }
         }
+        switch (op) {  // MEd's view options and camera buttons, mixed in with the editing
+            case 19: what = "wireframe"; SendMessageA(app.hwnd, WM_COMMAND, ID_TB_WIREFRAME, 0); break;
+            case 20: what = "2dfx"; SendMessageA(app.hwnd, WM_COMMAND, ID_TB_2DFX, 0); app.sceneHour = rnd(24); break;
+            case 21: what = "top down / reset view"; SendMessageA(app.hwnd, WM_COMMAND, rnd(2) ? ID_TB_TOPDOWN : ID_TB_RESETVIEW, 0); break;
+            case 22: what = "selection mode"; SendMessageA(app.toolbar, TB_CHECKBUTTON, ID_TB_SELMODE, MAKELONG(rnd(2), 0)); SendMessageA(app.hwnd, WM_COMMAND, ID_TB_SELMODE, 0); break;
+            case 23: what = "reset angle"; SendMessageA(app.hwnd, WM_COMMAND, ID_TB_RESETANGLE, 0); break;
+        }
+        if (op >= 19) {
+            ST_CHECK(t, app.selectionMode == (SendMessageA(app.toolbar, TB_ISBUTTONCHECKED, ID_TB_SELMODE, 0) != 0), "random step " + std::to_string(step) + ": Selection Mode matches its button");
+            if (op == 23) for (int idx : editTargets()) ST_CHECK(t, app.instances[size_t(idx)].rotW == 1 && app.instances[size_t(idx)].rotZ == 0, "random step " + std::to_string(step) + ": Reset Angle made every target upright");
+        }
         const int failuresBefore = t.failures;
         stInvariants(t, "random step " + std::to_string(step) + " (" + what + ")");
         if (t.failures > failuresBefore + 20) break;  // one broken step should not flood the output
@@ -12186,6 +13088,9 @@ int runPlacementsSelfTest() {
     std::fflush(stdout);
     return t.failures == 0 ? 0 : 1;
 }
+
+bool dragMovesObjects(bool alt, bool ctrl);
+void loadControlSettings();
 
 LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (std::getenv("MED_DEBUG") && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_LBUTTONDBLCLK || msg == WM_RBUTTONDOWN)) {
@@ -12332,7 +13237,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
             app.downMouse = app.lastMouse;
             SetCapture(h);
             // Alt + left button with a selection drags the selected objects over the plane z - h.
-            app.movingObjects = !fullScr.on && (GetKeyState(VK_MENU) & 0x8000) && !app.selected.empty() &&
+            app.movingObjects = !fullScr.on && dragMovesObjects((GetKeyState(VK_MENU) & 0x8000) != 0, (GetKeyState(VK_CONTROL) & 0x8000) != 0) && !app.selected.empty() &&
                                 unprojectToPlane(int(short(LOWORD(l))), int(short(HIWORD(l))) - app.toolbarH, app.lastPick);
             return 0;
         case WM_LBUTTONUP: {
@@ -12353,7 +13258,7 @@ LRESULT CALLBACK wndProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 double dx = p.x - app.lastMouse.x, dy = p.y - app.lastMouse.y;
                 app.lastMouse = p;
                 double cur[3];
-                if (app.movingObjects && (GetKeyState(VK_MENU) & 0x8000)) {
+                if (app.movingObjects && dragMovesObjects((GetKeyState(VK_MENU) & 0x8000) != 0, (GetKeyState(VK_CONTROL) & 0x8000) != 0)) {
                     POINT cp = p;
                     ScreenToClient(h, &cp);
                     if (unprojectToPlane(cp.x, cp.y - app.toolbarH, cur)) {
@@ -12410,6 +13315,22 @@ bool createWindow(bool visible) {
 
 bool down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+// The keys MEd's pollKeyboard (0x0045e530) reads, from a key-state test (the real keyboard, or a test's).
+CameraKeys cameraKeysFrom(bool (*isDown)(int)) {
+    CameraKeys k;
+    k.forward = isDown('W') || isDown(VK_UP) || isDown(VK_ADD);  // MEd: Numpad + and - move forward and back too
+    k.back = isDown('S') || isDown(VK_DOWN) || isDown(VK_SUBTRACT);
+    k.left = isDown('A') || isDown(VK_LEFT);
+    k.right = isDown('D') || isDown(VK_RIGHT);
+    k.pageUp = isDown(VK_PRIOR) || isDown('R');
+    k.pageDown = isDown(VK_NEXT) || isDown('F');
+    k.shift = isDown(VK_SHIFT);
+    k.ctrl = isDown(VK_CONTROL);
+    k.alt = isDown(VK_MENU);
+    return k;
+}
+bool dragMovesObjects(bool alt, bool ctrl);
+
 // MEd polls the keyboard from a 1 ms QTimer (CMapView::initializeGL, QTimer::start(1)), so the
 // camera gets one pollKeyboard() step per elapsed millisecond.
 void updateCamera() {
@@ -12421,16 +13342,7 @@ void updateCamera() {
     ticks = std::min(ticks, 100);  // do not fly away after a stall
     if (GetForegroundWindow() != app.hwnd) return;
     { HWND f = GetFocus(); if (f && f != app.hwnd) return; }  // typing in the panel is not camera input
-    CameraKeys k;
-    k.forward = down('W') || down(VK_UP);
-    k.back = down('S') || down(VK_DOWN);
-    k.left = down('A') || down(VK_LEFT);
-    k.right = down('D') || down(VK_RIGHT);
-    k.pageUp = down(VK_PRIOR) || down('R');
-    k.pageDown = down(VK_NEXT) || down('F');
-    k.shift = down(VK_SHIFT);
-    k.ctrl = down(VK_CONTROL);
-    k.alt = down(VK_MENU);
+    const CameraKeys k = cameraKeysFrom(down);
     for (int i = 0; i < ticks; ++i) {
         cameraKeyboardTick(app.cam, k);
         if (!app.selected.empty() && !fullScr.on) {  // Alt + keys move the selection, not while full screen
@@ -12485,6 +13397,7 @@ int main(int argc, char** argv) {
     bool rememberFolder = true;
     for (int i = 2; i < argc; ++i)
         if (std::string(argv[i]) == "--shot" || std::string(argv[i]) == "--selftest") rememberFolder = false;  // test runs do not change what the editor reopens
+    if (rememberFolder) loadControlSettings();  // MEd's controls/mousesens and controls/speed
     if (rememberFolder) WritePrivateProfileStringA("Editor", "game", app.root.c_str(), modIniPath().c_str());
     std::string shot;
     int bookmark = 0;
@@ -12975,11 +13888,12 @@ int main(int argc, char** argv) {
             return last == std::string::npos ? r : r.substr(last + 1);
         }();
         char title[400];
-        std::snprintf(title, sizeof title, "%s  -  MEd 3D viewer  |  %.2f : %.2f : %.2f : %.2f : %.1f : %.1f  |  %d objects  |  undo %zu redo %zu%s%s%s", folderLabel.c_str(), app.cam.x,
+        std::snprintf(title, sizeof title, "%s  -  MEd 3D viewer  |  %.2f : %.2f : %.2f : %.2f : %.1f : %.1f  |  %d objects  |  undo %zu redo %zu%s%s%s%s", folderLabel.c_str(), app.cam.x,
                       app.cam.y, app.cam.z, app.cam.h, app.cam.yaw, app.cam.pitch, app.drawn,
                       app.history.undoCount(), app.history.redoCount(), anyUnsaved() ? "  |  UNSAVED (Ctrl+S)" : "",
                       app.selected.empty() ? "" : ("  |  " + selectionTitle()).c_str(),
-                      app.lodViewText.empty() ? "" : ("  |  " + app.lodViewText).c_str());
+                      app.lodViewText.empty() ? "" : ("  |  " + app.lodViewText).c_str(),
+                      app.show2dfx ? ("  |  2DFX: " + std::to_string(app.fxDrawn) + " lights at " + (app.sceneHour < 10 ? "0" : "") + std::to_string(app.sceneHour) + ":00").c_str() : "");
         // undo/redo depth is shown too: see the status text below
         static DWORD fpsStart = GetTickCount();
         static int fpsFrames = 0;
